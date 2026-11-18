@@ -234,9 +234,19 @@ pub fn has_audio_stream(path: &Path) -> bool {
 pub fn reveal_in_explorer(path: &Path) {
     #[cfg(windows)]
     {
-        let _ = Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
-            .spawn();
+        use std::os::windows::process::CommandExt;
+
+        let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let path_str = resolved.to_string_lossy().replace('/', "\\");
+        let clean_path = path_str.strip_prefix(r"\\?\").unwrap_or(&path_str);
+
+        if resolved.exists() {
+            let _ = Command::new("explorer")
+                .raw_arg(format!("/select,\"{}\"", clean_path))
+                .spawn();
+        } else if let Some(parent) = resolved.parent() {
+            let _ = Command::new("explorer").arg(parent).spawn();
+        }
     }
 }
 
