@@ -1,6 +1,5 @@
 mod editor_view;
 mod media_engine;
-mod model;
 mod theme;
 
 use editor_view::EditorView;
@@ -21,7 +20,12 @@ fn main() {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 ..Default::default()
             },
-            |_, cx| cx.new(EditorView::new),
+            |window, cx| {
+                let view = cx.new(EditorView::new);
+                let focus = view.read(cx).focus_handle().clone();
+                window.focus(&focus);
+                view
+            },
         )
         .expect("failed to open the main window");
     });

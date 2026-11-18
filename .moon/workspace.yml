@@ -4,3 +4,4 @@ $schema: 'https://moonrepo.dev/schemas/workspace.json'
 # When shared crates land under crates/, add a 'crates/*' glob here.
 projects:
   - 'apps/*'
+  - 'crates/*'

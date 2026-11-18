@@ -4,17 +4,50 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use gpui::{
-    Context, ExternalPaths, InteractiveElement, IntoElement, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, ParentElement, PathPromptOptions, Render, RenderImage, ScrollDelta,
-    ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled, StyledImage, Window, div,
-    img, prelude::FluentBuilder, px, rgb,
+    AnyView, AppContext, Context, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, PathPromptOptions,
+    Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Styled, StyledImage, Window, div, img, prelude::FluentBuilder, px, rgb,
 };
+use opencut_core::{EditorCore, TrackKind, format_timecode};
 
 use crate::media_engine::{
-    ExportHandle, VideoStreamPlayer, decode_single_frame, reveal_in_explorer, start_export_timeline,
+    AudioStreamPlayer, ExportHandle, VideoStreamPlayer, decode_single_frame, probe_duration_secs,
+    reveal_in_explorer, start_export_timeline,
 };
-use crate::model::{EditorState, TrackKind, format_timecode};
 use crate::theme::Theme;
+
+const TRACK_HEADER_W: f32 = 124.0;
+
+struct TooltipView {
+    text: SharedString,
+}
+
+impl TooltipView {
+    fn new(text: impl Into<SharedString>) -> Self {
+        Self { text: text.into() }
+    }
+}
+
+impl Render for TooltipView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2p5()
+            .py_1()
+            .rounded_md()
+            .bg(Theme::bg_surface())
+            .border_1()
+            .border_color(Theme::border())
+            .shadow_md()
+            .text_xs()
+            .text_color(Theme::text_primary())
+            .child(self.text.clone())
+    }
+}
+
+fn build_tooltip(text: &'static str) -> impl Fn(&mut Window, &mut gpui::App) -> AnyView + 'static {
+    move |_window, cx| cx.new(|_| TooltipView::new(text)).into()
+}
 
 enum ExportStatus {
     Idle,
@@ -23,46 +56,72 @@ enum ExportStatus {
     Error { message: String },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClipDragKind {
+    Move,
+    TrimLeft,
+    TrimRight,
+}
+
+#[derive(Clone, Copy)]
+struct ClipDragState {
+    clip_id: usize,
+    kind: ClipDragKind,
+    start_mouse_x: f32,
+    initial_start_secs: f32,
+    initial_duration_secs: f32,
+}
+
 pub struct EditorView {
-    state: EditorState,
+    state: EditorCore,
+    focus_handle: FocusHandle,
     playback_started: bool,
     current_frame: Option<Arc<RenderImage>>,
     player: VideoStreamPlayer,
+    audio_player: AudioStreamPlayer,
     decode_seq: u64,
     timeline_scroll_x: f32,
     scrollbar_dragging: bool,
     scrollbar_drag_start_x: f32,
     scrollbar_drag_start_scroll: f32,
     playhead_dragging: bool,
+    clip_drag: Option<ClipDragState>,
     export_status: ExportStatus,
 }
 
 impl EditorView {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let mut view = Self {
-            state: EditorState::new(),
+            state: EditorCore::new(),
+            focus_handle: cx.focus_handle(),
             playback_started: false,
             current_frame: None,
             player: VideoStreamPlayer::new(),
+            audio_player: AudioStreamPlayer::new(),
             decode_seq: 0,
             timeline_scroll_x: 0.0,
             scrollbar_dragging: false,
             scrollbar_drag_start_x: 0.0,
             scrollbar_drag_start_scroll: 0.0,
             playhead_dragging: false,
+            clip_drag: None,
             export_status: ExportStatus::Idle,
         };
         view.ensure_playback_loop(cx);
         view
     }
 
+    pub fn focus_handle(&self) -> &FocusHandle {
+        &self.focus_handle
+    }
+
     fn seek_from_window_x(&mut self, window_x: f32, window: &Window, cx: &mut Context<Self>) {
-        let vp_w = (f32::from(window.viewport_size().width) - 90.0).max(200.0);
+        let vp_w = (f32::from(window.viewport_size().width) - TRACK_HEADER_W).max(200.0);
         let timeline_w = (self.state.total_duration_secs * self.state.px_per_sec).max(vp_w);
         let max_scroll = (timeline_w - vp_w).max(0.0);
         let scroll_x = self.timeline_scroll_x.clamp(0.0, max_scroll);
 
-        let x_in_tracks = (window_x - 90.0).max(0.0);
+        let x_in_tracks = (window_x - TRACK_HEADER_W).max(0.0);
         let secs = (scroll_x + x_in_tracks) / self.state.px_per_sec;
         self.state.seek_to(secs);
         self.sync_preview_after_seek(cx);
@@ -95,6 +154,8 @@ impl EditorView {
                         view.state.tick(0.04);
                         view.poll_playback_frame(cx);
                         changed = true;
+                    } else {
+                        view.audio_player.stop();
                     }
 
                     if view.poll_export_progress() {
@@ -115,6 +176,10 @@ impl EditorView {
     }
 
     fn poll_playback_frame(&mut self, cx: &mut Context<Self>) {
+        let audio_clips = self.state.active_audio_clips_at(self.state.playhead_secs);
+        self.audio_player
+            .sync_playing_clips(&audio_clips, self.state.playhead_secs);
+
         let Some(active) = self.state.active_video_clip().cloned() else {
             self.player.stop();
             self.set_current_frame(None, cx);
@@ -142,6 +207,13 @@ impl EditorView {
     }
 
     fn sync_preview_after_seek(&mut self, cx: &mut Context<Self>) {
+        self.audio_player.stop();
+        if self.state.is_playing {
+            let audio_clips = self.state.active_audio_clips_at(self.state.playhead_secs);
+            self.audio_player
+                .sync_playing_clips(&audio_clips, self.state.playhead_secs);
+        }
+
         let Some(active) = self.state.active_video_clip().cloned() else {
             self.player.stop();
             self.set_current_frame(None, cx);
@@ -201,12 +273,122 @@ impl EditorView {
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(paths))) = rx.await {
                 let _ = this.update(cx, |view, cx| {
-                    view.state.import_paths(paths);
+                    view.state.import_paths_with_probe(paths, probe_duration_secs);
                     cx.notify();
                 });
             }
         })
         .detach();
+    }
+
+    fn prompt_open_project(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from("Open .opencut Project")),
+        });
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update(cx, |view, cx| {
+                        view.player.stop();
+                        view.audio_player.stop();
+                        if let Err(err) = view.state.load_from_file(&path) {
+                            view.state.status_message = err;
+                        }
+                        view.sync_preview_after_seek(cx);
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn save_project(&mut self, cx: &mut Context<Self>) {
+        if let Some(existing) = self.state.project_path.clone() {
+            if let Err(err) = self.state.save_to_file(&existing) {
+                self.state.status_message = err;
+            }
+            cx.notify();
+            return;
+        }
+
+        let dir = PathBuf::from(".");
+        let suggested = format!("{}.opencut", self.state.project_name.replace(' ', "_"));
+        let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut path))) = rx.await {
+                if path.extension().is_none() {
+                    path.set_extension("opencut");
+                }
+                let _ = this.update(cx, |view, cx| {
+                    if let Err(err) = view.state.save_to_file(&path) {
+                        view.state.status_message = err;
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn handle_key_down(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) {
+        let key = event.keystroke.key.as_str();
+        let ctrl = event.keystroke.modifiers.control;
+        let shift = event.keystroke.modifiers.shift;
+
+        match (ctrl, shift, key) {
+            (false, false, "space") => {
+                self.state.toggle_play();
+                self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            (true, false, "z") => {
+                if self.state.undo() {
+                    self.sync_preview_after_seek(cx);
+                }
+                cx.notify();
+            }
+            (true, false, "y") | (true, true, "z") => {
+                if self.state.redo() {
+                    self.sync_preview_after_seek(cx);
+                }
+                cx.notify();
+            }
+            (true, false, "b") => {
+                self.state.split_selected_or_at_playhead();
+                self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            (true, false, "s") => {
+                self.save_project(cx);
+            }
+            (false, true, "delete") | (false, true, "backspace") => {
+                self.state.ripple_delete_selected();
+                self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            (false, false, "delete") | (false, false, "backspace") => {
+                self.state.delete_selected_clip();
+                self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            (false, false, "left") => {
+                self.state.step_by(-0.5);
+                self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            (false, false, "right") => {
+                self.state.step_by(0.5);
+                self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            _ => {}
+        }
     }
 
     fn poll_export_progress(&mut self) -> bool {
@@ -258,6 +440,7 @@ impl EditorView {
 
         self.state.is_playing = false;
         self.player.stop();
+        self.audio_player.stop();
 
         let default_dir = self
             .state
@@ -277,7 +460,8 @@ impl EditorView {
 
                 let _ = this.update(cx, |view, cx| {
                     let clips = view.state.clips.clone();
-                    let handle = start_export_timeline(clips, path.clone());
+                    let flags = view.state.track_flags;
+                    let handle = start_export_timeline(clips, flags, path.clone());
                     view.state.status_message = "Exporting... 0%".into();
                     view.export_status = ExportStatus::Exporting {
                         handle,
@@ -458,7 +642,7 @@ impl EditorView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
+                    .gap_2p5()
                     .child(
                         div()
                             .px_2()
@@ -478,6 +662,18 @@ impl EditorView {
                             .child(project_name),
                     )
                     .child(
+                        self.icon_button("btn-open-proj", "📂", "Open Project (.opencut)", false, true)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.prompt_open_project(cx);
+                            })),
+                    )
+                    .child(
+                        self.icon_button("btn-save-proj", "💾", "Save Project (Ctrl+S)", false, true)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.save_project(cx);
+                            })),
+                    )
+                    .child(
                         div()
                             .px_2()
                             .py_0p5()
@@ -494,42 +690,68 @@ impl EditorView {
                     .items_center()
                     .gap_2()
                     .child(
-                        self.header_button("btn-import", "+ Import Media", false)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.prompt_import_media(cx);
-                            })),
-                    )
-                    .child(
-                        self.header_button("btn-split", "Split", false)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.split_selected_or_at_playhead();
-                                this.sync_preview_after_seek(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        self.header_button("btn-delete", "Delete", false)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.delete_selected_clip();
-                                this.sync_preview_after_seek(cx);
-                                cx.notify();
-                            })),
-                    )
-                    .child(
                         self.header_button(
                             "btn-export",
                             if matches!(self.export_status, ExportStatus::Exporting { .. }) {
                                 "Exporting..."
                             } else {
-                                "Export"
+                                "⬆ Export"
                             },
                             true,
                         )
+                        .tooltip(build_tooltip("Export Video (MP4)"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.prompt_export_video(cx);
                         })),
                     ),
             )
+    }
+
+    fn icon_button(
+        &self,
+        id: &'static str,
+        icon: &'static str,
+        tooltip: &'static str,
+        active: bool,
+        enabled: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        let bg = if active {
+            Theme::accent()
+        } else {
+            Theme::bg_surface()
+        };
+        let hover_bg = if active {
+            rgb(Theme::ACCENT_HOVER)
+        } else {
+            Theme::bg_hover()
+        };
+
+        div()
+            .id(id)
+            .w(px(28.))
+            .h(px(26.))
+            .rounded_md()
+            .bg(bg)
+            .border_1()
+            .border_color(if active {
+                Theme::accent()
+            } else {
+                Theme::border()
+            })
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_xs()
+            .font_weight(gpui::FontWeight::MEDIUM)
+            .text_color(if enabled {
+                Theme::text_primary()
+            } else {
+                Theme::text_muted()
+            })
+            .cursor_pointer()
+            .hover(move |s| s.bg(hover_bg))
+            .tooltip(build_tooltip(tooltip))
+            .child(icon)
     }
 
     fn header_button(
@@ -551,7 +773,7 @@ impl EditorView {
 
         div()
             .id(id)
-            .px_3()
+            .px_2p5()
             .py_1()
             .rounded_md()
             .bg(bg)
@@ -590,7 +812,8 @@ impl EditorView {
                     .bg(Theme::bg_hover())
             })
             .on_drop(cx.listener(|this, paths: &ExternalPaths, _window, cx| {
-                this.state.import_paths(paths.paths().to_vec());
+                this.state
+                    .import_paths_with_probe(paths.paths().to_vec(), probe_duration_secs);
                 cx.notify();
             }))
             .child(
@@ -627,7 +850,6 @@ impl EditorView {
                             .child("+ Import"),
                     ),
             )
-            // Drag & drop / Browse box
             .child(
                 div().p_2().child(
                     div()
@@ -804,7 +1026,12 @@ impl EditorView {
                         .justify_center()
                         .child(img(path).size_full().object_fit(ObjectFit::Contain))
                 } else {
-                    self.render_empty_preview("No image path", &timecode, &total_timecode, active_count)
+                    self.render_empty_preview(
+                        "No image path",
+                        &timecode,
+                        &total_timecode,
+                        active_count,
+                    )
                 }
             } else if let Some(frame) = self.current_frame.clone() {
                 div()
@@ -814,7 +1041,12 @@ impl EditorView {
                     .justify_center()
                     .child(img(frame).size_full().object_fit(ObjectFit::Contain))
             } else {
-                self.render_empty_preview("Loading video frame...", &timecode, &total_timecode, active_count)
+                self.render_empty_preview(
+                    "Loading video frame...",
+                    &timecode,
+                    &total_timecode,
+                    active_count,
+                )
             }
         } else {
             self.render_empty_preview(
@@ -902,7 +1134,7 @@ impl EditorView {
                             .items_center()
                             .gap_2()
                             .child(
-                                self.transport_btn("tr-start", "|<", false)
+                                self.icon_button("tr-start", "⏮", "Jump to Start", false, true)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.seek_to(0.0);
                                         this.sync_preview_after_seek(cx);
@@ -910,7 +1142,7 @@ impl EditorView {
                                     })),
                             )
                             .child(
-                                self.transport_btn("tr-back", "-1s", false)
+                                self.icon_button("tr-back", "⏪", "Step Back 1s", false, true)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.step_by(-1.0);
                                         this.sync_preview_after_seek(cx);
@@ -918,9 +1150,15 @@ impl EditorView {
                                     })),
                             )
                             .child(
-                                self.transport_btn(
+                                self.icon_button(
                                     "tr-play",
-                                    if is_playing { "Pause" } else { "Play" },
+                                    if is_playing { "⏸" } else { "▶" },
+                                    if is_playing {
+                                        "Pause (Space)"
+                                    } else {
+                                        "Play (Space)"
+                                    },
+                                    true,
                                     true,
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -930,7 +1168,7 @@ impl EditorView {
                                 })),
                             )
                             .child(
-                                self.transport_btn("tr-fwd", "+1s", false)
+                                self.icon_button("tr-fwd", "⏩", "Step Forward 1s", false, true)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.step_by(1.0);
                                         this.sync_preview_after_seek(cx);
@@ -938,7 +1176,7 @@ impl EditorView {
                                     })),
                             )
                             .child(
-                                self.transport_btn("tr-end", ">|", false)
+                                self.icon_button("tr-end", "⏭", "Jump to End", false, true)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         let end = this.state.total_duration_secs;
                                         this.state.seek_to(end);
@@ -951,7 +1189,7 @@ impl EditorView {
                         div()
                             .text_xs()
                             .text_color(Theme::text_muted())
-                            .child("640x360 Preview • FFmpeg"),
+                            .child("Space: Play • Ctrl+B: Split • Ctrl+Z: Undo"),
                     ),
             )
     }
@@ -995,42 +1233,6 @@ impl EditorView {
                         timecode, total_timecode, active_count
                     )),
             )
-    }
-
-    fn transport_btn(
-        &self,
-        id: &'static str,
-        label: &'static str,
-        accent: bool,
-    ) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(id)
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .bg(if accent {
-                Theme::accent()
-            } else {
-                Theme::bg_surface()
-            })
-            .border_1()
-            .border_color(if accent {
-                Theme::accent()
-            } else {
-                Theme::border()
-            })
-            .text_xs()
-            .font_weight(gpui::FontWeight::SEMIBOLD)
-            .text_color(Theme::text_primary())
-            .cursor_pointer()
-            .hover(move |s| {
-                s.bg(if accent {
-                    rgb(Theme::ACCENT_HOVER)
-                } else {
-                    Theme::bg_hover()
-                })
-            })
-            .child(label)
     }
 
     fn render_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1101,12 +1303,14 @@ impl EditorView {
                         "op-dec",
                         "op-inc",
                         cx.listener(|this, _, _, cx| {
+                            this.state.push_undo();
                             if let Some(c) = this.state.selected_clip_mut() {
                                 c.opacity = c.opacity.saturating_sub(10);
                             }
                             cx.notify();
                         }),
                         cx.listener(|this, _, _, cx| {
+                            this.state.push_undo();
                             if let Some(c) = this.state.selected_clip_mut() {
                                 c.opacity = (c.opacity + 10).min(100);
                             }
@@ -1119,12 +1323,14 @@ impl EditorView {
                         "sc-dec",
                         "sc-inc",
                         cx.listener(|this, _, _, cx| {
+                            this.state.push_undo();
                             if let Some(c) = this.state.selected_clip_mut() {
                                 c.scale = c.scale.saturating_sub(10).max(10);
                             }
                             cx.notify();
                         }),
                         cx.listener(|this, _, _, cx| {
+                            this.state.push_undo();
                             if let Some(c) = this.state.selected_clip_mut() {
                                 c.scale = (c.scale + 10).min(200);
                             }
@@ -1137,46 +1343,26 @@ impl EditorView {
                         "vol-dec",
                         "vol-inc",
                         cx.listener(|this, _, _, cx| {
+                            this.state.push_undo();
                             if let Some(c) = this.state.selected_clip_mut() {
                                 c.volume = c.volume.saturating_sub(10);
                             }
                             cx.notify();
                         }),
                         cx.listener(|this, _, _, cx| {
+                            this.state.push_undo();
                             if let Some(c) = this.state.selected_clip_mut() {
                                 c.volume = (c.volume + 10).min(100);
                             }
                             cx.notify();
                         }),
                     ))
-                    .child(
-                        div()
-                            .id("inspector-remove")
-                            .mt_2()
-                            .py_1p5()
-                            .rounded_md()
-                            .bg(Theme::bg_surface())
-                            .border_1()
-                            .border_color(Theme::border())
-                            .flex()
-                            .justify_center()
-                            .text_xs()
-                            .text_color(rgb(Theme::PLAYHEAD))
-                            .cursor_pointer()
-                            .hover(|s| s.bg(Theme::bg_hover()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.delete_selected_clip();
-                                this.sync_preview_after_seek(cx);
-                                cx.notify();
-                            }))
-                            .child("Remove Clip"),
-                    )
             } else {
                 div()
                     .p_4()
                     .text_xs()
                     .text_color(Theme::text_muted())
-                    .child("Select a clip on the timeline to inspect and adjust properties.")
+                    .child("Select a clip on the timeline to inspect, drag, or trim its edges.")
             })
     }
 
@@ -1253,13 +1439,43 @@ impl EditorView {
             )
     }
 
+    fn track_flag_btn(
+        &self,
+        id: SharedString,
+        label: &'static str,
+        tooltip: &'static str,
+        active: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .w(px(18.))
+            .h(px(18.))
+            .rounded_sm()
+            .bg(if active {
+                rgb(Theme::PLAYHEAD)
+            } else {
+                Theme::bg_surface()
+            })
+            .border_1()
+            .border_color(Theme::border())
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_xs()
+            .text_color(Theme::text_primary())
+            .cursor_pointer()
+            .hover(|s| s.bg(Theme::bg_hover()))
+            .tooltip(build_tooltip(tooltip))
+            .child(label)
+    }
+
     fn render_timeline(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let px_per_sec = self.state.px_per_sec;
         let total_secs = self.state.total_duration_secs;
         let playhead_px = self.state.playhead_secs * px_per_sec;
 
         let win_width = f32::from(window.viewport_size().width);
-        let viewport_w = (win_width - 90.0).max(200.0);
+        let viewport_w = (win_width - TRACK_HEADER_W).max(200.0);
         let timeline_width = (total_secs * px_per_sec).max(viewport_w);
         let max_scroll = (timeline_width - viewport_w).max(0.0);
         let scroll_x = self.timeline_scroll_x.clamp(0.0, max_scroll);
@@ -1273,6 +1489,7 @@ impl EditorView {
         };
 
         let selected_clip_id = self.state.selected_clip_id;
+        let snap_enabled = self.state.snap_enabled;
 
         let ruler_step: usize = if px_per_sec >= 24.0 {
             2
@@ -1301,7 +1518,7 @@ impl EditorView {
                     ScrollDelta::Lines(p) => (p.x * 24.0, p.y * 24.0),
                 };
 
-                let vp_w = (f32::from(window.viewport_size().width) - 90.0).max(200.0);
+                let vp_w = (f32::from(window.viewport_size().width) - TRACK_HEADER_W).max(200.0);
 
                 if event.modifiers.control {
                     let old_pps = this.state.px_per_sec;
@@ -1309,16 +1526,18 @@ impl EditorView {
                     this.state.adjust_zoom(factor);
                     let new_pps = this.state.px_per_sec;
 
-                    // Keep mouse position roughly anchored while zooming
-                    let cursor_in_tracks = (f32::from(event.position.x) - 90.0).clamp(0.0, vp_w);
+                    let cursor_in_tracks =
+                        (f32::from(event.position.x) - TRACK_HEADER_W).clamp(0.0, vp_w);
                     let time_at_cursor = (this.timeline_scroll_x + cursor_in_tracks) / old_pps;
                     let new_scroll = time_at_cursor * new_pps - cursor_in_tracks;
                     let new_max = (this.state.total_duration_secs * new_pps - vp_w).max(0.0);
                     this.timeline_scroll_x = new_scroll.clamp(0.0, new_max);
                 } else {
                     let delta = if dx.abs() > dy.abs() { dx } else { dy };
-                    let new_max = (this.state.total_duration_secs * this.state.px_per_sec - vp_w).max(0.0);
-                    this.timeline_scroll_x = (this.timeline_scroll_x - delta * 2.0).clamp(0.0, new_max);
+                    let new_max =
+                        (this.state.total_duration_secs * this.state.px_per_sec - vp_w).max(0.0);
+                    this.timeline_scroll_x =
+                        (this.timeline_scroll_x - delta * 2.0).clamp(0.0, new_max);
                 }
                 cx.notify();
             }))
@@ -1357,24 +1576,107 @@ impl EditorView {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap_1p5()
                             .child(
-                                self.header_button("tl-split", "Split at Playhead", false)
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.split_selected_or_at_playhead();
+                                self.icon_button(
+                                    "tl-undo",
+                                    "↶",
+                                    "Undo (Ctrl+Z)",
+                                    false,
+                                    self.state.can_undo(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.state.undo() {
                                         this.sync_preview_after_seek(cx);
-                                        cx.notify();
-                                    })),
+                                    }
+                                    cx.notify();
+                                })),
                             )
                             .child(
-                                self.header_button("tl-zoom-out", "Zoom -", false)
+                                self.icon_button(
+                                    "tl-redo",
+                                    "↷",
+                                    "Redo (Ctrl+Y)",
+                                    false,
+                                    self.state.can_redo(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.state.redo() {
+                                        this.sync_preview_after_seek(cx);
+                                    }
+                                    cx.notify();
+                                })),
+                            )
+                            .child(div().w(px(1.)).h(px(16.)).mx_1().bg(Theme::border()))
+                            .child(
+                                self.icon_button(
+                                    "tl-split",
+                                    "✂",
+                                    "Split at Playhead (Ctrl+B)",
+                                    false,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.split_selected_or_at_playhead();
+                                    this.sync_preview_after_seek(cx);
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "tl-delete",
+                                    "🗑",
+                                    "Delete Clip (Del)",
+                                    false,
+                                    selected_clip_id.is_some(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.delete_selected_clip();
+                                    this.sync_preview_after_seek(cx);
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "tl-ripple",
+                                    "⇇",
+                                    "Ripple Delete (Shift+Del)",
+                                    false,
+                                    selected_clip_id.is_some(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.ripple_delete_selected();
+                                    this.sync_preview_after_seek(cx);
+                                    cx.notify();
+                                })),
+                            )
+                            .child(div().w(px(1.)).h(px(16.)).mx_1().bg(Theme::border()))
+                            .child(
+                                self.icon_button(
+                                    "tl-snap",
+                                    "⌖",
+                                    if snap_enabled {
+                                        "Snap to Edges: ON"
+                                    } else {
+                                        "Snap to Edges: OFF"
+                                    },
+                                    snap_enabled,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.snap_enabled = !this.state.snap_enabled;
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button("tl-zoom-out", "−", "Zoom Out", false, true)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.adjust_zoom(0.8);
                                         cx.notify();
                                     })),
                             )
                             .child(
-                                self.header_button("tl-zoom-in", "Zoom +", false)
+                                self.icon_button("tl-zoom-in", "+", "Zoom In", false, true)
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.state.adjust_zoom(1.25);
                                         cx.notify();
@@ -1387,10 +1689,10 @@ impl EditorView {
                     .flex_1()
                     .flex()
                     .overflow_hidden()
-                    // Track headers column
+                    // Track headers column with Mute / Hide / Lock
                     .child(
                         div()
-                            .w(px(90.))
+                            .w(px(TRACK_HEADER_W))
                             .h_full()
                             .flex()
                             .flex_col()
@@ -1400,35 +1702,115 @@ impl EditorView {
                             .child(
                                 div()
                                     .h(px(26.))
-                                    .border_b_1()
-                                    .border_color(Theme::border()),
-                            )
-                            .children(tracks.iter().map(|track| {
-                                div()
-                                    .h(px(48.))
-                                    .px_3()
+                                    .px_2()
                                     .flex()
                                     .items_center()
-                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(Theme::text_muted())
+                                    .border_b_1()
+                                    .border_color(Theme::border())
+                                    .child("Tracks"),
+                            )
+                            .children(tracks.iter().map(|track| {
+                                let t = *track;
+                                let flags = self.state.track_flags(t);
+
+                                div()
+                                    .h(px(48.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
                                     .border_b_1()
                                     .border_color(Theme::border())
                                     .child(
                                         div()
-                                            .w(px(6.))
-                                            .h(px(16.))
-                                            .rounded_sm()
-                                            .bg(rgb(track.color_hex())),
+                                            .flex()
+                                            .items_center()
+                                            .gap_1p5()
+                                            .child(
+                                                div()
+                                                    .w(px(4.))
+                                                    .h(px(16.))
+                                                    .rounded_sm()
+                                                    .bg(rgb(t.color_hex())),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                                    .text_color(Theme::text_secondary())
+                                                    .child(t.label()),
+                                            ),
                                     )
                                     .child(
                                         div()
-                                            .text_xs()
-                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                            .text_color(Theme::text_secondary())
-                                            .child(format!(
-                                                "{} {}",
-                                                track.label(),
-                                                track.display_name()
-                                            )),
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .when(t != TrackKind::Overlay, |el| {
+                                                el.child(
+                                                    self.track_flag_btn(
+                                                        SharedString::from(format!(
+                                                            "mute-{}",
+                                                            t.label()
+                                                        )),
+                                                        "M",
+                                                        if flags.muted {
+                                                            "Unmute Track"
+                                                        } else {
+                                                            "Mute Track"
+                                                        },
+                                                        flags.muted,
+                                                    )
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.state.toggle_mute(t);
+                                                        this.sync_preview_after_seek(cx);
+                                                        cx.notify();
+                                                    })),
+                                                )
+                                            })
+                                            .when(t != TrackKind::Audio, |el| {
+                                                el.child(
+                                                    self.track_flag_btn(
+                                                        SharedString::from(format!(
+                                                            "hide-{}",
+                                                            t.label()
+                                                        )),
+                                                        "H",
+                                                        if flags.hidden {
+                                                            "Show Track"
+                                                        } else {
+                                                            "Hide Track"
+                                                        },
+                                                        flags.hidden,
+                                                    )
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.state.toggle_hide(t);
+                                                        this.sync_preview_after_seek(cx);
+                                                        cx.notify();
+                                                    })),
+                                                )
+                                            })
+                                            .child(
+                                                self.track_flag_btn(
+                                                    SharedString::from(format!(
+                                                        "lock-{}",
+                                                        t.label()
+                                                    )),
+                                                    "L",
+                                                    if flags.locked {
+                                                        "Unlock Track"
+                                                    } else {
+                                                        "Lock Track"
+                                                    },
+                                                    flags.locked,
+                                                )
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.toggle_lock(t);
+                                                    cx.notify();
+                                                })),
+                                            ),
                                     )
                             })),
                     )
@@ -1509,7 +1891,9 @@ impl EditorView {
                                                 let is_sel = selected_clip_id == Some(clip_id);
                                                 let left = clip.start_secs * px_per_sec;
                                                 let width =
-                                                    (clip.duration_secs * px_per_sec).max(20.0);
+                                                    (clip.duration_secs * px_per_sec).max(24.0);
+                                                let init_start = clip.start_secs;
+                                                let init_dur = clip.duration_secs;
 
                                                 div()
                                                     .id(SharedString::from(format!(
@@ -1521,7 +1905,6 @@ impl EditorView {
                                                     .top(px(6.))
                                                     .w(px(width))
                                                     .h(px(36.))
-                                                    .px_2()
                                                     .rounded_md()
                                                     .bg(rgb(clip.track.color_hex()))
                                                     .border_2()
@@ -1532,18 +1915,130 @@ impl EditorView {
                                                     })
                                                     .flex()
                                                     .items_center()
+                                                    .justify_between()
                                                     .overflow_hidden()
                                                     .cursor_pointer()
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.state.selected_clip_id = Some(clip_id);
-                                                        cx.notify();
-                                                    }))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(
+                                                            move |this,
+                                                                  event: &MouseDownEvent,
+                                                                  _,
+                                                                  cx| {
+                                                                cx.stop_propagation();
+                                                                this.state.selected_clip_id =
+                                                                    Some(clip_id);
+                                                                this.state.push_undo();
+                                                                this.clip_drag =
+                                                                    Some(ClipDragState {
+                                                                        clip_id,
+                                                                        kind: ClipDragKind::Move,
+                                                                        start_mouse_x: f32::from(
+                                                                            event.position.x,
+                                                                        ),
+                                                                        initial_start_secs:
+                                                                            init_start,
+                                                                        initial_duration_secs:
+                                                                            init_dur,
+                                                                    });
+                                                                cx.notify();
+                                                            },
+                                                        ),
+                                                    )
+                                                    // Left trim handle
                                                     .child(
                                                         div()
+                                                            .id(SharedString::from(format!(
+                                                                "trim-l-{}",
+                                                                clip_id
+                                                            )))
+                                                            .w(px(7.))
+                                                            .h_full()
+                                                            .bg(if is_sel {
+                                                                Theme::text_primary()
+                                                            } else {
+                                                                rgb(clip.track.color_hex())
+                                                            })
+                                                            .cursor_ew_resize()
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(
+                                                                    move |this,
+                                                                          event: &MouseDownEvent,
+                                                                          _,
+                                                                          cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.state.selected_clip_id =
+                                                                            Some(clip_id);
+                                                                        this.state.push_undo();
+                                                                        this.clip_drag = Some(
+                                                                            ClipDragState {
+                                                                                clip_id,
+                                                                                kind: ClipDragKind::TrimLeft,
+                                                                                start_mouse_x: f32::from(
+                                                                                    event.position.x,
+                                                                                ),
+                                                                                initial_start_secs: init_start,
+                                                                                initial_duration_secs: init_dur,
+                                                                            },
+                                                                        );
+                                                                        cx.notify();
+                                                                    },
+                                                                ),
+                                                            ),
+                                                    )
+                                                    // Clip title
+                                                    .child(
+                                                        div()
+                                                            .flex_1()
+                                                            .px_1()
+                                                            .overflow_hidden()
                                                             .text_xs()
                                                             .font_weight(gpui::FontWeight::MEDIUM)
                                                             .text_color(Theme::text_primary())
                                                             .child(clip.name),
+                                                    )
+                                                    // Right trim handle
+                                                    .child(
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "trim-r-{}",
+                                                                clip_id
+                                                            )))
+                                                            .w(px(7.))
+                                                            .h_full()
+                                                            .bg(if is_sel {
+                                                                Theme::text_primary()
+                                                            } else {
+                                                                rgb(clip.track.color_hex())
+                                                            })
+                                                            .cursor_ew_resize()
+                                                            .on_mouse_down(
+                                                                MouseButton::Left,
+                                                                cx.listener(
+                                                                    move |this,
+                                                                          event: &MouseDownEvent,
+                                                                          _,
+                                                                          cx| {
+                                                                        cx.stop_propagation();
+                                                                        this.state.selected_clip_id =
+                                                                            Some(clip_id);
+                                                                        this.state.push_undo();
+                                                                        this.clip_drag = Some(
+                                                                            ClipDragState {
+                                                                                clip_id,
+                                                                                kind: ClipDragKind::TrimRight,
+                                                                                start_mouse_x: f32::from(
+                                                                                    event.position.x,
+                                                                                ),
+                                                                                initial_start_secs: init_start,
+                                                                                initial_duration_secs: init_dur,
+                                                                            },
+                                                                        );
+                                                                        cx.notify();
+                                                                    },
+                                                                ),
+                                                            ),
                                                     )
                                             }))
                                     }))
@@ -1571,7 +2066,7 @@ impl EditorView {
                     .border_color(Theme::border())
                     .child(
                         div()
-                            .w(px(90.))
+                            .w(px(TRACK_HEADER_W))
                             .h_full()
                             .border_r_1()
                             .border_color(Theme::border()),
@@ -1590,7 +2085,8 @@ impl EditorView {
                                     if max_scroll <= 0.0 || thumb_track_space <= 0.0 {
                                         return;
                                     }
-                                    let click_x = (f32::from(event.position.x) - 90.0).max(0.0);
+                                    let click_x =
+                                        (f32::from(event.position.x) - TRACK_HEADER_W).max(0.0);
                                     let target_thumb_left =
                                         (click_x - thumb_w * 0.5).clamp(0.0, thumb_track_space);
                                     this.timeline_scroll_x =
@@ -1637,12 +2133,43 @@ impl EditorView {
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id("editor-root")
+            .track_focus(&self.focus_handle)
             .size_full()
             .flex()
             .flex_col()
             .bg(Theme::bg_app())
             .text_color(Theme::text_primary())
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _, cx| {
+                this.handle_key_down(event, cx);
+            }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if let Some(drag) = this.clip_drag {
+                    let dx = f32::from(event.position.x) - drag.start_mouse_x;
+                    let dt = dx / this.state.px_per_sec;
+                    match drag.kind {
+                        ClipDragKind::Move => {
+                            let snap_threshold = 10.0 / this.state.px_per_sec;
+                            this.state.move_clip_with_snap(
+                                drag.clip_id,
+                                drag.initial_start_secs + dt,
+                                snap_threshold,
+                            );
+                        }
+                        ClipDragKind::TrimLeft => {
+                            this.state
+                                .trim_clip_left(drag.clip_id, drag.initial_start_secs + dt);
+                        }
+                        ClipDragKind::TrimRight => {
+                            let new_end =
+                                drag.initial_start_secs + drag.initial_duration_secs + dt;
+                            this.state.trim_clip_right(drag.clip_id, new_end);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+
                 if this.playhead_dragging {
                     this.seek_from_window_x(f32::from(event.position.x), window, cx);
                     return;
@@ -1650,8 +2177,9 @@ impl Render for EditorView {
                 if !this.scrollbar_dragging {
                     return;
                 }
-                let vp_w = (f32::from(window.viewport_size().width) - 90.0).max(200.0);
-                let timeline_w = (this.state.total_duration_secs * this.state.px_per_sec).max(vp_w);
+                let vp_w = (f32::from(window.viewport_size().width) - TRACK_HEADER_W).max(200.0);
+                let timeline_w =
+                    (this.state.total_duration_secs * this.state.px_per_sec).max(vp_w);
                 let max_scroll = (timeline_w - vp_w).max(0.0);
                 let thumb_w = ((vp_w / timeline_w) * vp_w).clamp(36.0, vp_w);
                 let track_space = (vp_w - thumb_w).max(1.0);
@@ -1666,6 +2194,11 @@ impl Render for EditorView {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     let mut changed = false;
+                    if this.clip_drag.is_some() {
+                        this.clip_drag = None;
+                        this.sync_preview_after_seek(cx);
+                        changed = true;
+                    }
                     if this.scrollbar_dragging {
                         this.scrollbar_dragging = false;
                         changed = true;

@@ -8,7 +8,7 @@ use gpui::RenderImage;
 use image::{Frame, RgbaImage};
 use smallvec::smallvec;
 
-use crate::model::{TimelineClip, TrackKind};
+use opencut_core::{TimelineClip, TrackFlags, TrackKind};
 
 pub const PREVIEW_WIDTH: u32 = 640;
 pub const PREVIEW_HEIGHT: u32 = 360;
@@ -209,6 +209,90 @@ impl Drop for VideoStreamPlayer {
     }
 }
 
+pub struct AudioStreamPlayer {
+    active_processes: Vec<(usize, Child)>,
+}
+
+impl AudioStreamPlayer {
+    pub fn new() -> Self {
+        Self {
+            active_processes: Vec::new(),
+        }
+    }
+
+    pub fn sync_playing_clips(
+        &mut self,
+        clips: &[&TimelineClip],
+        playhead_secs: f32,
+    ) {
+        let desired_ids: Vec<usize> = clips.iter().map(|c| c.id).collect();
+
+        // Stop clips that are no longer active
+        let mut i = 0;
+        while i < self.active_processes.len() {
+            let (id, _) = &self.active_processes[i];
+            if !desired_ids.contains(id) {
+                let (_, mut child) = self.active_processes.remove(i);
+                let _ = child.kill();
+                let _ = child.wait();
+            } else {
+                i += 1;
+            }
+        }
+
+        // Start newly entered clips
+        for clip in clips {
+            if self.active_processes.iter().any(|(id, _)| *id == clip.id) {
+                continue;
+            }
+            let Some(path) = &clip.source_path else {
+                continue;
+            };
+            if clip.track == TrackKind::Video && !has_audio_stream(path) {
+                continue;
+            }
+
+            let offset = clip.source_in_secs + (playhead_secs - clip.start_secs).max(0.0);
+            let mut cmd = Command::new("ffplay");
+            apply_no_window(&mut cmd);
+            cmd.args([
+                "-nodisp",
+                "-autoexit",
+                "-vn",
+                "-loglevel",
+                "quiet",
+                "-ss",
+                &format!("{:.3}", offset.max(0.0)),
+                "-t",
+                &format!("{:.3}", (clip.end_secs() - playhead_secs).max(0.1)),
+                "-volume",
+                &clip.volume.to_string(),
+            ])
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+
+            if let Ok(child) = cmd.spawn() {
+                self.active_processes.push((clip.id, child));
+            }
+        }
+    }
+
+    pub fn stop(&mut self) {
+        for (_, mut child) in self.active_processes.drain(..) {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+impl Drop for AudioStreamPlayer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub fn has_audio_stream(path: &Path) -> bool {
     let mut cmd = Command::new("ffprobe");
     apply_no_window(&mut cmd);
@@ -258,7 +342,11 @@ pub struct ExportHandle {
     pub error: Arc<Mutex<Option<String>>>,
 }
 
-pub fn start_export_timeline(clips: Vec<TimelineClip>, output_path: PathBuf) -> ExportHandle {
+pub fn start_export_timeline(
+    clips: Vec<TimelineClip>,
+    track_flags: [TrackFlags; 3],
+    output_path: PathBuf,
+) -> ExportHandle {
     let progress_pct = Arc::new(Mutex::new(0.0_f32));
     let finished = Arc::new(AtomicBool::new(false));
     let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
@@ -273,7 +361,12 @@ pub fn start_export_timeline(clips: Vec<TimelineClip>, output_path: PathBuf) -> 
     std::thread::spawn(move || {
         let valid_clips: Vec<TimelineClip> = clips
             .into_iter()
-            .filter(|c| c.source_path.is_some() && c.duration_secs > 0.05)
+            .filter(|c| {
+                let flags = track_flags[c.track.index()];
+                let visible = c.track == TrackKind::Audio || !flags.hidden;
+                let audible = c.track != TrackKind::Audio || !flags.muted;
+                c.source_path.is_some() && c.duration_secs > 0.05 && (visible || audible)
+            })
             .collect();
 
         if valid_clips.is_empty() {
@@ -328,6 +421,7 @@ pub fn start_export_timeline(clips: Vec<TimelineClip>, output_path: PathBuf) -> 
             let Some(path) = &clip.source_path else {
                 continue;
             };
+            let flags = track_flags[clip.track.index()];
 
             match clip.track {
                 TrackKind::Video => {
@@ -340,35 +434,37 @@ pub fn start_export_timeline(clips: Vec<TimelineClip>, output_path: PathBuf) -> 
                     .arg("-i")
                     .arg(path);
 
-                    let v_prep = format!("vp{}", video_step);
-                    let v_out = format!("vout{}", video_step);
-                    video_step += 1;
+                    if !flags.hidden {
+                        let v_prep = format!("vp{}", video_step);
+                        let v_out = format!("vout{}", video_step);
+                        video_step += 1;
 
-                    let scale_factor = (clip.scale as f32 / 100.0).clamp(0.1, 2.0);
-                    let target_w = ((1280.0 * scale_factor) as u32).max(16) & !1;
-                    let target_h = ((720.0 * scale_factor) as u32).max(16) & !1;
-                    let opacity = (clip.opacity as f32 / 100.0).clamp(0.0, 1.0);
+                        let scale_factor = (clip.scale as f32 / 100.0).clamp(0.1, 2.0);
+                        let target_w = ((1280.0 * scale_factor) as u32).max(16) & !1;
+                        let target_h = ((720.0 * scale_factor) as u32).max(16) & !1;
+                        let opacity = (clip.opacity as f32 / 100.0).clamp(0.0, 1.0);
 
-                    filter_parts.push(format!(
-                        "[{in_idx}:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,format=yuva420p,colorchannelmixer=aa={op:.2},setpts=PTS-STARTPTS+{st:.3}/TB[{vp}]",
-                        in_idx = input_idx,
-                        tw = target_w,
-                        th = target_h,
-                        op = opacity,
-                        st = clip.start_secs,
-                        vp = v_prep
-                    ));
-                    filter_parts.push(format!(
-                        "{prev}[{vp}]overlay=(W-w)/2:(H-h)/2:enable='between(t,{st:.3},{en:.3})'[{vo}]",
-                        prev = last_video_label,
-                        vp = v_prep,
-                        st = clip.start_secs,
-                        en = clip.end_secs(),
-                        vo = v_out
-                    ));
-                    last_video_label = format!("[{}]", v_out);
+                        filter_parts.push(format!(
+                            "[{in_idx}:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,format=yuva420p,colorchannelmixer=aa={op:.2},setpts=PTS-STARTPTS+{st:.3}/TB[{vp}]",
+                            in_idx = input_idx,
+                            tw = target_w,
+                            th = target_h,
+                            op = opacity,
+                            st = clip.start_secs,
+                            vp = v_prep
+                        ));
+                        filter_parts.push(format!(
+                            "{prev}[{vp}]overlay=(W-w)/2:(H-h)/2:enable='between(t,{st:.3},{en:.3})'[{vo}]",
+                            prev = last_video_label,
+                            vp = v_prep,
+                            st = clip.start_secs,
+                            en = clip.end_secs(),
+                            vo = v_out
+                        ));
+                        last_video_label = format!("[{}]", v_out);
+                    }
 
-                    if clip.volume > 0 && has_audio_stream(path) {
+                    if !flags.muted && clip.volume > 0 && has_audio_stream(path) {
                         let a_label = format!("a{}", audio_step);
                         audio_step += 1;
                         let delay_ms = (clip.start_secs * 1000.0).round() as u64;
@@ -427,19 +523,21 @@ pub fn start_export_timeline(clips: Vec<TimelineClip>, output_path: PathBuf) -> 
                     .arg("-i")
                     .arg(path);
 
-                    let a_label = format!("a{}", audio_step);
-                    audio_step += 1;
-                    let delay_ms = (clip.start_secs * 1000.0).round() as u64;
-                    let vol = clip.volume as f32 / 100.0;
-                    filter_parts.push(format!(
-                        "[{in_idx}:a]atrim=0:{dur:.3},asetpts=PTS-STARTPTS,volume={vol:.2},adelay={d}|{d}[{al}]",
-                        in_idx = input_idx,
-                        dur = clip.duration_secs,
-                        vol = vol,
-                        d = delay_ms,
-                        al = a_label
-                    ));
-                    audio_labels.push(format!("[{}]", a_label));
+                    if !flags.muted && clip.volume > 0 {
+                        let a_label = format!("a{}", audio_step);
+                        audio_step += 1;
+                        let delay_ms = (clip.start_secs * 1000.0).round() as u64;
+                        let vol = clip.volume as f32 / 100.0;
+                        filter_parts.push(format!(
+                            "[{in_idx}:a]atrim=0:{dur:.3},asetpts=PTS-STARTPTS,volume={vol:.2},adelay={d}|{d}[{al}]",
+                            in_idx = input_idx,
+                            dur = clip.duration_secs,
+                            vol = vol,
+                            d = delay_ms,
+                            al = a_label
+                        ));
+                        audio_labels.push(format!("[{}]", a_label));
+                    }
                 }
             }
         }

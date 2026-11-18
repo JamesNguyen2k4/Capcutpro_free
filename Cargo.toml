@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
   'apps/desktop',
+  'crates/opencut-core',
 ]
 
 [workspace.package]

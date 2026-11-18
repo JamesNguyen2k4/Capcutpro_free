@@ -20,10 +20,6 @@ impl Theme {
     pub const PLAYHEAD: u32 = 0xef4444;
     pub const SUCCESS: u32 = 0x22c55e;
 
-    pub const CLIP_VIDEO: u32 = 0x2563eb;
-    pub const CLIP_OVERLAY: u32 = 0x8b5cf6;
-    pub const CLIP_AUDIO: u32 = 0x059669;
-
     pub fn bg_app() -> Rgba {
         rgb(Self::BG_APP)
     }
