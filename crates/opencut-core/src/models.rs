@@ -392,6 +392,16 @@ pub struct TimelineMarker {
     pub color_hex: u32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClipKeyframe {
+    pub time_offset_secs: f32,
+    pub pos_x: f32,
+    pub pos_y: f32,
+    pub scale: u16,
+    pub rotation_deg: f32,
+    pub opacity: u8,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct MediaAsset {
     pub id: usize,
@@ -448,6 +458,8 @@ pub struct TimelineClip {
     pub text: Option<TextClipData>,
     #[serde(default)]
     pub linked_clip_id: Option<usize>,
+    #[serde(default)]
+    pub keyframes: Vec<ClipKeyframe>,
 }
 
 impl TimelineClip {
@@ -457,6 +469,67 @@ impl TimelineClip {
 
     pub fn contains(&self, time_secs: f32) -> bool {
         time_secs >= self.start_secs && time_secs < self.end_secs()
+    }
+
+    /// Evaluate animated (pos_x, pos_y, scale, rotation_deg, opacity) at timeline `time_secs`.
+    pub fn evaluate_at(&self, time_secs: f32) -> (f32, f32, u16, f32, u8) {
+        if self.keyframes.is_empty() {
+            return (
+                self.pos_x,
+                self.pos_y,
+                self.scale,
+                self.rotation_deg,
+                self.opacity,
+            );
+        }
+
+        let local_t = (time_secs - self.start_secs).clamp(0.0, self.duration_secs);
+        let first = &self.keyframes[0];
+        if local_t <= first.time_offset_secs {
+            return (
+                first.pos_x,
+                first.pos_y,
+                first.scale,
+                first.rotation_deg,
+                first.opacity,
+            );
+        }
+
+        let last = &self.keyframes[self.keyframes.len() - 1];
+        if local_t >= last.time_offset_secs {
+            return (
+                last.pos_x,
+                last.pos_y,
+                last.scale,
+                last.rotation_deg,
+                last.opacity,
+            );
+        }
+
+        for pair in self.keyframes.windows(2) {
+            let a = &pair[0];
+            let b = &pair[1];
+            if local_t >= a.time_offset_secs && local_t <= b.time_offset_secs {
+                let span = (b.time_offset_secs - a.time_offset_secs).max(0.0001);
+                let t = ((local_t - a.time_offset_secs) / span).clamp(0.0, 1.0);
+                let lerp = |x: f32, y: f32| x + (y - x) * t;
+                return (
+                    lerp(a.pos_x, b.pos_x),
+                    lerp(a.pos_y, b.pos_y),
+                    lerp(a.scale as f32, b.scale as f32).round() as u16,
+                    lerp(a.rotation_deg, b.rotation_deg),
+                    lerp(a.opacity as f32, b.opacity as f32).round() as u8,
+                );
+            }
+        }
+
+        (
+            self.pos_x,
+            self.pos_y,
+            self.scale,
+            self.rotation_deg,
+            self.opacity,
+        )
     }
 }
 

@@ -1,15 +1,17 @@
-﻿use std::ops::Range;
+﻿use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use gpui::{
     AnyView, AppContext, Bounds, Context, ElementInputHandler, EntityInputHandler, ExternalPaths,
     FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render,
-    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
-    StyledImage, UTF16Selection, Window, canvas, div, img, prelude::FluentBuilder, px, rgb,
+    MouseMoveEvent, ObjectFit, ParentElement, PathBuilder, PathPromptOptions, Pixels, Point,
+    Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
+    Styled, StyledImage, UTF16Selection, Window, canvas, div, img, point, prelude::FluentBuilder,
+    px, rgb,
 };
 use opencut_core::{
     AspectRatio, EditorCore, RecentProjectEntry, TextAnimation, TextPreset, TrackKind,
@@ -17,8 +19,9 @@ use opencut_core::{
 };
 
 use crate::media_engine::{
-    AudioStreamPlayer, ExportHandle, VideoStreamPlayer, decode_single_frame, probe_duration_secs,
-    reveal_in_explorer, start_export_timeline,
+    AudioStreamPlayer, ExportHandle, VideoStreamPlayer, decode_single_frame, export_freeze_frame,
+    probe_duration_secs, probe_media_dimensions, render_rotated_text_frame, reveal_in_explorer,
+    start_export_timeline,
 };
 use crate::theme::Theme;
 
@@ -78,14 +81,62 @@ struct ClipDragState {
 }
 
 #[derive(Clone, Copy)]
+enum PreviewTransformKind {
+    Move,
+    ResizeCorner,
+    Rotate,
+}
+
+#[derive(Clone, Copy)]
 struct PreviewTextDragState {
     clip_id: usize,
+    kind: PreviewTransformKind,
     start_mouse_x: f32,
     start_mouse_y: f32,
     initial_pos_x: f32,
     initial_pos_y: f32,
+    initial_scale: u16,
+    initial_font_size: f32,
+    initial_rot: f32,
+    center_x: f32,
+    center_y: f32,
     preview_scale: f32,
     moved: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct PreviewSnapGuides {
+    center_x: bool,
+    center_y: bool,
+    left_edge: bool,
+    right_edge: bool,
+    top_edge: bool,
+    bottom_edge: bool,
+    safe_left: bool,
+    safe_right: bool,
+    safe_top: bool,
+    safe_bottom: bool,
+}
+
+fn snap_rotation_angle(deg: f32, shift: bool) -> (f32, Option<f32>) {
+    let norm = deg.rem_euclid(360.0);
+    if shift {
+        let s = ((norm / 15.0).round() * 15.0).rem_euclid(360.0);
+        return (s, Some(s));
+    }
+    for target in [0.0_f32, 90.0, 180.0, 270.0] {
+        let diff = ((norm - target + 180.0).rem_euclid(360.0) - 180.0).abs();
+        if diff <= 4.0 {
+            return (target, Some(target));
+        }
+    }
+    for target in [45.0_f32, 135.0, 225.0, 315.0] {
+        let diff = ((norm - target + 180.0).rem_euclid(360.0) - 180.0).abs();
+        if diff <= 2.5 {
+            return (target, Some(target));
+        }
+    }
+    (norm, None)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -125,6 +176,8 @@ impl PreviewQuality {
 enum SliderField {
     Opacity,
     Scale,
+    Rotation,
+    Speed,
     Volume,
     FontSize,
     FontWeight,
@@ -159,6 +212,7 @@ pub struct EditorView {
     editing_text_clip_id: Option<usize>,
     marked_text_range: Option<Range<usize>>,
     preview_quality: PreviewQuality,
+    preview_zoom: f32,
     show_safe_zone: bool,
     preview_fullscreen: bool,
     playback_started: bool,
@@ -174,6 +228,11 @@ pub struct EditorView {
     clip_drag: Option<ClipDragState>,
     preview_text_drag: Option<PreviewTextDragState>,
     slider_drag: Option<SliderField>,
+    media_dim_cache: HashMap<PathBuf, (u32, u32)>,
+    last_rotate_sync: Option<Instant>,
+    active_snap_guides: PreviewSnapGuides,
+    rotated_text_cache: HashMap<usize, (u64, Arc<RenderImage>, u32, u32)>,
+    rotated_text_seq: HashMap<usize, u64>,
     export_status: ExportStatus,
 }
 
@@ -192,6 +251,7 @@ impl EditorView {
             editing_text_clip_id: None,
             marked_text_range: None,
             preview_quality: PreviewQuality::Half,
+            preview_zoom: 1.0,
             show_safe_zone: false,
             preview_fullscreen: false,
             playback_started: false,
@@ -207,10 +267,36 @@ impl EditorView {
             clip_drag: None,
             preview_text_drag: None,
             slider_drag: None,
+            media_dim_cache: HashMap::new(),
+            last_rotate_sync: None,
+            active_snap_guides: PreviewSnapGuides::default(),
+            rotated_text_cache: HashMap::new(),
+            rotated_text_seq: HashMap::new(),
             export_status: ExportStatus::Idle,
         };
         view.ensure_playback_loop(cx);
         view
+    }
+
+    fn clip_canvas_half_extents(&self, clip_id: usize) -> (f32, f32) {
+        let (out_w, out_h) = self.state.aspect_ratio.dimensions(self.state.base_height);
+        let cw = out_w as f32;
+        let ch = out_h as f32;
+        let Some(c) = self.state.clips.iter().find(|c| c.id == clip_id) else {
+            return (cw * 0.5, ch * 0.5);
+        };
+        if c.track == TrackKind::Text {
+            let td = c.text.as_ref();
+            let font_sz = td.map_or(48.0, |t| t.font_size);
+            let char_count = td.map_or(4.0, |t| t.content.chars().count().max(2) as f32);
+            let sc = c.scale as f32 / 100.0;
+            let est_w = (char_count * font_sz * 0.56 * sc).clamp(40.0, cw);
+            let est_h = (font_sz * 1.35 * sc).clamp(24.0, ch);
+            return (est_w * 0.5, est_h * 0.5);
+        }
+        let sc = (c.scale as f32 / 100.0).clamp(0.1, 2.0);
+        let (fit_w, fit_h) = self.fit_media_box(c.source_path.as_ref(), cw, ch);
+        (fit_w * sc * 0.5, fit_h * sc * 0.5)
     }
 
     fn apply_slider_ratio(&mut self, field: SliderField, ratio: f32) {
@@ -221,6 +307,14 @@ impl EditorView {
         match field {
             SliderField::Opacity => c.opacity = (r * 100.0).round() as u8,
             SliderField::Scale => c.scale = (10.0 + r * 190.0).round() as u16,
+            SliderField::Rotation => {
+                let (snapped, _) = snap_rotation_angle((r * 360.0).round(), false);
+                c.rotation_deg = snapped;
+            }
+            SliderField::Speed => {
+                let spd = ((0.25 + r * 3.75) * 4.0).round() / 4.0;
+                self.state.set_selected_speed(spd);
+            }
             SliderField::Volume => c.volume = (r * 100.0).round() as u8,
             SliderField::FontSize => {
                 if let Some(ref mut t) = c.text {
@@ -370,19 +464,30 @@ impl EditorView {
             return;
         };
 
+        let (_, _, _, rot, _) = active.evaluate_at(self.state.playhead_secs);
         let Some(path) = active.source_path else {
             return;
         };
 
         let ph = self.preview_quality.height();
+        let (cur_flip, cur_rot) = self.player.active_transform();
         if self.player.active_clip_id() != Some(active.id)
             || self.player.active_ratio() != Some(self.state.aspect_ratio)
             || self.player.active_height() != Some(ph)
+            || cur_flip != active.flip_h
+            || (cur_rot - rot).abs() > 1.0
         {
             let offset =
                 active.source_in_secs + (self.state.playhead_secs - active.start_secs).max(0.0);
-            self.player
-                .start(active.id, path, offset, self.state.aspect_ratio, ph);
+            self.player.start(
+                active.id,
+                path,
+                offset,
+                self.state.aspect_ratio,
+                ph,
+                active.flip_h,
+                rot,
+            );
         }
 
         if let Some(frame) = self.player.take_latest_frame() {
@@ -391,6 +496,7 @@ impl EditorView {
     }
 
     fn sync_preview_after_seek(&mut self, cx: &mut Context<Self>) {
+        self.sync_rotated_texts(cx);
         self.audio_player.stop();
         if self.state.is_playing {
             let audio_clips = self.state.active_audio_clips_at(self.state.playhead_secs);
@@ -411,6 +517,7 @@ impl EditorView {
             return;
         };
 
+        let (_, _, _, rot, _) = active.evaluate_at(self.state.playhead_secs);
         let Some(path) = active.source_path else {
             self.player.stop();
             self.set_current_frame(None, cx);
@@ -420,24 +527,180 @@ impl EditorView {
         let offset =
             active.source_in_secs + (self.state.playhead_secs - active.start_secs).max(0.0);
         let ph = self.preview_quality.height();
+        let paths_to_probe: Vec<PathBuf> = self
+            .state
+            .active_clips_at_playhead()
+            .into_iter()
+            .filter_map(|c| c.source_path.clone())
+            .filter(|p| !self.media_dim_cache.contains_key(p))
+            .collect();
+        for p in paths_to_probe {
+            self.ensure_media_dims_cached(p, cx);
+        }
+
         if self.state.is_playing {
-            self.player
-                .start(active.id, path, offset, self.state.aspect_ratio, ph);
+            self.player.start(
+                active.id,
+                path,
+                offset,
+                self.state.aspect_ratio,
+                ph,
+                active.flip_h,
+                rot,
+            );
         } else {
             self.player.stop();
-            self.request_single_frame(path, offset, cx);
+            self.request_single_frame(path, offset, active.flip_h, rot, cx);
         }
     }
 
-    fn request_single_frame(&mut self, path: PathBuf, offset_secs: f32, cx: &mut Context<Self>) {
+    fn sync_rotated_texts(&mut self, cx: &mut Context<Self>) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let texts: Vec<_> = self
+            .state
+            .active_clips_at_playhead()
+            .into_iter()
+            .filter(|c| c.track == TrackKind::Text && c.text.is_some())
+            .cloned()
+            .collect();
+
+        for tclip in texts {
+            let Some(td) = tclip.text.clone() else {
+                continue;
+            };
+            let (_, _, esc, erot, _) = tclip.evaluate_at(self.state.playhead_secs);
+            let norm_rot = erot.rem_euclid(360.0);
+            let needs_rot = tclip.flip_h || (norm_rot > 0.5 && norm_rot < 359.5);
+            if !needs_rot {
+                self.rotated_text_cache.remove(&tclip.id);
+                continue;
+            }
+            let clip_scale = (esc as f32 / 100.0).clamp(0.1, 2.0);
+            let font_sz = (td.font_size * clip_scale).clamp(8.0, 220.0);
+            let mut max_cols = 1usize;
+            let mut lines = 0usize;
+            for line in td.content.lines() {
+                lines += 1;
+                max_cols = max_cols.max(line.chars().count());
+            }
+            let lines = lines.max(1) as f32;
+            let pad = td.bg_padding.clamp(2.0, 24.0);
+            let box_w = ((max_cols as f32 * font_sz * 0.62) + pad * 2.0 + 24.0)
+                .ceil()
+                .max(48.0) as u32;
+            let box_h = ((lines * font_sz * 1.35) + pad * 1.5 + 16.0)
+                .ceil()
+                .max(32.0) as u32;
+
+            let mut hasher = DefaultHasher::new();
+            td.content.hash(&mut hasher);
+            td.font_family.hash(&mut hasher);
+            td.font_weight.hash(&mut hasher);
+            (font_sz.round() as i32).hash(&mut hasher);
+            td.color_hex.hash(&mut hasher);
+            td.bg_color_hex.hash(&mut hasher);
+            td.stroke_color_hex.hash(&mut hasher);
+            ((td.stroke_width * 10.0).round() as i32).hash(&mut hasher);
+            td.shadow_color_hex.hash(&mut hasher);
+            tclip.flip_h.hash(&mut hasher);
+            ((norm_rot * 2.0).round() as i32).hash(&mut hasher);
+            let sig = hasher.finish();
+
+            if self
+                .rotated_text_cache
+                .get(&tclip.id)
+                .is_some_and(|(s, _, _, _)| *s == sig)
+            {
+                continue;
+            }
+
+            let seq = self
+                .rotated_text_seq
+                .entry(tclip.id)
+                .and_modify(|v| *v = v.wrapping_add(1))
+                .or_insert(1);
+            let seq_val = *seq;
+            let cid = tclip.id;
+            let flip_h = tclip.flip_h;
+
+            let task = cx.background_executor().spawn(async move {
+                render_rotated_text_frame(&td, font_sz, box_w, box_h, flip_h, norm_rot)
+            });
+
+            cx.spawn(async move |this, cx| {
+                if let Some((r_img, rw, rh)) = task.await {
+                    let _ = this.update(cx, |view, cx| {
+                        if view.rotated_text_seq.get(&cid).copied() == Some(seq_val) {
+                            view.rotated_text_cache.insert(cid, (sig, r_img, rw, rh));
+                            cx.notify();
+                        }
+                    });
+                }
+            })
+            .detach();
+        }
+    }
+
+    fn ensure_media_dims_cached(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.media_dim_cache.contains_key(&path) {
+            return;
+        }
+        if let Ok((w, h)) = image::image_dimensions(&path) {
+            if w > 0 && h > 0 {
+                self.media_dim_cache.insert(path, (w, h));
+                return;
+            }
+        }
+        let path_clone = path.clone();
+        let task = cx
+            .background_executor()
+            .spawn(async move { probe_media_dimensions(&path_clone) });
+        cx.spawn(async move |this, cx| {
+            if let Some((w, h)) = task.await {
+                let _ = this.update(cx, |view, cx| {
+                    view.media_dim_cache.insert(path, (w, h));
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn fit_media_box(&self, path: Option<&PathBuf>, box_w: f32, box_h: f32) -> (f32, f32) {
+        if let Some(p) = path {
+            if let Some(&(sw, sh)) = self.media_dim_cache.get(p) {
+                if sw > 0 && sh > 0 {
+                    let src_ratio = sw as f32 / sh as f32;
+                    let box_ratio = box_w / box_h.max(1.0);
+                    return if src_ratio > box_ratio {
+                        (box_w, box_w / src_ratio)
+                    } else {
+                        (box_h * src_ratio, box_h)
+                    };
+                }
+            }
+        }
+        (box_w, box_h)
+    }
+
+    fn request_single_frame(
+        &mut self,
+        path: PathBuf,
+        offset_secs: f32,
+        flip_h: bool,
+        rotation_deg: f32,
+        cx: &mut Context<Self>,
+    ) {
         self.decode_seq = self.decode_seq.wrapping_add(1);
         let seq = self.decode_seq;
         let ratio = self.state.aspect_ratio;
         let ph = self.preview_quality.height();
 
-        let task = cx
-            .background_executor()
-            .spawn(async move { decode_single_frame(&path, offset_secs, ratio, ph) });
+        let task = cx.background_executor().spawn(async move {
+            decode_single_frame(&path, offset_secs, ratio, ph, flip_h, rotation_deg)
+        });
 
         cx.spawn(async move |this, cx| {
             let frame = task.await;
@@ -1483,6 +1746,262 @@ impl EditorView {
             })
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn render_rotated_transform_handles(
+        &self,
+        clip_id: usize,
+        rel_cx: f32,
+        rel_cy: f32,
+        box_w: f32,
+        box_h: f32,
+        init_px: f32,
+        init_py: f32,
+        init_scale: u16,
+        init_font: f32,
+        init_rot: f32,
+        center_x: f32,
+        center_y: f32,
+        preview_scale: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let hw = (box_w * 0.5).max(8.0);
+        let hh = (box_h * 0.5).max(8.0);
+        let rad = init_rot.to_radians();
+        let cos_a = rad.cos();
+        let sin_a = rad.sin();
+        let rot_pt = |lx: f32, ly: f32| -> (f32, f32) {
+            (
+                rel_cx + lx * cos_a - ly * sin_a,
+                rel_cy + lx * sin_a + ly * cos_a,
+            )
+        };
+
+        let tl = rot_pt(-hw, -hh);
+        let tr = rot_pt(hw, -hh);
+        let br = rot_pt(hw, hh);
+        let bl = rot_pt(-hw, hh);
+        let tc = rot_pt(0.0, -hh);
+        let rh = rot_pt(0.0, -(hh + 24.0));
+
+        let corners = [
+            ("tl", tl.0, tl.1, gpui::CursorStyle::ResizeUpRightDownLeft),
+            ("tr", tr.0, tr.1, gpui::CursorStyle::ResizeUpLeftDownRight),
+            ("bl", bl.0, bl.1, gpui::CursorStyle::ResizeUpLeftDownRight),
+            ("br", br.0, br.1, gpui::CursorStyle::ResizeUpRightDownLeft),
+        ];
+        let em_t = rot_pt(0.0, -hh);
+        let em_b = rot_pt(0.0, hh);
+        let em_l = rot_pt(-hw, 0.0);
+        let em_r = rot_pt(hw, 0.0);
+        let edges = [
+            ("top", em_t.0, em_t.1, gpui::CursorStyle::ResizeUpDown),
+            ("bottom", em_b.0, em_b.1, gpui::CursorStyle::ResizeUpDown),
+            ("left", em_l.0, em_l.1, gpui::CursorStyle::ResizeLeftRight),
+            ("right", em_r.0, em_r.1, gpui::CursorStyle::ResizeLeftRight),
+        ];
+
+        let is_rotating_now = self.preview_text_drag.as_ref().is_some_and(|d| {
+            d.clip_id == clip_id && matches!(d.kind, PreviewTransformKind::Rotate)
+        });
+        let snapped_key_angle = [0.0_f32, 45.0, 90.0, 135.0, 180.0, 225.0, 270.0, 315.0]
+            .iter()
+            .any(|t| ((init_rot.rem_euclid(360.0) - t + 180.0).rem_euclid(360.0) - 180.0).abs() < 0.05);
+
+        div()
+            .absolute()
+            .inset_0()
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, _| {
+                        let ox = f32::from(bounds.origin.x);
+                        let oy = f32::from(bounds.origin.y);
+                        if is_rotating_now {
+                            let axis_len = (hw.max(hh) + 36.0).max(64.0);
+                            let mut gpb = PathBuilder::stroke(px(1.0));
+                            gpb.move_to(point(px(ox + rel_cx - axis_len), px(oy + rel_cy)));
+                            gpb.line_to(point(px(ox + rel_cx + axis_len), px(oy + rel_cy)));
+                            gpb.move_to(point(px(ox + rel_cx), px(oy + rel_cy - axis_len)));
+                            gpb.line_to(point(px(ox + rel_cx), px(oy + rel_cy + axis_len)));
+                            if let Ok(gpath) = gpb.build() {
+                                let gcolor = if snapped_key_angle {
+                                    gpui::rgba(0xfacc15cc)
+                                } else {
+                                    gpui::rgba(0xffffff55)
+                                };
+                                window.paint_path(gpath, gcolor);
+                            }
+
+                            let mut rpb = PathBuilder::stroke(px(1.2));
+                            rpb.move_to(point(px(ox + rel_cx), px(oy + rel_cy)));
+                            rpb.line_to(point(px(ox + rh.0), px(oy + rh.1)));
+                            if let Ok(rpath) = rpb.build() {
+                                let rcolor = if snapped_key_angle {
+                                    gpui::rgba(0xfacc15ee)
+                                } else {
+                                    gpui::rgba(0x38bdf8cc)
+                                };
+                                window.paint_path(rpath, rcolor);
+                            }
+                        }
+
+                        let mut pb = PathBuilder::stroke(px(1.5));
+                        pb.move_to(point(px(ox + tl.0), px(oy + tl.1)));
+                        pb.line_to(point(px(ox + tr.0), px(oy + tr.1)));
+                        pb.line_to(point(px(ox + br.0), px(oy + br.1)));
+                        pb.line_to(point(px(ox + bl.0), px(oy + bl.1)));
+                        pb.close();
+                        pb.move_to(point(px(ox + tc.0), px(oy + tc.1)));
+                        pb.line_to(point(px(ox + rh.0), px(oy + rh.1)));
+                        if let Ok(path) = pb.build() {
+                            window.paint_path(path, Theme::accent());
+                        }
+                    },
+                )
+                .absolute()
+                .inset_0(),
+            )
+            .children(edges.into_iter().map(|(etag, ex, ey, cursor)| {
+                div()
+                    .id(SharedString::from(format!("rsz-e-{}-{}", etag, clip_id)))
+                    .absolute()
+                    .left(px(ex - 7.0))
+                    .top(px(ey - 7.0))
+                    .w(px(14.))
+                    .h(px(14.))
+                    .cursor(cursor)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.state.push_undo();
+                            this.preview_text_drag = Some(PreviewTextDragState {
+                                clip_id,
+                                kind: PreviewTransformKind::ResizeCorner,
+                                start_mouse_x: f32::from(event.position.x),
+                                start_mouse_y: f32::from(event.position.y),
+                                initial_pos_x: init_px,
+                                initial_pos_y: init_py,
+                                initial_scale: init_scale,
+                                initial_font_size: init_font,
+                                initial_rot: init_rot,
+                                center_x,
+                                center_y,
+                                preview_scale,
+                                moved: false,
+                            });
+                            cx.notify();
+                        }),
+                    )
+            }))
+            .child(
+                div()
+                    .id(SharedString::from(format!("rot-hdl-{}", clip_id)))
+                    .absolute()
+                    .left(px(rh.0 - 11.0))
+                    .top(px(rh.1 - 11.0))
+                    .w(px(22.))
+                    .h(px(22.))
+                    .rounded_full()
+                    .bg(Theme::accent())
+                    .border_1()
+                    .border_color(Theme::text_primary())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_xs()
+                    .text_color(Theme::text_primary())
+                    .cursor_pointer()
+                    .tooltip(build_tooltip("Drag to Rotate (Shift: snap 15°)"))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.state.push_undo();
+                            this.preview_text_drag = Some(PreviewTextDragState {
+                                clip_id,
+                                kind: PreviewTransformKind::Rotate,
+                                start_mouse_x: f32::from(event.position.x),
+                                start_mouse_y: f32::from(event.position.y),
+                                initial_pos_x: init_px,
+                                initial_pos_y: init_py,
+                                initial_scale: init_scale,
+                                initial_font_size: init_font,
+                                initial_rot: init_rot,
+                                center_x,
+                                center_y,
+                                preview_scale,
+                                moved: false,
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .child("↻"),
+            )
+            .when(is_rotating_now, |el| {
+                el.child(
+                    div()
+                        .absolute()
+                        .left(px(rh.0 + 15.0))
+                        .top(px(rh.1 - 10.0))
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(Theme::bg_panel())
+                        .border_1()
+                        .border_color(if snapped_key_angle {
+                            gpui::rgba(0xfacc15ff)
+                        } else {
+                            gpui::rgba(0x3b82f6ff)
+                        })
+                        .text_xs()
+                        .text_color(if snapped_key_angle {
+                            gpui::rgba(0xfacc15ff)
+                        } else {
+                            gpui::rgba(0xf4f4f5ff)
+                        })
+                        .child(format!("{:.0}°", init_rot)),
+                )
+            })
+            .children(corners.into_iter().map(|(tag, cx_pt, cy_pt, cursor)| {
+                div()
+                    .id(SharedString::from(format!("rsz-{}-{}", tag, clip_id)))
+                    .absolute()
+                    .left(px(cx_pt - 4.0))
+                    .top(px(cy_pt - 4.0))
+                    .w(px(8.))
+                    .h(px(8.))
+                    .rounded_sm()
+                    .bg(Theme::text_primary())
+                    .border_1()
+                    .border_color(Theme::accent())
+                    .cursor(cursor)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.state.push_undo();
+                            this.preview_text_drag = Some(PreviewTextDragState {
+                                clip_id,
+                                kind: PreviewTransformKind::ResizeCorner,
+                                start_mouse_x: f32::from(event.position.x),
+                                start_mouse_y: f32::from(event.position.y),
+                                initial_pos_x: init_px,
+                                initial_pos_y: init_py,
+                                initial_scale: init_scale,
+                                initial_font_size: init_font,
+                                initial_rot: init_rot,
+                                center_x,
+                                center_y,
+                                preview_scale,
+                                moved: false,
+                            });
+                            cx.notify();
+                        }),
+                    )
+            }))
+    }
+
     fn render_preview_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_clips = self.state.active_clips_at_playhead();
         let active_main_video = active_clips
@@ -1519,24 +2038,64 @@ impl EditorView {
             )
         };
         let target_ratio = self.state.aspect_ratio.ratio_f32();
-        let (preview_w, preview_h) = if avail_w / avail_h > target_ratio {
+        let (base_pw, base_ph) = if avail_w / avail_h > target_ratio {
             (avail_h * target_ratio, avail_h)
         } else {
             (avail_w, avail_w / target_ratio)
         };
+        let preview_w = base_pw * self.preview_zoom;
+        let preview_h = base_ph * self.preview_zoom;
         let (_, out_h) = self.state.aspect_ratio.dimensions(self.state.base_height);
         let preview_scale = preview_h / (out_h.max(1) as f32);
+        let pv_center_x = if self.preview_fullscreen {
+            win_w * 0.5
+        } else {
+            280.0 + (win_w - 280.0 - INSPECTOR_W) * 0.5
+        };
+        let pv_center_y = if self.preview_fullscreen {
+            (win_h - 48.0) * 0.5
+        } else {
+            44.0 + (win_h - 44.0 - 234.0 - 48.0) * 0.5
+        };
+
+        let mut selected_handle_overlay: Option<gpui::AnyElement> = None;
 
         let base_layer = if let Some(vclip) = active_main_video {
             if let Some(frame) = self.current_frame.clone() {
                 let vid = vclip.id;
-                let vscale = (vclip.scale as f32 / 100.0).clamp(0.1, 2.0);
-                let valpha = (vclip.opacity as f32 / 100.0).clamp(0.0, 1.0);
-                let vox = vclip.pos_x * preview_scale;
-                let voy = vclip.pos_y * preview_scale;
-                let init_px = vclip.pos_x;
-                let init_py = vclip.pos_y;
+                let (epx, epy, esc, erot, eop) = vclip.evaluate_at(self.state.playhead_secs);
+                let vscale = (esc as f32 / 100.0).clamp(0.1, 2.0);
+                let valpha = (eop as f32 / 100.0).clamp(0.0, 1.0);
+                let (fit_w, fit_h) =
+                    self.fit_media_box(vclip.source_path.as_ref(), preview_w, preview_h);
+                let box_w = fit_w * vscale;
+                let box_h = fit_h * vscale;
+                let vox = epx * preview_scale;
+                let voy = epy * preview_scale;
                 let is_sel = self.state.selected_clip_id == Some(vid);
+                let obj_cx = pv_center_x + vox;
+                let obj_cy = pv_center_y + voy;
+                if is_sel {
+                    selected_handle_overlay = Some(
+                        self.render_rotated_transform_handles(
+                            vid,
+                            preview_w * 0.5 + vox,
+                            preview_h * 0.5 + voy,
+                            box_w,
+                            box_h,
+                            epx,
+                            epy,
+                            esc,
+                            48.0,
+                            erot,
+                            obj_cx,
+                            obj_cy,
+                            preview_scale,
+                            cx,
+                        )
+                        .into_any_element(),
+                    );
+                }
 
                 div()
                     .id(SharedString::from(format!("pv-vid-{}", vid)))
@@ -1554,10 +2113,16 @@ impl EditorView {
                             this.state.push_undo();
                             this.preview_text_drag = Some(PreviewTextDragState {
                                 clip_id: vid,
+                                kind: PreviewTransformKind::Move,
                                 start_mouse_x: f32::from(event.position.x),
                                 start_mouse_y: f32::from(event.position.y),
-                                initial_pos_x: init_px,
-                                initial_pos_y: init_py,
+                                initial_pos_x: epx,
+                                initial_pos_y: epy,
+                                initial_scale: esc,
+                                initial_font_size: 48.0,
+                                initial_rot: erot,
+                                center_x: obj_cx,
+                                center_y: obj_cy,
                                 preview_scale,
                                 moved: false,
                             });
@@ -1569,15 +2134,9 @@ impl EditorView {
                             .relative()
                             .left(px(vox))
                             .top(px(voy))
-                            .w(px(preview_w * vscale))
-                            .h(px(preview_h * vscale))
+                            .w(px(box_w))
+                            .h(px(box_h))
                             .opacity(valpha)
-                            .border_1()
-                            .border_color(if is_sel {
-                                Theme::accent()
-                            } else {
-                                gpui::rgba(0x00000000)
-                            })
                             .child(img(frame).size_full().object_fit(ObjectFit::Contain)),
                     )
                     .into_any_element()
@@ -1602,6 +2161,356 @@ impl EditorView {
             div().size_full().into_any_element()
         };
 
+        let overlay_elements: Vec<_> = active_overlays
+            .into_iter()
+            .filter_map(|oclip| {
+                let path = oclip.source_path.clone()?;
+                let oid = oclip.id;
+                let (epx, epy, esc, erot, eop) = oclip.evaluate_at(self.state.playhead_secs);
+                let oscale = (esc as f32 / 100.0).clamp(0.1, 2.0);
+                let oalpha = (eop as f32 / 100.0).clamp(0.0, 1.0);
+                let (fit_w, fit_h) = self.fit_media_box(Some(&path), preview_w, preview_h);
+                let box_w = fit_w * oscale;
+                let box_h = fit_h * oscale;
+                let ox = epx * preview_scale;
+                let oy = epy * preview_scale;
+                let is_sel = self.state.selected_clip_id == Some(oid);
+                let obj_cx = pv_center_x + ox;
+                let obj_cy = pv_center_y + oy;
+
+                if is_sel {
+                    selected_handle_overlay = Some(
+                        self.render_rotated_transform_handles(
+                            oid,
+                            preview_w * 0.5 + ox,
+                            preview_h * 0.5 + oy,
+                            box_w,
+                            box_h,
+                            epx,
+                            epy,
+                            esc,
+                            48.0,
+                            erot,
+                            obj_cx,
+                            obj_cy,
+                            preview_scale,
+                            cx,
+                        )
+                        .into_any_element(),
+                    );
+                }
+
+                Some(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("pv-ovl-{}", oid)))
+                                .relative()
+                                .left(px(ox))
+                                .top(px(oy))
+                                .w(px(box_w))
+                                .h(px(box_h))
+                                .opacity(oalpha)
+                                .cursor(gpui::CursorStyle::OpenHand)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                        cx.stop_propagation();
+                                        this.state.selected_clip_id = Some(oid);
+                                        this.editing_text_clip_id = None;
+                                        this.state.push_undo();
+                                        this.preview_text_drag = Some(PreviewTextDragState {
+                                            clip_id: oid,
+                                            kind: PreviewTransformKind::Move,
+                                            start_mouse_x: f32::from(event.position.x),
+                                            start_mouse_y: f32::from(event.position.y),
+                                            initial_pos_x: epx,
+                                            initial_pos_y: epy,
+                                            initial_scale: esc,
+                                            initial_font_size: 48.0,
+                                            initial_rot: erot,
+                                            center_x: obj_cx,
+                                            center_y: obj_cy,
+                                            preview_scale,
+                                            moved: false,
+                                        });
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(img(path).size_full().object_fit(ObjectFit::Contain)),
+                        ),
+                )
+            })
+            .collect();
+
+        let text_elements: Vec<_> = active_texts
+            .into_iter()
+            .map(|tclip| {
+                let tclip_id = tclip.id;
+                let is_sel = self.state.selected_clip_id == Some(tclip_id);
+                let is_editing = self.editing_text_clip_id == Some(tclip_id);
+                let td = tclip.text.clone().unwrap_or_default();
+
+                let elapsed = (self.state.playhead_secs - tclip.start_secs).max(0.0);
+                let remaining = (tclip.end_secs() - self.state.playhead_secs).max(0.0);
+                let ad = td
+                    .anim_duration_secs
+                    .clamp(0.1, (tclip.duration_secs * 0.5).max(0.1));
+                let (anim_alpha, anim_scale, anim_dy) = match td.animation {
+                    TextAnimation::None => (1.0, 1.0, 0.0),
+                    TextAnimation::FadeIn => ((elapsed / ad).clamp(0.0, 1.0), 1.0, 0.0),
+                    TextAnimation::FadeOut => ((remaining / ad).clamp(0.0, 1.0), 1.0, 0.0),
+                    TextAnimation::FadeInOut => {
+                        let fin = (elapsed / ad).clamp(0.0, 1.0);
+                        let fout = (remaining / ad).clamp(0.0, 1.0);
+                        (fin.min(fout), 1.0, 0.0)
+                    }
+                    TextAnimation::PopIn => {
+                        let p = (elapsed / ad).clamp(0.0, 1.0);
+                        (p, 0.55 + 0.45 * p, 0.0)
+                    }
+                    TextAnimation::SlideUp => {
+                        let p = (elapsed / ad).clamp(0.0, 1.0);
+                        (p, 1.0, (1.0 - p) * 60.0)
+                    }
+                };
+
+                let (epx, epy, esc, erot, eop) = tclip.evaluate_at(self.state.playhead_secs);
+                let clip_scale = (esc as f32 / 100.0).clamp(0.1, 2.0);
+                let scaled_font =
+                    (td.font_size * clip_scale * preview_scale * anim_scale).clamp(8.0, 220.0);
+                let ox = epx * preview_scale;
+                let oy = (epy + anim_dy) * preview_scale;
+                let alpha = ((eop as f32 / 100.0) * anim_alpha).clamp(0.0, 1.0);
+                let obj_cx = pv_center_x + ox;
+                let obj_cy = pv_center_y + oy;
+                let display_text = if is_editing {
+                    format!("{}|", td.content)
+                } else if td.content.is_empty() {
+                    "Double-click to edit".to_string()
+                } else {
+                    td.content.clone()
+                };
+                let shadow_ox = td.shadow_offset_x * preview_scale;
+                let shadow_oy = td.shadow_offset_y * preview_scale;
+                let pad_px = (td.bg_padding * preview_scale).clamp(2.0, 24.0);
+
+                if is_sel && !is_editing {
+                    let mut max_w = 0.0_f32;
+                    let mut line_count = 0usize;
+                    let mut font_def = gpui::font(td.font_family.clone());
+                    font_def.weight = gpui::FontWeight(td.font_weight as f32);
+                    for line in display_text.lines() {
+                        line_count += 1;
+                        let run = gpui::TextRun {
+                            len: line.len(),
+                            font: font_def.clone(),
+                            color: gpui::hsla(0.0, 0.0, 1.0, 1.0),
+                            background_color: None,
+                            underline: None,
+                            strikethrough: None,
+                        };
+                        let shaped = window.text_system().shape_line(
+                            SharedString::from(line.to_string()),
+                            px(scaled_font),
+                            &[run],
+                            None,
+                        );
+                        max_w = max_w.max(f32::from(shaped.width));
+                    }
+                    let lines = line_count.max(1) as f32;
+                    let box_w = (max_w + pad_px * 2.0 + 4.0).max(40.0);
+                    let box_h = (lines * scaled_font * 1.3 + pad_px * 1.2 + 4.0).max(26.0);
+                    selected_handle_overlay = Some(
+                        self.render_rotated_transform_handles(
+                            tclip_id,
+                            preview_w * 0.5 + ox,
+                            preview_h * 0.5 + oy,
+                            box_w,
+                            box_h,
+                            epx,
+                            epy,
+                            esc,
+                            td.font_size,
+                            erot,
+                            obj_cx,
+                            obj_cy,
+                            preview_scale,
+                            cx,
+                        )
+                        .into_any_element(),
+                    );
+                }
+
+                let norm_rot = erot.rem_euclid(360.0);
+                let use_rot_img =
+                    !is_editing && (tclip.flip_h || (norm_rot > 0.5 && norm_rot < 359.5));
+                let cached_rot_img = if use_rot_img {
+                    self.rotated_text_cache
+                        .get(&tclip_id)
+                        .map(|(_, im, w, h)| (im.clone(), *w, *h))
+                } else {
+                    None
+                };
+
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(if let Some((r_img, rw, rh)) = cached_rot_img {
+                        div()
+                            .id(SharedString::from(format!("pv-text-{}", tclip_id)))
+                            .relative()
+                            .left(px(ox))
+                            .top(px(oy))
+                            .w(px(rw as f32 * preview_scale))
+                            .h(px(rh as f32 * preview_scale))
+                            .opacity(alpha)
+                            .cursor(gpui::CursorStyle::OpenHand)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.state.selected_clip_id = Some(tclip_id);
+                                    if event.click_count >= 2 {
+                                        if this.editing_text_clip_id != Some(tclip_id) {
+                                            this.state.push_undo();
+                                            this.editing_text_clip_id = Some(tclip_id);
+                                        }
+                                        this.preview_text_drag = None;
+                                    } else {
+                                        this.state.push_undo();
+                                        this.preview_text_drag = Some(PreviewTextDragState {
+                                            clip_id: tclip_id,
+                                            kind: PreviewTransformKind::Move,
+                                            start_mouse_x: f32::from(event.position.x),
+                                            start_mouse_y: f32::from(event.position.y),
+                                            initial_pos_x: epx,
+                                            initial_pos_y: epy,
+                                            initial_scale: esc,
+                                            initial_font_size: td.font_size,
+                                            initial_rot: erot,
+                                            center_x: obj_cx,
+                                            center_y: obj_cy,
+                                            preview_scale,
+                                            moved: false,
+                                        });
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .child(img(r_img).size_full().object_fit(ObjectFit::Contain))
+                            .into_any_element()
+                    } else {
+                        div()
+                            .id(SharedString::from(format!("pv-text-{}", tclip_id)))
+                            .relative()
+                            .left(px(ox))
+                            .top(px(oy))
+                            .px(px(pad_px))
+                            .py(px(pad_px * 0.6))
+                            .rounded_sm()
+                            .when_some(td.bg_color_hex, |el, bg_hex| el.bg(rgb(bg_hex)))
+                            .border_1()
+                            .border_color(if is_editing {
+                                Theme::accent()
+                            } else {
+                                gpui::rgba(0x00000000)
+                            })
+                            .opacity(alpha)
+                            .font_family(td.font_family.clone())
+                            .text_size(px(scaled_font))
+                            .font_weight(gpui::FontWeight(td.font_weight as f32))
+                            .cursor(if is_editing {
+                                gpui::CursorStyle::IBeam
+                            } else {
+                                gpui::CursorStyle::OpenHand
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.state.selected_clip_id = Some(tclip_id);
+                                    if event.click_count >= 2 {
+                                        if this.editing_text_clip_id != Some(tclip_id) {
+                                            this.state.push_undo();
+                                            this.editing_text_clip_id = Some(tclip_id);
+                                        }
+                                        this.preview_text_drag = None;
+                                    } else {
+                                        this.state.push_undo();
+                                        this.preview_text_drag = Some(PreviewTextDragState {
+                                            clip_id: tclip_id,
+                                            kind: PreviewTransformKind::Move,
+                                            start_mouse_x: f32::from(event.position.x),
+                                            start_mouse_y: f32::from(event.position.y),
+                                            initial_pos_x: epx,
+                                            initial_pos_y: epy,
+                                            initial_scale: esc,
+                                            initial_font_size: td.font_size,
+                                            initial_rot: erot,
+                                            center_x: obj_cx,
+                                            center_y: obj_cy,
+                                            preview_scale,
+                                            moved: false,
+                                        });
+                                    }
+                                    cx.notify();
+                                }),
+                            )
+                            .when_some(td.shadow_color_hex, |el, sh_hex| {
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .left(px(pad_px + shadow_ox))
+                                        .top(px(pad_px * 0.6 + shadow_oy))
+                                        .opacity(0.75)
+                                        .text_color(rgb(sh_hex))
+                                        .child(display_text.clone()),
+                                )
+                            })
+                            .when(td.stroke_width > 0.1, |el| {
+                                let sw =
+                                    (td.stroke_width * preview_scale * 2.2).clamp(1.2, 10.0);
+                                let sc = td.stroke_color_hex.unwrap_or(0x000000);
+                                let d = sw * 0.7;
+                                let offsets = [
+                                    (-sw, 0.0),
+                                    (sw, 0.0),
+                                    (0.0, -sw),
+                                    (0.0, sw),
+                                    (-d, -d),
+                                    (d, -d),
+                                    (-d, d),
+                                    (d, d),
+                                ];
+                                el.children(offsets.into_iter().map(|(dx, dy)| {
+                                    div()
+                                        .absolute()
+                                        .left(px(pad_px + dx))
+                                        .top(px(pad_px * 0.6 + dy))
+                                        .text_color(rgb(sc))
+                                        .child(display_text.clone())
+                                }))
+                            })
+                            .child(
+                                div()
+                                    .relative()
+                                    .text_color(rgb(td.color_hex))
+                                    .child(display_text),
+                            )
+                            .into_any_element()
+                    })
+            })
+            .collect();
+
         let is_editing_any_text = self.editing_text_clip_id.is_some();
         let focus_for_ime = self.focus_handle.clone();
         let view_entity = cx.entity().clone();
@@ -1614,281 +2523,89 @@ impl EditorView {
             .bg(Theme::bg_app())
             .child(
                 div()
+                    .id("preview-stage")
                     .flex_1()
-                    .p_4()
+                    .pt(px(36.))
+                    .pb(px(20.))
+                    .px(px(24.))
+                    .relative()
+                    .overflow_hidden()
                     .flex()
                     .items_center()
                     .justify_center()
+                    .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
+                        if !event.modifiers.control {
+                            return;
+                        }
+                        let dy = match event.delta {
+                            ScrollDelta::Pixels(p) => f32::from(p.y),
+                            ScrollDelta::Lines(p) => p.y * 24.0,
+                        };
+                        let factor = if dy > 0.0 { 1.1 } else { 0.9 };
+                        this.preview_zoom = (this.preview_zoom * factor).clamp(0.35, 2.5);
+                        cx.notify();
+                    }))
+                    .when_some(active_video, |el, clip| {
+                        el.child(
+                            div()
+                                .absolute()
+                                .top_2()
+                                .left_3()
+                                .px_2()
+                                .py_0p5()
+                                .rounded_sm()
+                                .bg(Theme::bg_panel())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .text_xs()
+                                .text_color(if is_playing {
+                                    rgb(Theme::SUCCESS)
+                                } else {
+                                    Theme::text_secondary()
+                                })
+                                .child(format!(
+                                    "{} • {} • {}",
+                                    if is_playing { "PLAYING" } else { "PAUSED" },
+                                    clip.name,
+                                    timecode
+                                )),
+                        )
+                    })
                     .child(
                         div()
                             .w(px(preview_w))
                             .h(px(preview_h))
-                            .rounded_lg()
-                            .bg(Theme::bg_preview())
-                            .border_1()
-                            .border_color(Theme::border())
-                            .overflow_hidden()
                             .relative()
-                            .when(is_editing_any_text, |el| {
-                                let fh = focus_for_ime.clone();
-                                let ent = view_entity.clone();
-                                el.child(
-                                    canvas(
-                                        |_, _, _| (),
-                                        move |bounds, _, window, cx| {
-                                            window.handle_input(
-                                                &fh,
-                                                ElementInputHandler::new(bounds, ent),
-                                                cx,
-                                            );
-                                        },
-                                    )
-                                    .absolute()
-                                    .inset_0(),
-                                )
-                            })
-                            .child(base_layer)
-                            .children(active_overlays.into_iter().filter_map(|oclip| {
-                                let path = oclip.source_path.clone()?;
-                                let oid = oclip.id;
-                                let oscale = (oclip.scale as f32 / 100.0).clamp(0.1, 2.0);
-                                let oalpha = (oclip.opacity as f32 / 100.0).clamp(0.0, 1.0);
-                                let ox = oclip.pos_x * preview_scale;
-                                let oy = oclip.pos_y * preview_scale;
-                                let init_px = oclip.pos_x;
-                                let init_py = oclip.pos_y;
-                                let is_sel = self.state.selected_clip_id == Some(oid);
-
-                                Some(
-                                    div()
-                                        .absolute()
-                                        .inset_0()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .child(
-                                            div()
-                                                .id(SharedString::from(format!("pv-ovl-{}", oid)))
-                                                .relative()
-                                                .left(px(ox))
-                                                .top(px(oy))
-                                                .w(px(preview_w * oscale))
-                                                .h(px(preview_h * oscale))
-                                                .opacity(oalpha)
-                                                .border_1()
-                                                .border_color(if is_sel {
-                                                    Theme::accent()
-                                                } else {
-                                                    gpui::rgba(0x00000000)
-                                                })
-                                                .cursor(gpui::CursorStyle::OpenHand)
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(
-                                                        move |this, event: &MouseDownEvent, _, cx| {
-                                                            cx.stop_propagation();
-                                                            this.state.selected_clip_id = Some(oid);
-                                                            this.editing_text_clip_id = None;
-                                                            this.state.push_undo();
-                                                            this.preview_text_drag = Some(
-                                                                PreviewTextDragState {
-                                                                    clip_id: oid,
-                                                                    start_mouse_x: f32::from(
-                                                                        event.position.x,
-                                                                    ),
-                                                                    start_mouse_y: f32::from(
-                                                                        event.position.y,
-                                                                    ),
-                                                                    initial_pos_x: init_px,
-                                                                    initial_pos_y: init_py,
-                                                                    preview_scale,
-                                                                    moved: false,
-                                                                },
-                                                            );
-                                                            cx.notify();
-                                                        },
-                                                    ),
-                                                )
-                                                .child(
-                                                    img(path)
-                                                        .size_full()
-                                                        .object_fit(ObjectFit::Contain),
-                                                ),
-                                        ),
-                                )
-                            }))
-                            .children(active_texts.into_iter().map(|tclip| {
-                                let tclip_id = tclip.id;
-                                let is_sel = self.state.selected_clip_id == Some(tclip_id);
-                                let is_editing = self.editing_text_clip_id == Some(tclip_id);
-                                let td = tclip.text.clone().unwrap_or_default();
-
-                                let elapsed = (self.state.playhead_secs - tclip.start_secs).max(0.0);
-                                let remaining = (tclip.end_secs() - self.state.playhead_secs).max(0.0);
-                                let ad = td
-                                    .anim_duration_secs
-                                    .clamp(0.1, (tclip.duration_secs * 0.5).max(0.1));
-                                let (anim_alpha, anim_scale, anim_dy) = match td.animation {
-                                    TextAnimation::None => (1.0, 1.0, 0.0),
-                                    TextAnimation::FadeIn => ((elapsed / ad).clamp(0.0, 1.0), 1.0, 0.0),
-                                    TextAnimation::FadeOut => {
-                                        ((remaining / ad).clamp(0.0, 1.0), 1.0, 0.0)
-                                    }
-                                    TextAnimation::FadeInOut => {
-                                        let fin = (elapsed / ad).clamp(0.0, 1.0);
-                                        let fout = (remaining / ad).clamp(0.0, 1.0);
-                                        (fin.min(fout), 1.0, 0.0)
-                                    }
-                                    TextAnimation::PopIn => {
-                                        let p = (elapsed / ad).clamp(0.0, 1.0);
-                                        (p, 0.55 + 0.45 * p, 0.0)
-                                    }
-                                    TextAnimation::SlideUp => {
-                                        let p = (elapsed / ad).clamp(0.0, 1.0);
-                                        (p, 1.0, (1.0 - p) * 60.0)
-                                    }
-                                };
-
-                                let clip_scale = (tclip.scale as f32 / 100.0).clamp(0.1, 2.0);
-                                let scaled_font = (td.font_size
-                                    * clip_scale
-                                    * preview_scale
-                                    * anim_scale)
-                                    .clamp(8.0, 220.0);
-                                let ox = tclip.pos_x * preview_scale;
-                                let oy = (tclip.pos_y + anim_dy) * preview_scale;
-                                let init_px = tclip.pos_x;
-                                let init_py = tclip.pos_y;
-                                let alpha = ((tclip.opacity as f32 / 100.0) * anim_alpha)
-                                    .clamp(0.0, 1.0);
-                                let display_text = if is_editing {
-                                    format!("{}|", td.content)
-                                } else if td.content.is_empty() {
-                                    "Double-click to edit".to_string()
-                                } else {
-                                    td.content.clone()
-                                };
-                                let shadow_ox = td.shadow_offset_x * preview_scale;
-                                let shadow_oy = td.shadow_offset_y * preview_scale;
-                                let pad_px = (td.bg_padding * preview_scale).clamp(2.0, 24.0);
-
+                            .child(
                                 div()
                                     .absolute()
                                     .inset_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(
-                                        div()
-                                            .id(SharedString::from(format!(
-                                                "pv-text-{}",
-                                                tclip_id
-                                            )))
-                                            .relative()
-                                            .left(px(ox))
-                                            .top(px(oy))
-                                            .px(px(pad_px))
-                                            .py(px(pad_px * 0.6))
-                                            .rounded_sm()
-                                            .when_some(td.bg_color_hex, |el, bg_hex| {
-                                                el.bg(rgb(bg_hex))
-                                            })
-                                            .border_1()
-                                            .border_color(if is_editing || is_sel {
-                                                Theme::accent()
-                                            } else {
-                                                gpui::rgba(0x00000000)
-                                            })
-                                            .opacity(alpha)
-                                            .font_family(td.font_family.clone())
-                                            .text_size(px(scaled_font))
-                                            .font_weight(gpui::FontWeight(td.font_weight as f32))
-                                            .cursor(if is_editing {
-                                                gpui::CursorStyle::IBeam
-                                            } else {
-                                                gpui::CursorStyle::OpenHand
-                                            })
-                                            .on_mouse_down(
-                                                MouseButton::Left,
-                                                cx.listener(
-                                                    move |this, event: &MouseDownEvent, _, cx| {
-                                                        cx.stop_propagation();
-                                                        this.state.selected_clip_id =
-                                                            Some(tclip_id);
-                                                        if event.click_count >= 2 {
-                                                            if this.editing_text_clip_id
-                                                                != Some(tclip_id)
-                                                            {
-                                                                this.state.push_undo();
-                                                                this.editing_text_clip_id =
-                                                                    Some(tclip_id);
-                                                            }
-                                                            this.preview_text_drag = None;
-                                                        } else {
-                                                            this.state.push_undo();
-                                                            this.preview_text_drag = Some(
-                                                                PreviewTextDragState {
-                                                                    clip_id: tclip_id,
-                                                                    start_mouse_x: f32::from(
-                                                                        event.position.x,
-                                                                    ),
-                                                                    start_mouse_y: f32::from(
-                                                                        event.position.y,
-                                                                    ),
-                                                                    initial_pos_x: init_px,
-                                                                    initial_pos_y: init_py,
-                                                                    preview_scale,
-                                                                    moved: false,
-                                                                },
-                                                            );
-                                                        }
-                                                        cx.notify();
-                                                    },
-                                                ),
+                                    .rounded_lg()
+                                    .bg(Theme::bg_preview())
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .overflow_hidden()
+                                    .when(is_editing_any_text, |el| {
+                                        let fh = focus_for_ime.clone();
+                                        let ent = view_entity.clone();
+                                        el.child(
+                                            canvas(
+                                                |_, _, _| (),
+                                                move |bounds, _, window, cx| {
+                                                    window.handle_input(
+                                                        &fh,
+                                                        ElementInputHandler::new(bounds, ent),
+                                                        cx,
+                                                    );
+                                                },
                                             )
-                                            .when_some(td.shadow_color_hex, |el, sh_hex| {
-                                                el.child(
-                                                    div()
-                                                        .absolute()
-                                                        .left(px(pad_px + shadow_ox))
-                                                        .top(px(pad_px * 0.6 + shadow_oy))
-                                                        .opacity(0.75)
-                                                        .text_color(rgb(sh_hex))
-                                                        .child(display_text.clone()),
-                                                )
-                                            })
-                                            .when(td.stroke_width > 0.1, |el| {
-                                                let sw = (td.stroke_width * preview_scale * 2.2)
-                                                    .clamp(1.2, 10.0);
-                                                let sc = td.stroke_color_hex.unwrap_or(0x000000);
-                                                let d = sw * 0.7;
-                                                let offsets = [
-                                                    (-sw, 0.0),
-                                                    (sw, 0.0),
-                                                    (0.0, -sw),
-                                                    (0.0, sw),
-                                                    (-d, -d),
-                                                    (d, -d),
-                                                    (-d, d),
-                                                    (d, d),
-                                                ];
-                                                el.children(offsets.into_iter().map(|(dx, dy)| {
-                                                    div()
-                                                        .absolute()
-                                                        .left(px(pad_px + dx))
-                                                        .top(px(pad_px * 0.6 + dy))
-                                                        .text_color(rgb(sc))
-                                                        .child(display_text.clone())
-                                                }))
-                                            })
-                                            .child(
-                                                div()
-                                                    .relative()
-                                                    .text_color(rgb(td.color_hex))
-                                                    .child(display_text),
-                                            ),
-                                    )
-                            }))
+                                            .absolute()
+                                            .inset_0(),
+                                        )
+                                    })
+                                    .child(base_layer)
+                                    .children(overlay_elements)
+                                    .children(text_elements)
                             .when(self.show_safe_zone, |el| {
                                 let gx1 = preview_w / 3.0;
                                 let gx2 = preview_w * 2.0 / 3.0;
@@ -1948,32 +2665,126 @@ impl EditorView {
                                         ),
                                 )
                             })
-                            .when_some(active_video, |el, clip| {
-                                el.child(
-                                    div()
-                                        .absolute()
-                                        .top_2()
-                                        .left_2()
-                                        .px_2()
-                                        .py_0p5()
-                                        .rounded_sm()
-                                        .bg(Theme::bg_panel())
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .text_xs()
-                                        .text_color(if is_playing {
-                                            rgb(Theme::SUCCESS)
-                                        } else {
-                                            Theme::text_secondary()
-                                        })
-                                        .child(format!(
-                                            "{} • {} • {}",
-                                            if is_playing { "PLAYING" } else { "PAUSED" },
-                                            clip.name,
-                                            timecode
-                                        )),
-                                )
+                            .child({
+                                let g = self.active_snap_guides;
+                                let sx = preview_w * 0.08;
+                                let sy = preview_h * 0.08;
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .when(g.center_x, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(preview_w * 0.5))
+                                                .top_0()
+                                                .w(px(1.5))
+                                                .h_full()
+                                                .bg(gpui::rgba(0x38bdf8ee)),
+                                        )
+                                    })
+                                    .when(g.center_y, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(preview_h * 0.5))
+                                                .left_0()
+                                                .h(px(1.5))
+                                                .w_full()
+                                                .bg(gpui::rgba(0x38bdf8ee)),
+                                        )
+                                    })
+                                    .when(g.left_edge, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .left_0()
+                                                .top_0()
+                                                .w(px(2.0))
+                                                .h_full()
+                                                .bg(gpui::rgba(0xf43f5eee)),
+                                        )
+                                    })
+                                    .when(g.right_edge, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .right_0()
+                                                .top_0()
+                                                .w(px(2.0))
+                                                .h_full()
+                                                .bg(gpui::rgba(0xf43f5eee)),
+                                        )
+                                    })
+                                    .when(g.top_edge, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .top_0()
+                                                .left_0()
+                                                .h(px(2.0))
+                                                .w_full()
+                                                .bg(gpui::rgba(0xf43f5eee)),
+                                        )
+                                    })
+                                    .when(g.bottom_edge, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .bottom_0()
+                                                .left_0()
+                                                .h(px(2.0))
+                                                .w_full()
+                                                .bg(gpui::rgba(0xf43f5eee)),
+                                        )
+                                    })
+                                    .when(g.safe_left, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(sx))
+                                                .top_0()
+                                                .w(px(1.0))
+                                                .h_full()
+                                                .bg(gpui::rgba(0xfacc15dd)),
+                                        )
+                                    })
+                                    .when(g.safe_right, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .left(px(preview_w - sx))
+                                                .top_0()
+                                                .w(px(1.0))
+                                                .h_full()
+                                                .bg(gpui::rgba(0xfacc15dd)),
+                                        )
+                                    })
+                                    .when(g.safe_top, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(sy))
+                                                .left_0()
+                                                .h(px(1.0))
+                                                .w_full()
+                                                .bg(gpui::rgba(0xfacc15dd)),
+                                        )
+                                    })
+                                    .when(g.safe_bottom, |el| {
+                                        el.child(
+                                            div()
+                                                .absolute()
+                                                .top(px(preview_h - sy))
+                                                .left_0()
+                                                .h(px(1.0))
+                                                .w_full()
+                                                .bg(gpui::rgba(0xfacc15dd)),
+                                        )
+                                    })
                             }),
+                            )
+                            .when_some(selected_handle_overlay, |el, hdl| el.child(hdl)),
                     ),
             )
             .child(
@@ -2084,6 +2895,47 @@ impl EditorView {
                             .flex()
                             .items_center()
                             .gap_1p5()
+                            .child({
+                                let zoomed = (self.preview_zoom - 1.0).abs() > 0.02;
+                                div()
+                                    .id("pv-zoom-reset")
+                                    .h(px(26.))
+                                    .px_2()
+                                    .rounded_md()
+                                    .bg(if zoomed {
+                                        Theme::accent()
+                                    } else {
+                                        Theme::bg_surface()
+                                    })
+                                    .border_1()
+                                    .border_color(if zoomed {
+                                        Theme::accent()
+                                    } else {
+                                        Theme::border()
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .text_xs()
+                                    .text_color(if zoomed {
+                                        rgb(0xFFFFFF)
+                                    } else {
+                                        Theme::text_primary()
+                                    })
+                                    .cursor_pointer()
+                                    .hover(|s| {
+                                        s.bg(if zoomed {
+                                            rgb(Theme::ACCENT_HOVER)
+                                        } else {
+                                            Theme::bg_hover()
+                                        })
+                                    })
+                                    .child(format!("{:.0}%", self.preview_zoom * 100.0))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.preview_zoom = 1.0;
+                                        cx.notify();
+                                    }))
+                            })
                             .child(
                                 self.icon_button(
                                     "pv-quality",
@@ -2267,6 +3119,243 @@ impl EditorView {
                             cx,
                         ))
                     })
+                    .child(self.inspector_slider(
+                        "Rotate",
+                        format!("{:.0}°", clip.rotation_deg),
+                        (clip.rotation_deg.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0),
+                        Theme::accent(),
+                        SliderField::Rotation,
+                        cx,
+                    ))
+                    .when(clip.track.is_visual(), |el| {
+                        let cur_rot = clip.rotation_deg.rem_euclid(360.0);
+                        let presets: [(&str, f32, bool); 5] = [
+                            ("-90°", -90.0, true),
+                            ("0°", 0.0, false),
+                            ("90°", 90.0, false),
+                            ("180°", 180.0, false),
+                            ("+90°", 90.0, true),
+                        ];
+                        let aligns: [(&str, &str, u8); 7] = [
+                            ("⇤", "Căn lề trái", 0),
+                            ("⇹", "Căn giữa ngang", 1),
+                            ("⇥", "Căn lề phải", 2),
+                            ("⤒", "Căn lề trên", 3),
+                            ("↕", "Căn giữa dọc", 4),
+                            ("⤓", "Căn lề dưới", 5),
+                            ("⌖", "Căn giữa tâm", 6),
+                        ];
+                        el.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .children(presets.into_iter().map(|(lbl, val, is_rel)| {
+                                    let active = !is_rel && (cur_rot - val).abs() < 0.5;
+                                    div()
+                                        .id(SharedString::from(format!("ang-btn-{}", lbl)))
+                                        .flex_1()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .bg(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::border()
+                                        })
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_xs()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .child(lbl)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.state.push_undo();
+                                            if let Some(c) = this.state.selected_clip_mut() {
+                                                c.rotation_deg = if is_rel {
+                                                    (c.rotation_deg + val).rem_euclid(360.0)
+                                                } else {
+                                                    val
+                                                };
+                                                this.state.status_message =
+                                                    format!("Angle: {:.0}°", c.rotation_deg);
+                                            }
+                                            this.sync_preview_after_seek(cx);
+                                            cx.notify();
+                                        }))
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(Theme::text_secondary())
+                                        .child("Align & Center"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1()
+                                        .children(aligns.into_iter().map(|(icon, tip, mode)| {
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "align-btn-{}",
+                                                    mode
+                                                )))
+                                                .flex_1()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(Theme::bg_surface())
+                                                .border_1()
+                                                .border_color(Theme::border())
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_xs()
+                                                .text_color(Theme::text_primary())
+                                                .cursor_pointer()
+                                                .tooltip(build_tooltip(tip))
+                                                .hover(|s| s.bg(Theme::bg_hover()))
+                                                .child(icon)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    let Some(sel_id) = this.state.selected_clip_id
+                                                    else {
+                                                        return;
+                                                    };
+                                                    let (out_w, out_h) = this
+                                                        .state
+                                                        .aspect_ratio
+                                                        .dimensions(this.state.base_height);
+                                                    let cw = out_w as f32;
+                                                    let ch = out_h as f32;
+                                                    let (hw, hh) =
+                                                        this.clip_canvas_half_extents(sel_id);
+                                                    this.state.push_undo();
+                                                    if let Some(c) = this
+                                                        .state
+                                                        .clips
+                                                        .iter_mut()
+                                                        .find(|c| c.id == sel_id)
+                                                    {
+                                                        match mode {
+                                                            0 => c.pos_x = -(cw * 0.5 - hw),
+                                                            1 => c.pos_x = 0.0,
+                                                            2 => c.pos_x = cw * 0.5 - hw,
+                                                            3 => c.pos_y = -(ch * 0.5 - hh),
+                                                            4 => c.pos_y = 0.0,
+                                                            5 => c.pos_y = ch * 0.5 - hh,
+                                                            _ => {
+                                                                c.pos_x = 0.0;
+                                                                c.pos_y = 0.0;
+                                                            }
+                                                        }
+                                                    }
+                                                    this.state.status_message = tip.to_string();
+                                                    cx.notify();
+                                                }))
+                                        })),
+                                ),
+                        )
+                    })
+                    .when(clip.track == TrackKind::Video || clip.track == TrackKind::Audio, |el| {
+                        el.child(self.inspector_slider(
+                            "Speed",
+                            format!("{:.2}x", clip.speed),
+                            ((clip.speed - 0.25) / 3.75).clamp(0.0, 1.0),
+                            Theme::accent(),
+                            SliderField::Speed,
+                            cx,
+                        ))
+                    })
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .when(clip.track.is_visual(), |el| {
+                                el.child(
+                                    div()
+                                        .id("ins-mirror-btn")
+                                        .flex_1()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(if clip.flip_h {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .text_xs()
+                                        .text_center()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.state.toggle_mirror_selected() {
+                                                this.sync_preview_after_seek(cx);
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .child("⇄ Mirror"),
+                                )
+                            })
+                            .when(clip.track == TrackKind::Video, |el| {
+                                el.child(
+                                    div()
+                                        .id("ins-rev-btn")
+                                        .flex_1()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(if clip.reversed {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .text_xs()
+                                        .text_center()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.state.toggle_reverse_selected();
+                                            cx.notify();
+                                        }))
+                                        .child("⟲ Reverse"),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("ins-kf-btn")
+                                    .flex_1()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(Theme::bg_surface())
+                                    .border_1()
+                                    .border_color(rgb(0xf59e0b))
+                                    .text_xs()
+                                    .text_center()
+                                    .text_color(rgb(0xf59e0b))
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.state.toggle_keyframe_at_playhead();
+                                        cx.notify();
+                                    }))
+                                    .child(format!("◆ KF ({})", clip.keyframes.len())),
+                            ),
+                    )
                     .when(clip.track.is_audible(), |el| {
                         el.child(self.inspector_slider(
                             "Volume",
@@ -3218,6 +4307,86 @@ impl EditorView {
                                     cx.notify();
                                 })),
                             )
+                            .child(div().w(px(1.)).h(px(16.)).mx_1().bg(Theme::border()))
+                            .child(
+                                self.icon_button(
+                                    "tl-mirror",
+                                    "⇄",
+                                    "Mirror Horizontally",
+                                    self.state.selected_clip().map(|c| c.flip_h).unwrap_or(false),
+                                    selected_clip_id.is_some(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.state.toggle_mirror_selected() {
+                                        this.sync_preview_after_seek(cx);
+                                    }
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "tl-rot90",
+                                    "↻",
+                                    "Rotate 90°",
+                                    false,
+                                    selected_clip_id.is_some(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.state.rotate_selected_90() {
+                                        this.sync_preview_after_seek(cx);
+                                    }
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "tl-freeze",
+                                    "❄",
+                                    "Freeze Frame at Playhead",
+                                    false,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let Some(vclip) = this
+                                        .state
+                                        .active_clips_at_playhead()
+                                        .into_iter()
+                                        .find(|c| c.track == TrackKind::Video)
+                                        .cloned()
+                                    else {
+                                        this.state.status_message =
+                                            "Place playhead over a video clip to freeze".into();
+                                        cx.notify();
+                                        return;
+                                    };
+                                    let Some(path) = vclip.source_path else {
+                                        return;
+                                    };
+                                    let offset = vclip.source_in_secs
+                                        + (this.state.playhead_secs - vclip.start_secs).max(0.0);
+                                    if let Some(img_path) = export_freeze_frame(&path, offset) {
+                                        this.state.insert_freeze_frame_at_playhead(img_path, 3.0);
+                                        this.sync_preview_after_seek(cx);
+                                    } else {
+                                        this.state.status_message =
+                                            "Failed to capture freeze frame".into();
+                                    }
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "tl-kf",
+                                    "◆",
+                                    "Add / Remove Keyframe at Playhead",
+                                    false,
+                                    selected_clip_id.is_some(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.toggle_keyframe_at_playhead();
+                                    cx.notify();
+                                })),
+                            )
                             .child(
                                 self.icon_button("tl-zoom-out", "−", "Zoom Out", false, true)
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -3653,16 +4822,42 @@ impl EditorView {
                                                                 ),
                                                             ),
                                                     )
-                                                    // Clip title
+                                                    // Clip title & keyframe diamonds
                                                     .child(
                                                         div()
                                                             .flex_1()
+                                                            .h_full()
+                                                            .relative()
+                                                            .flex()
+                                                            .items_center()
                                                             .px_1()
                                                             .overflow_hidden()
-                                                            .text_xs()
-                                                            .font_weight(gpui::FontWeight::MEDIUM)
-                                                            .text_color(Theme::text_primary())
-                                                            .child(clip.name),
+                                                            .child(
+                                                                div()
+                                                                    .text_xs()
+                                                                    .font_weight(
+                                                                        gpui::FontWeight::MEDIUM,
+                                                                    )
+                                                                    .text_color(
+                                                                        Theme::text_primary(),
+                                                                    )
+                                                                    .child(clip.name),
+                                                            )
+                                                            .children(clip.keyframes.into_iter().map(
+                                                                |kf| {
+                                                                    let kx = (kf.time_offset_secs
+                                                                        * px_per_sec
+                                                                        - 10.0)
+                                                                        .max(0.0);
+                                                                    div()
+                                                                        .absolute()
+                                                                        .left(px(kx))
+                                                                        .bottom(px(1.))
+                                                                        .text_xs()
+                                                                        .text_color(rgb(0xfacc15))
+                                                                        .child("◆")
+                                                                },
+                                                            )),
                                                     )
                                                     // Right trim handle
                                                     .child(
@@ -3823,8 +5018,10 @@ impl Render for EditorView {
                 }
 
                 if let Some(mut pdrag) = this.preview_text_drag {
-                    let dx = f32::from(event.position.x) - pdrag.start_mouse_x;
-                    let dy = f32::from(event.position.y) - pdrag.start_mouse_y;
+                    let cur_x = f32::from(event.position.x);
+                    let cur_y = f32::from(event.position.y);
+                    let dx = cur_x - pdrag.start_mouse_x;
+                    let dy = cur_y - pdrag.start_mouse_y;
                     if dx.abs() > 2.0 || dy.abs() > 2.0 {
                         pdrag.moved = true;
                         this.preview_text_drag = Some(pdrag);
@@ -3834,9 +5031,120 @@ impl Render for EditorView {
                     } else {
                         1.0
                     };
+                    let mut rotate_sync_needed = false;
+                    let (out_w, out_h) = this
+                        .state
+                        .aspect_ratio
+                        .dimensions(this.state.base_height);
+                    let cw = out_w as f32;
+                    let ch = out_h as f32;
+                    let (half_w, half_h) = this.clip_canvas_half_extents(pdrag.clip_id);
+                    let mut next_guides = PreviewSnapGuides::default();
+
                     if let Some(c) = this.state.clips.iter_mut().find(|c| c.id == pdrag.clip_id) {
-                        c.pos_x = pdrag.initial_pos_x + dx * inv;
-                        c.pos_y = pdrag.initial_pos_y + dy * inv;
+                        match pdrag.kind {
+                            PreviewTransformKind::Move => {
+                                let mut nx = pdrag.initial_pos_x + dx * inv;
+                                let mut ny = pdrag.initial_pos_y + dy * inv;
+                                if !event.modifiers.alt {
+                                    let tol = 8.0 * inv;
+                                    let left_pos = -(cw * 0.5 - half_w);
+                                    let right_pos = cw * 0.5 - half_w;
+                                    let sleft_pos = -(cw * 0.42 - half_w);
+                                    let sright_pos = cw * 0.42 - half_w;
+                                    if nx.abs() <= tol {
+                                        nx = 0.0;
+                                        next_guides.center_x = true;
+                                    } else if (nx - left_pos).abs() <= tol {
+                                        nx = left_pos;
+                                        next_guides.left_edge = true;
+                                    } else if (nx - right_pos).abs() <= tol {
+                                        nx = right_pos;
+                                        next_guides.right_edge = true;
+                                    } else if (nx - sleft_pos).abs() <= tol {
+                                        nx = sleft_pos;
+                                        next_guides.safe_left = true;
+                                    } else if (nx - sright_pos).abs() <= tol {
+                                        nx = sright_pos;
+                                        next_guides.safe_right = true;
+                                    }
+
+                                    let top_pos = -(ch * 0.5 - half_h);
+                                    let bot_pos = ch * 0.5 - half_h;
+                                    let stop_pos = -(ch * 0.42 - half_h);
+                                    let sbot_pos = ch * 0.42 - half_h;
+                                    if ny.abs() <= tol {
+                                        ny = 0.0;
+                                        next_guides.center_y = true;
+                                    } else if (ny - top_pos).abs() <= tol {
+                                        ny = top_pos;
+                                        next_guides.top_edge = true;
+                                    } else if (ny - bot_pos).abs() <= tol {
+                                        ny = bot_pos;
+                                        next_guides.bottom_edge = true;
+                                    } else if (ny - stop_pos).abs() <= tol {
+                                        ny = stop_pos;
+                                        next_guides.safe_top = true;
+                                    } else if (ny - sbot_pos).abs() <= tol {
+                                        ny = sbot_pos;
+                                        next_guides.safe_bottom = true;
+                                    }
+                                }
+                                c.pos_x = nx;
+                                c.pos_y = ny;
+                            }
+                            PreviewTransformKind::ResizeCorner => {
+                                let d_init = ((pdrag.start_mouse_x - pdrag.center_x).powi(2)
+                                    + (pdrag.start_mouse_y - pdrag.center_y).powi(2))
+                                .sqrt()
+                                .max(12.0);
+                                let d_cur = ((cur_x - pdrag.center_x).powi(2)
+                                    + (cur_y - pdrag.center_y).powi(2))
+                                .sqrt()
+                                .max(6.0);
+                                let factor = (d_cur / d_init).clamp(0.2, 4.0);
+                                if c.track == TrackKind::Text {
+                                    if let Some(ref mut t) = c.text {
+                                        t.font_size =
+                                            (pdrag.initial_font_size * factor).clamp(12.0, 140.0);
+                                    }
+                                } else {
+                                    c.scale = ((pdrag.initial_scale as f32) * factor)
+                                        .round()
+                                        .clamp(10.0, 200.0)
+                                        as u16;
+                                }
+                            }
+                            PreviewTransformKind::Rotate => {
+                                let a0 = (pdrag.start_mouse_y - pdrag.center_y)
+                                    .atan2(pdrag.start_mouse_x - pdrag.center_x);
+                                let a1 = (cur_y - pdrag.center_y).atan2(cur_x - pdrag.center_x);
+                                let delta_deg = (a1 - a0).to_degrees();
+                                let (snapped_rot, snapped_to) = snap_rotation_angle(
+                                    pdrag.initial_rot + delta_deg,
+                                    event.modifiers.shift,
+                                );
+                                c.rotation_deg = snapped_rot;
+                                this.state.status_message = if snapped_to.is_some() {
+                                    format!("Rotate: {:.0}° (Snap)", c.rotation_deg)
+                                } else {
+                                    format!("Rotate: {:.0}°", c.rotation_deg)
+                                };
+                                rotate_sync_needed =
+                                    c.track == TrackKind::Video || c.track == TrackKind::Text;
+                            }
+                        }
+                    }
+                    this.active_snap_guides = next_guides;
+                    if rotate_sync_needed {
+                        let now = Instant::now();
+                        let due = this
+                            .last_rotate_sync
+                            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(60));
+                        if due {
+                            this.last_rotate_sync = Some(now);
+                            this.sync_preview_after_seek(cx);
+                        }
                     }
                     cx.notify();
                     return;
@@ -3895,7 +5203,11 @@ impl Render for EditorView {
                     if this.slider_drag.take().is_some() {
                         changed = true;
                     }
-                    if this.preview_text_drag.take().is_some() {
+                    if let Some(pdrag) = this.preview_text_drag.take() {
+                        this.active_snap_guides = PreviewSnapGuides::default();
+                        if matches!(pdrag.kind, PreviewTransformKind::Rotate) {
+                            this.sync_preview_after_seek(cx);
+                        }
                         changed = true;
                     }
                     if this.clip_drag.is_some() {

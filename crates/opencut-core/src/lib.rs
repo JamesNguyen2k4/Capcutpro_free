@@ -664,6 +664,7 @@ impl EditorCore {
             color: ColorAdjustment::default(),
             text: None,
             linked_clip_id: None,
+            keyframes: Vec::new(),
         }
     }
 
@@ -1047,6 +1048,171 @@ impl EditorCore {
     pub fn adjust_zoom(&mut self, factor: f32) {
         self.px_per_sec = (self.px_per_sec * factor).clamp(4.0, 120.0);
     }
+
+    pub fn toggle_mirror_selected(&mut self) -> bool {
+        let Some(id) = self.selected_clip_id else {
+            self.status_message = "No clip selected".into();
+            return false;
+        };
+        let Some(pos) = self.clips.iter().position(|c| c.id == id) else {
+            return false;
+        };
+        if self.is_clip_track_locked(&self.clips[pos]) {
+            self.status_message = "Track is locked".into();
+            return false;
+        }
+        self.push_undo();
+        self.clips[pos].flip_h = !self.clips[pos].flip_h;
+        self.status_message = if self.clips[pos].flip_h {
+            "Mirrored horizontally".into()
+        } else {
+            "Mirror removed".into()
+        };
+        true
+    }
+
+    pub fn rotate_selected_90(&mut self) -> bool {
+        let Some(id) = self.selected_clip_id else {
+            self.status_message = "No clip selected".into();
+            return false;
+        };
+        let Some(pos) = self.clips.iter().position(|c| c.id == id) else {
+            return false;
+        };
+        if self.is_clip_track_locked(&self.clips[pos]) {
+            self.status_message = "Track is locked".into();
+            return false;
+        }
+        self.push_undo();
+        self.clips[pos].rotation_deg = (self.clips[pos].rotation_deg + 90.0) % 360.0;
+        self.status_message = format!("Rotated to {:.0}°", self.clips[pos].rotation_deg);
+        true
+    }
+
+    pub fn toggle_reverse_selected(&mut self) -> bool {
+        let Some(id) = self.selected_clip_id else {
+            self.status_message = "No clip selected".into();
+            return false;
+        };
+        let Some(pos) = self.clips.iter().position(|c| c.id == id) else {
+            return false;
+        };
+        if self.is_clip_track_locked(&self.clips[pos]) {
+            self.status_message = "Track is locked".into();
+            return false;
+        }
+        self.push_undo();
+        self.clips[pos].reversed = !self.clips[pos].reversed;
+        self.status_message = if self.clips[pos].reversed {
+            "Reverse playback ON".into()
+        } else {
+            "Reverse playback OFF".into()
+        };
+        true
+    }
+
+    pub fn set_selected_speed(&mut self, new_speed: f32) -> bool {
+        let Some(id) = self.selected_clip_id else {
+            return false;
+        };
+        let Some(pos) = self.clips.iter().position(|c| c.id == id) else {
+            return false;
+        };
+        if self.is_clip_track_locked(&self.clips[pos]) {
+            return false;
+        }
+        let clamped = new_speed.clamp(0.25, 4.0);
+        let old_speed = self.clips[pos].speed.max(0.25);
+        if (old_speed - clamped).abs() < 0.01 {
+            return false;
+        }
+        let new_dur = (self.clips[pos].duration_secs * (old_speed / clamped)).max(0.3);
+        self.clips[pos].speed = clamped;
+        self.clips[pos].duration_secs = new_dur;
+        self.status_message = format!("Speed: {:.2}x", clamped);
+        true
+    }
+
+    pub fn toggle_keyframe_at_playhead(&mut self) -> bool {
+        let Some(id) = self.selected_clip_id else {
+            self.status_message = "Select a clip to add keyframe".into();
+            return false;
+        };
+        let playhead = self.playhead_secs;
+        let Some(pos) = self.clips.iter().position(|c| c.id == id) else {
+            return false;
+        };
+        if !self.clips[pos].contains(playhead) {
+            self.status_message = "Move playhead inside the selected clip".into();
+            return false;
+        }
+        if self.is_clip_track_locked(&self.clips[pos]) {
+            self.status_message = "Track is locked".into();
+            return false;
+        }
+
+        self.push_undo();
+        let local_t = (playhead - self.clips[pos].start_secs).max(0.0);
+        if let Some(kf_idx) = self.clips[pos]
+            .keyframes
+            .iter()
+            .position(|k| (k.time_offset_secs - local_t).abs() < 0.1)
+        {
+            self.clips[pos].keyframes.remove(kf_idx);
+            self.status_message = format!("Removed keyframe at {:.1}s", local_t);
+            return true;
+        }
+
+        let (px, py, sc, rot, op) = self.clips[pos].evaluate_at(playhead);
+        self.clips[pos].keyframes.push(ClipKeyframe {
+            time_offset_secs: local_t,
+            pos_x: px,
+            pos_y: py,
+            scale: sc,
+            rotation_deg: rot,
+            opacity: op,
+        });
+        self.clips[pos].keyframes.sort_by(|a, b| {
+            a.time_offset_secs
+                .partial_cmp(&b.time_offset_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        self.status_message = format!("Added keyframe at {:.1}s", local_t);
+        true
+    }
+
+    pub fn insert_freeze_frame_at_playhead(&mut self, image_path: PathBuf, freeze_dur: f32) -> bool {
+        let playhead = self.playhead_secs;
+        let overlay_track_id = self.default_track_id(TrackKind::Overlay);
+        if self.track_flags_by_id(overlay_track_id).locked {
+            self.status_message = "Overlay track is locked".into();
+            return false;
+        }
+
+        self.push_undo();
+        let dur = freeze_dur.clamp(0.5, 15.0);
+        let clip_id = self.next_id;
+        self.next_id += 1;
+        if playhead + dur > self.total_duration_secs {
+            self.total_duration_secs = (playhead + dur + 5.0).ceil();
+        }
+        let mut clip = Self::build_clip_base(
+            clip_id,
+            0,
+            format!("Freeze {:.1}s", playhead),
+            Some(image_path),
+            TrackKind::Overlay,
+            overlay_track_id,
+            playhead,
+            dur,
+            3600.0,
+        );
+        clip.volume = 0;
+        self.clips.push(clip);
+        self.selected_clip_id = Some(clip_id);
+        self.status_message = format!("Inserted freeze frame at {:.1}s", playhead);
+        true
+    }
 }
 
 pub fn classify_media_path(path: &Path) -> Option<TrackKind> {
@@ -1279,5 +1445,43 @@ mod tests {
         assert_eq!(AspectRatio::Ratio16x9.dimensions(720), (1280, 720));
         assert_eq!(AspectRatio::Ratio9x16.dimensions(720), (720, 1280));
         assert_eq!(AspectRatio::Ratio1x1.dimensions(720), (720, 720));
+    }
+
+    #[test]
+    fn keyframe_interpolation_evaluates_midpoint() {
+        let mut core = EditorCore::new();
+        core.clips.push(sample_clip(1, 0.0, 4.0));
+        core.selected_clip_id = Some(1);
+
+        core.seek_to(0.0);
+        assert!(core.toggle_keyframe_at_playhead());
+        core.clips[0].pos_x = 100.0;
+        core.clips[0].rotation_deg = 90.0;
+        core.seek_to(4.0);
+        // evaluate_at clamps to duration; test explicit second keyframe at 2.0s
+        core.seek_to(2.0);
+        assert!(core.toggle_keyframe_at_playhead());
+        core.clips[0].keyframes[1].pos_x = 100.0;
+        core.clips[0].keyframes[1].rotation_deg = 90.0;
+
+        let (px, _, _, rot, _) = core.clips[0].evaluate_at(1.0);
+        assert!((px - 50.0).abs() < 0.01);
+        assert!((rot - 45.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn mirror_rotate_reverse_speed_work() {
+        let mut core = EditorCore::new();
+        core.clips.push(sample_clip(1, 0.0, 4.0));
+        core.selected_clip_id = Some(1);
+
+        assert!(core.toggle_mirror_selected());
+        assert!(core.clips[0].flip_h);
+        assert!(core.rotate_selected_90());
+        assert!((core.clips[0].rotation_deg - 90.0).abs() < 0.01);
+        assert!(core.toggle_reverse_selected());
+        assert!(core.clips[0].reversed);
+        assert!(core.set_selected_speed(2.0));
+        assert!((core.clips[0].duration_secs - 2.0).abs() < 0.01);
     }
 }

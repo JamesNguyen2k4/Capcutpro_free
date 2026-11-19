@@ -47,10 +47,92 @@ pub fn probe_duration_secs(path: &Path) -> Option<f32> {
     text.trim().parse::<f32>().ok().filter(|d| *d > 0.05)
 }
 
+pub fn probe_media_dimensions(path: &Path) -> Option<(u32, u32)> {
+    if let Ok((w, h)) = image::image_dimensions(path) {
+        if w > 0 && h > 0 {
+            return Some((w, h));
+        }
+    }
+    let mut cmd = Command::new("ffprobe");
+    apply_no_window(&mut cmd);
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=width,height",
+        "-of",
+        "csv=s=x:p=0",
+    ])
+    .arg(path)
+    .stdout(Stdio::piped())
+    .stderr(Stdio::null());
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.trim().split('x');
+    let w = parts.next()?.parse::<u32>().ok()?;
+    let h = parts.next()?.parse::<u32>().ok()?;
+    if w > 0 && h > 0 {
+        Some((w, h))
+    } else {
+        None
+    }
+}
+
 fn bgra_bytes_to_render_image(bytes: Vec<u8>, width: u32, height: u32) -> Option<Arc<RenderImage>> {
     let img = RgbaImage::from_raw(width, height, bytes)?;
     let frame = Frame::new(img);
     Some(Arc::new(RenderImage::new(smallvec![frame])))
+}
+
+fn append_flip_rotate_filters(parts: &mut Vec<String>, flip_h: bool, rotation_deg: f32) {
+    if flip_h {
+        parts.push("hflip".into());
+    }
+    let norm_rot = rotation_deg.rem_euclid(360.0);
+    if norm_rot.abs() > 0.5 && (norm_rot - 360.0).abs() > 0.5 {
+        let rad = norm_rot * std::f32::consts::PI / 180.0;
+        parts.push(format!(
+            "format=rgba,rotate={rad:.5}:ow=rotw({rad:.5}):oh=roth({rad:.5}):fillcolor=none",
+            rad = rad
+        ));
+    }
+}
+
+pub fn export_freeze_frame(path: &Path, time_secs: f32) -> Option<PathBuf> {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out_path = std::env::temp_dir().join(format!("opencut_freeze_{}.png", ts));
+
+    let mut cmd = Command::new("ffmpeg");
+    apply_no_window(&mut cmd);
+    cmd.args([
+        "-y",
+        "-v",
+        "error",
+        "-ss",
+        &format!("{:.3}", time_secs.max(0.0)),
+    ])
+    .arg("-i")
+    .arg(path)
+    .args(["-frames:v", "1"])
+    .arg(&out_path)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null());
+
+    let status = cmd.status().ok()?;
+    if status.success() && out_path.exists() {
+        Some(out_path)
+    } else {
+        None
+    }
 }
 
 pub fn decode_single_frame(
@@ -58,14 +140,19 @@ pub fn decode_single_frame(
     time_secs: f32,
     aspect_ratio: AspectRatio,
     preview_height: u32,
+    flip_h: bool,
+    rotation_deg: f32,
 ) -> Option<Arc<RenderImage>> {
     let (pw, ph) = preview_dimensions(aspect_ratio, preview_height);
     let frame_bytes = (pw * ph * 4) as usize;
-    let vf = format!(
+    let mut vf_parts = Vec::new();
+    append_flip_rotate_filters(&mut vf_parts, flip_h, rotation_deg);
+    vf_parts.push(format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
         w = pw,
         h = ph
-    );
+    ));
+    let vf = vf_parts.join(",");
 
     let mut cmd = Command::new("ffmpeg");
     apply_no_window(&mut cmd);
@@ -96,6 +183,103 @@ pub fn decode_single_frame(
     bgra_bytes_to_render_image(buf, pw, ph)
 }
 
+pub fn render_rotated_text_frame(
+    td: &TextClipData,
+    font_size_px: f32,
+    box_w: u32,
+    box_h: u32,
+    flip_h: bool,
+    rotation_deg: f32,
+) -> Option<(Arc<RenderImage>, u32, u32)> {
+    let base_w = (box_w + 16).max(32);
+    let base_h = (box_h + 16).max(32);
+    let norm_rot = rotation_deg.rem_euclid(360.0);
+    let rad = norm_rot * std::f32::consts::PI / 180.0;
+    let c = rad.cos().abs();
+    let s = rad.sin().abs();
+    let rot_w = ((base_w as f32 * c + base_h as f32 * s).ceil() as u32).max(16);
+    let rot_h = ((base_w as f32 * s + base_h as f32 * c).ceil() as u32).max(16);
+    let frame_bytes = (rot_w * rot_h * 4) as usize;
+
+    let display_text = if td.content.is_empty() {
+        "Text"
+    } else {
+        td.content.as_str()
+    };
+    let escaped = display_text
+        .replace('\\', "\\\\")
+        .replace(':', "\\:")
+        .replace('\'', "\\'");
+    let box_part = if let Some(bg_hex) = td.bg_color_hex {
+        format!(
+            ":box=1:boxcolor=0x{:06x}@0.75:boxborderw={:.0}",
+            bg_hex,
+            td.bg_padding.max(2.0)
+        )
+    } else {
+        String::new()
+    };
+    let border_part = if td.stroke_width > 0.1 {
+        let sc = td.stroke_color_hex.unwrap_or(0x000000);
+        format!(":borderw={:.1}:bordercolor=0x{:06x}", td.stroke_width * 2.0, sc)
+    } else {
+        String::new()
+    };
+    let shadow_part = if let Some(sh_hex) = td.shadow_color_hex {
+        format!(
+            ":shadowx={:.1}:shadowy={:.1}:shadowcolor=0x{:06x}@0.75",
+            td.shadow_offset_x, td.shadow_offset_y, sh_hex
+        )
+    } else {
+        String::new()
+    };
+    let font_part = resolve_text_font_file(td)
+        .map(|p| {
+            let sp = p.to_string_lossy().replace('\\', "/").replace(':', "\\:");
+            format!(":fontfile='{}'", sp)
+        })
+        .unwrap_or_default();
+
+    let mut xf = format!(
+        "color=c=black@0.0:s={w}x{h}:d=0.1,format=rgba,drawtext=text='{txt}'{fp}:fontsize={fs:.1}:fontcolor=0x{col:06x}:x=(w-text_w)/2:y=(h-text_h)/2{bp}{bd}{sh}",
+        w = base_w,
+        h = base_h,
+        txt = escaped,
+        fp = font_part,
+        fs = font_size_px.max(8.0),
+        col = td.color_hex,
+        bp = box_part,
+        bd = border_part,
+        sh = shadow_part,
+    );
+    if flip_h {
+        xf.push_str(",hflip");
+    }
+    xf.push_str(&format!(
+        ",rotate={rad:.5}:ow={ow}:oh={oh}:fillcolor=none",
+        rad = rad,
+        ow = rot_w,
+        oh = rot_h
+    ));
+
+    let mut cmd = Command::new("ffmpeg");
+    apply_no_window(&mut cmd);
+    cmd.args(["-v", "error", "-f", "lavfi", "-i", &xf])
+        .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "bgra", "-"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+
+    let output = cmd.output().ok()?;
+    if !output.status.success() || output.stdout.len() < frame_bytes {
+        return None;
+    }
+
+    let mut buf = output.stdout;
+    buf.truncate(frame_bytes);
+    let img = bgra_bytes_to_render_image(buf, rot_w, rot_h)?;
+    Some((img, rot_w, rot_h))
+}
+
 pub struct VideoStreamPlayer {
     stop_flag: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
@@ -103,6 +287,8 @@ pub struct VideoStreamPlayer {
     active_clip_id: Option<usize>,
     active_ratio: Option<AspectRatio>,
     active_height: Option<u32>,
+    active_flip: bool,
+    active_rot: f32,
 }
 
 impl VideoStreamPlayer {
@@ -114,6 +300,8 @@ impl VideoStreamPlayer {
             active_clip_id: None,
             active_ratio: None,
             active_height: None,
+            active_flip: false,
+            active_rot: 0.0,
         }
     }
 
@@ -129,6 +317,10 @@ impl VideoStreamPlayer {
         self.active_height
     }
 
+    pub fn active_transform(&self) -> (bool, f32) {
+        (self.active_flip, self.active_rot)
+    }
+
     pub fn start(
         &mut self,
         clip_id: usize,
@@ -136,6 +328,8 @@ impl VideoStreamPlayer {
         start_offset_secs: f32,
         aspect_ratio: AspectRatio,
         preview_height: u32,
+        flip_h: bool,
+        rotation_deg: f32,
     ) {
         self.stop();
 
@@ -149,16 +343,21 @@ impl VideoStreamPlayer {
         self.active_clip_id = Some(clip_id);
         self.active_ratio = Some(aspect_ratio);
         self.active_height = Some(preview_height);
+        self.active_flip = flip_h;
+        self.active_rot = rotation_deg;
 
         let (pw, ph) = preview_dimensions(aspect_ratio, preview_height);
         let frame_bytes = (pw * ph * 4) as usize;
 
         std::thread::spawn(move || {
-            let vf = format!(
-                "fps=24,scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
+            let mut vf_parts = vec!["fps=24".to_string()];
+            append_flip_rotate_filters(&mut vf_parts, flip_h, rotation_deg);
+            vf_parts.push(format!(
+                "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
                 w = pw,
                 h = ph
-            );
+            ));
+            let vf = vf_parts.join(",");
 
             let mut cmd = Command::new("ffmpeg");
             apply_no_window(&mut cmd);
@@ -566,24 +765,63 @@ pub fn start_export_timeline(
                                 ),
                                 _ => format!("(h-text_h)/2+({:.0})", clip.pos_y),
                             };
-                            filter_parts.push(format!(
-                                "{prev}drawtext=text='{txt}'{fp}:fontsize={fs:.0}:fontcolor=0x{col:06x}@{op:.2}:x=(w-text_w)/2+({ox:.0}):y='{y}'{ae}{bp}{bd}{sh}:enable='between(t,{st:.3},{en:.3})'[{vo}]",
-                                prev = last_video_label,
-                                txt = escaped,
-                                fp = font_part,
-                                fs = base_fs,
-                                col = td.color_hex,
-                                op = alpha,
-                                ox = clip.pos_x,
-                                y = y_expr,
-                                ae = alpha_expr,
-                                bp = box_part,
-                                bd = border_part,
-                                sh = shadow_part,
-                                st = st,
-                                en = en,
-                                vo = v_out
-                            ));
+                            let norm_rot = clip.rotation_deg.rem_euclid(360.0);
+                            let has_rot_or_flip =
+                                clip.flip_h || (norm_rot > 0.5 && norm_rot < 359.5);
+                            if has_rot_or_flip {
+                                let txt_raw = format!("txt_raw_{}", clip.id);
+                                let txt_rot = format!("txt_xf_{}", clip.id);
+                                let mut xf_parts = Vec::new();
+                                append_flip_rotate_filters(&mut xf_parts, clip.flip_h, clip.rotation_deg);
+                                let xf_chain = xf_parts.join(",");
+                                filter_parts.push(format!(
+                                    "color=c=black@0.0:s={w}x{h}:d={dur:.3},format=rgba,drawtext=text='{txt}'{fp}:fontsize={fs:.0}:fontcolor=0x{col:06x}@{op:.2}:x=(w-text_w)/2:y=(h-text_h)/2{ae}{bp}{bd}{sh}[{tr}];[{tr}]{xf}[{tx}]",
+                                    w = out_w,
+                                    h = out_h,
+                                    dur = en.max(0.1),
+                                    txt = escaped,
+                                    fp = font_part,
+                                    fs = base_fs,
+                                    col = td.color_hex,
+                                    op = alpha,
+                                    ae = alpha_expr,
+                                    bp = box_part,
+                                    bd = border_part,
+                                    sh = shadow_part,
+                                    tr = txt_raw,
+                                    xf = xf_chain,
+                                    tx = txt_rot,
+                                ));
+                                filter_parts.push(format!(
+                                    "{prev}[{tx}]overlay=x=(W-w)/2+({ox:.0}):y=(H-h)/2+({oy:.0}):enable='between(t,{st:.3},{en:.3})'[{vo}]",
+                                    prev = last_video_label,
+                                    tx = txt_rot,
+                                    ox = clip.pos_x,
+                                    oy = clip.pos_y,
+                                    st = st,
+                                    en = en,
+                                    vo = v_out,
+                                ));
+                            } else {
+                                filter_parts.push(format!(
+                                    "{prev}drawtext=text='{txt}'{fp}:fontsize={fs:.0}:fontcolor=0x{col:06x}@{op:.2}:x=(w-text_w)/2+({ox:.0}):y='{y}'{ae}{bp}{bd}{sh}:enable='between(t,{st:.3},{en:.3})'[{vo}]",
+                                    prev = last_video_label,
+                                    txt = escaped,
+                                    fp = font_part,
+                                    fs = base_fs,
+                                    col = td.color_hex,
+                                    op = alpha,
+                                    ox = clip.pos_x,
+                                    y = y_expr,
+                                    ae = alpha_expr,
+                                    bp = box_part,
+                                    bd = border_part,
+                                    sh = shadow_part,
+                                    st = st,
+                                    en = en,
+                                    vo = v_out
+                                ));
+                            }
                             last_video_label = format!("[{}]", v_out);
                         }
                     }
@@ -617,13 +855,27 @@ pub fn start_export_timeline(
                         let target_w = ((out_w as f32 * scale_factor) as u32).max(16) & !1;
                         let target_h = ((out_h as f32 * scale_factor) as u32).max(16) & !1;
                         let opacity = (clip.opacity as f32 / 100.0).clamp(0.0, 1.0);
+                        let spd = clip.speed.clamp(0.25, 4.0);
+
+                        let mut extra_vf = Vec::new();
+                        if clip.reversed {
+                            extra_vf.push("reverse".into());
+                        }
+                        append_flip_rotate_filters(&mut extra_vf, clip.flip_h, clip.rotation_deg);
+                        let extra_prefix = if extra_vf.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{},", extra_vf.join(","))
+                        };
 
                         filter_parts.push(format!(
-                            "[{in_idx}:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,format=yuva420p,colorchannelmixer=aa={op:.2},setpts=PTS-STARTPTS+{st:.3}/TB[{vp}]",
+                            "[{in_idx}:v]{ep}scale={tw}:{th}:force_original_aspect_ratio=decrease,pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,format=yuva420p,colorchannelmixer=aa={op:.2},setpts=(PTS-STARTPTS)/{spd:.3}+{st:.3}/TB[{vp}]",
                             in_idx = input_idx,
+                            ep = extra_prefix,
                             tw = target_w,
                             th = target_h,
                             op = opacity,
+                            spd = spd,
                             st = clip.start_secs,
                             vp = v_prep
                         ));
@@ -670,9 +922,18 @@ pub fn start_export_timeline(
                     let target_h = ((out_h as f32 * scale_factor) as u32).max(16) & !1;
                     let opacity = (clip.opacity as f32 / 100.0).clamp(0.0, 1.0);
 
+                    let mut extra_vf = Vec::new();
+                    append_flip_rotate_filters(&mut extra_vf, clip.flip_h, clip.rotation_deg);
+                    let extra_prefix = if extra_vf.is_empty() {
+                        String::new()
+                    } else {
+                        format!("{},", extra_vf.join(","))
+                    };
+
                     filter_parts.push(format!(
-                        "[{in_idx}:v]scale={tw}:{th}:force_original_aspect_ratio=decrease,format=rgba,colorchannelmixer=aa={op:.2},setpts=PTS-STARTPTS+{st:.3}/TB[{vp}]",
+                        "[{in_idx}:v]{ep}scale={tw}:{th}:force_original_aspect_ratio=decrease,format=rgba,colorchannelmixer=aa={op:.2},setpts=PTS-STARTPTS+{st:.3}/TB[{vp}]",
                         in_idx = input_idx,
+                        ep = extra_prefix,
                         tw = target_w,
                         th = target_h,
                         op = opacity,
