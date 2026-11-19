@@ -1,5 +1,6 @@
 mod editor_view;
 mod media_engine;
+mod project_hub;
 mod theme;
 
 use editor_view::EditorView;

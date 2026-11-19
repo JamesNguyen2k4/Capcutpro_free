@@ -9,7 +9,10 @@ use gpui::{
     Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
     Styled, StyledImage, Window, div, img, prelude::FluentBuilder, px, rgb,
 };
-use opencut_core::{EditorCore, TrackKind, format_timecode};
+use opencut_core::{
+    AspectRatio, EditorCore, RecentProjectEntry, TrackKind, format_timecode, load_recent_projects,
+    record_recent_project,
+};
 
 use crate::media_engine::{
     AudioStreamPlayer, ExportHandle, VideoStreamPlayer, decode_single_frame, probe_duration_secs,
@@ -72,9 +75,21 @@ struct ClipDragState {
     initial_duration_secs: f32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppScreen {
+    ProjectHub,
+    Editor,
+}
+
 pub struct EditorView {
-    state: EditorCore,
-    focus_handle: FocusHandle,
+    pub(crate) state: EditorCore,
+    pub(crate) focus_handle: FocusHandle,
+    pub(crate) screen: AppScreen,
+    pub(crate) recent_projects: Vec<RecentProjectEntry>,
+    pub(crate) create_modal_open: bool,
+    pub(crate) draft_ratio: AspectRatio,
+    pub(crate) draft_base_height: u32,
+    pub(crate) hub_error: Option<String>,
     playback_started: bool,
     current_frame: Option<Arc<RenderImage>>,
     player: VideoStreamPlayer,
@@ -94,6 +109,12 @@ impl EditorView {
         let mut view = Self {
             state: EditorCore::new(),
             focus_handle: cx.focus_handle(),
+            screen: AppScreen::ProjectHub,
+            recent_projects: load_recent_projects(),
+            create_modal_open: false,
+            draft_ratio: AspectRatio::Ratio16x9,
+            draft_base_height: 1080,
+            hub_error: None,
             playback_started: false,
             current_frame: None,
             player: VideoStreamPlayer::new(),
@@ -195,10 +216,13 @@ impl EditorView {
             return;
         };
 
-        if self.player.active_clip_id() != Some(active.id) {
+        if self.player.active_clip_id() != Some(active.id)
+            || self.player.active_ratio() != Some(self.state.aspect_ratio)
+        {
             let offset =
                 active.source_in_secs + (self.state.playhead_secs - active.start_secs).max(0.0);
-            self.player.start(active.id, path, offset);
+            self.player
+                .start(active.id, path, offset, self.state.aspect_ratio);
         }
 
         if let Some(frame) = self.player.take_latest_frame() {
@@ -235,7 +259,8 @@ impl EditorView {
         let offset =
             active.source_in_secs + (self.state.playhead_secs - active.start_secs).max(0.0);
         if self.state.is_playing {
-            self.player.start(active.id, path, offset);
+            self.player
+                .start(active.id, path, offset, self.state.aspect_ratio);
         } else {
             self.player.stop();
             self.request_single_frame(path, offset, cx);
@@ -245,10 +270,11 @@ impl EditorView {
     fn request_single_frame(&mut self, path: PathBuf, offset_secs: f32, cx: &mut Context<Self>) {
         self.decode_seq = self.decode_seq.wrapping_add(1);
         let seq = self.decode_seq;
+        let ratio = self.state.aspect_ratio;
 
         let task = cx
             .background_executor()
-            .spawn(async move { decode_single_frame(&path, offset_secs) });
+            .spawn(async move { decode_single_frame(&path, offset_secs, ratio) });
 
         cx.spawn(async move |this, cx| {
             let frame = task.await;
@@ -281,7 +307,54 @@ impl EditorView {
         .detach();
     }
 
-    fn prompt_open_project(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn create_new_project(&mut self, cx: &mut Context<Self>) {
+        self.player.stop();
+        self.audio_player.stop();
+        self.current_frame = None;
+        self.timeline_scroll_x = 0.0;
+        self.export_status = ExportStatus::Idle;
+
+        let mut core = EditorCore::new();
+        core.aspect_ratio = self.draft_ratio;
+        core.base_height = self.draft_base_height;
+        let (w, h) = core.aspect_ratio.dimensions(core.base_height);
+        core.status_message = format!("New project ({} • {}x{})", core.aspect_ratio.label(), w, h);
+
+        self.state = core;
+        self.create_modal_open = false;
+        self.hub_error = None;
+        self.screen = AppScreen::Editor;
+        cx.notify();
+    }
+
+    pub(crate) fn open_project_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.player.stop();
+        self.audio_player.stop();
+        self.current_frame = None;
+        self.timeline_scroll_x = 0.0;
+        self.export_status = ExportStatus::Idle;
+
+        match self.state.load_from_file(&path) {
+            Ok(()) => {
+                self.recent_projects = record_recent_project(RecentProjectEntry {
+                    name: self.state.project_name.clone(),
+                    path,
+                    aspect_ratio: self.state.aspect_ratio,
+                    base_height: self.state.base_height,
+                });
+                self.hub_error = None;
+                self.screen = AppScreen::Editor;
+                self.sync_preview_after_seek(cx);
+            }
+            Err(err) => {
+                self.hub_error = Some(err.clone());
+                self.state.status_message = err;
+            }
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn prompt_open_project(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -293,13 +366,7 @@ impl EditorView {
             if let Ok(Ok(Some(paths))) = rx.await {
                 if let Some(path) = paths.into_iter().next() {
                     let _ = this.update(cx, |view, cx| {
-                        view.player.stop();
-                        view.audio_player.stop();
-                        if let Err(err) = view.state.load_from_file(&path) {
-                            view.state.status_message = err;
-                        }
-                        view.sync_preview_after_seek(cx);
-                        cx.notify();
+                        view.open_project_path(path, cx);
                     });
                 }
             }
@@ -309,8 +376,16 @@ impl EditorView {
 
     fn save_project(&mut self, cx: &mut Context<Self>) {
         if let Some(existing) = self.state.project_path.clone() {
-            if let Err(err) = self.state.save_to_file(&existing) {
-                self.state.status_message = err;
+            match self.state.save_to_file(&existing) {
+                Ok(()) => {
+                    self.recent_projects = record_recent_project(RecentProjectEntry {
+                        name: self.state.project_name.clone(),
+                        path: existing,
+                        aspect_ratio: self.state.aspect_ratio,
+                        base_height: self.state.base_height,
+                    });
+                }
+                Err(err) => self.state.status_message = err,
             }
             cx.notify();
             return;
@@ -326,8 +401,16 @@ impl EditorView {
                     path.set_extension("opencut");
                 }
                 let _ = this.update(cx, |view, cx| {
-                    if let Err(err) = view.state.save_to_file(&path) {
-                        view.state.status_message = err;
+                    match view.state.save_to_file(&path) {
+                        Ok(()) => {
+                            view.recent_projects = record_recent_project(RecentProjectEntry {
+                                name: view.state.project_name.clone(),
+                                path,
+                                aspect_ratio: view.state.aspect_ratio,
+                                base_height: view.state.base_height,
+                            });
+                        }
+                        Err(err) => view.state.status_message = err,
                     }
                     cx.notify();
                 });
@@ -461,7 +544,10 @@ impl EditorView {
                 let _ = this.update(cx, |view, cx| {
                     let clips = view.state.clips.clone();
                     let flags = view.state.track_flags;
-                    let handle = start_export_timeline(clips, flags, path.clone());
+                    let ratio = view.state.aspect_ratio;
+                    let base_height = view.state.base_height;
+                    let handle =
+                        start_export_timeline(clips, flags, ratio, base_height, path.clone());
                     view.state.status_message = "Exporting... 0%".into();
                     view.export_status = ExportStatus::Exporting {
                         handle,
@@ -644,6 +730,17 @@ impl EditorView {
                     .items_center()
                     .gap_2p5()
                     .child(
+                        self.icon_button("btn-home-hub", "🏠", "Back to Projects", false, true)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.is_playing = false;
+                                this.player.stop();
+                                this.audio_player.stop();
+                                this.recent_projects = load_recent_projects();
+                                this.screen = AppScreen::ProjectHub;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
                         div()
                             .px_2()
                             .py_1()
@@ -689,6 +786,21 @@ impl EditorView {
                     .flex()
                     .items_center()
                     .gap_2()
+                    .child(
+                        self.header_button(
+                            "btn-ratio",
+                            SharedString::from(format!("Ratio: {}", self.state.aspect_ratio.label())),
+                            false,
+                        )
+                        .tooltip(build_tooltip("Cycle Aspect Ratio (16:9, 9:16, 1:1...)"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let next = this.state.aspect_ratio.next();
+                            this.state.set_aspect_ratio(next);
+                            this.player.stop();
+                            this.sync_preview_after_seek(cx);
+                            cx.notify();
+                        })),
+                    )
                     .child(
                         self.header_button(
                             "btn-export",
@@ -754,10 +866,10 @@ impl EditorView {
             .child(icon)
     }
 
-    fn header_button(
+    pub(crate) fn header_button(
         &self,
         id: &'static str,
-        label: &'static str,
+        label: impl Into<SharedString>,
         primary: bool,
     ) -> gpui::Stateful<gpui::Div> {
         let bg = if primary {
@@ -788,7 +900,7 @@ impl EditorView {
             .text_color(Theme::text_primary())
             .cursor_pointer()
             .hover(move |s| s.bg(hover_bg))
-            .child(label)
+            .child(label.into())
     }
 
     fn render_media_pool(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1009,12 +1121,23 @@ impl EditorView {
             })
     }
 
-    fn render_preview_panel(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_preview_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_video = self.state.active_video_clip().cloned();
         let active_count = self.state.active_clips_at_playhead().len();
         let timecode = format_timecode(self.state.playhead_secs);
         let total_timecode = format_timecode(self.state.total_duration_secs);
         let is_playing = self.state.is_playing;
+
+        let win_w = f32::from(window.viewport_size().width);
+        let win_h = f32::from(window.viewport_size().height);
+        let avail_w = (win_w - 280.0 - 260.0 - 40.0).max(200.0);
+        let avail_h = (win_h - 44.0 - 234.0 - 48.0 - 32.0).max(180.0);
+        let target_ratio = self.state.aspect_ratio.ratio_f32();
+        let (preview_w, preview_h) = if avail_w / avail_h > target_ratio {
+            (avail_h * target_ratio, avail_h)
+        } else {
+            (avail_w, avail_w / target_ratio)
+        };
 
         let preview_content = if let Some(clip) = active_video.clone() {
             if clip.track == TrackKind::Overlay {
@@ -1072,9 +1195,8 @@ impl EditorView {
                     .justify_center()
                     .child(
                         div()
-                            .w_full()
-                            .max_w(px(680.))
-                            .h(px(360.))
+                            .w(px(preview_w))
+                            .h(px(preview_h))
                             .rounded_lg()
                             .bg(Theme::bg_preview())
                             .border_1()
@@ -1201,6 +1323,7 @@ impl EditorView {
         total_timecode: &str,
         active_count: usize,
     ) -> gpui::Div {
+        let (out_w, out_h) = self.state.aspect_ratio.dimensions(self.state.base_height);
         div()
             .size_full()
             .flex()
@@ -1216,7 +1339,12 @@ impl EditorView {
                     .bg(Theme::bg_surface())
                     .text_xs()
                     .text_color(Theme::text_secondary())
-                    .child("PREVIEW 16:9"),
+                    .child(format!(
+                        "PREVIEW {} • {}×{}",
+                        self.state.aspect_ratio.label(),
+                        out_w,
+                        out_h
+                    )),
             )
             .child(
                 div()
@@ -1490,6 +1618,7 @@ impl EditorView {
 
         let selected_clip_id = self.state.selected_clip_id;
         let snap_enabled = self.state.snap_enabled;
+        let magnet_enabled = self.state.main_track_magnet;
 
         let ruler_step: usize = if px_per_sec >= 24.0 {
             2
@@ -1665,6 +1794,38 @@ impl EditorView {
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.state.snap_enabled = !this.state.snap_enabled;
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "tl-magnet",
+                                    "🧲",
+                                    if magnet_enabled {
+                                        "Main Track Magnet: ON"
+                                    } else {
+                                        "Main Track Magnet: OFF"
+                                    },
+                                    magnet_enabled,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.toggle_main_track_magnet();
+                                    this.sync_preview_after_seek(cx);
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "tl-marker",
+                                    "⚑",
+                                    "Add Marker at Playhead",
+                                    false,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let t = this.state.playhead_secs;
+                                    this.state.add_marker(t, "Marker");
                                     cx.notify();
                                 })),
                             )
@@ -2132,6 +2293,10 @@ impl EditorView {
 
 impl Render for EditorView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.screen == AppScreen::ProjectHub {
+            return self.render_project_hub(cx).into_any_element();
+        }
+
         div()
             .id("editor-root")
             .track_focus(&self.focus_handle)
@@ -2221,9 +2386,10 @@ impl Render for EditorView {
                     .flex()
                     .overflow_hidden()
                     .child(self.render_media_pool(cx))
-                    .child(self.render_preview_panel(cx))
+                    .child(self.render_preview_panel(window, cx))
                     .child(self.render_inspector(cx)),
             )
             .child(self.render_timeline(window, cx))
+            .into_any_element()
     }
 }

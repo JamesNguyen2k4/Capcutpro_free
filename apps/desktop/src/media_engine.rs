@@ -8,11 +8,11 @@ use gpui::RenderImage;
 use image::{Frame, RgbaImage};
 use smallvec::smallvec;
 
-use opencut_core::{TimelineClip, TrackFlags, TrackKind};
+use opencut_core::{AspectRatio, TimelineClip, TrackFlags, TrackKind};
 
-pub const PREVIEW_WIDTH: u32 = 640;
-pub const PREVIEW_HEIGHT: u32 = 360;
-const FRAME_BYTES: usize = (PREVIEW_WIDTH * PREVIEW_HEIGHT * 4) as usize;
+pub fn preview_dimensions(aspect_ratio: AspectRatio) -> (u32, u32) {
+    aspect_ratio.dimensions(360)
+}
 
 #[cfg(windows)]
 fn apply_no_window(cmd: &mut Command) {
@@ -47,17 +47,23 @@ pub fn probe_duration_secs(path: &Path) -> Option<f32> {
     text.trim().parse::<f32>().ok().filter(|d| *d > 0.05)
 }
 
-fn bgra_bytes_to_render_image(bytes: Vec<u8>) -> Option<Arc<RenderImage>> {
-    let img = RgbaImage::from_raw(PREVIEW_WIDTH, PREVIEW_HEIGHT, bytes)?;
+fn bgra_bytes_to_render_image(bytes: Vec<u8>, width: u32, height: u32) -> Option<Arc<RenderImage>> {
+    let img = RgbaImage::from_raw(width, height, bytes)?;
     let frame = Frame::new(img);
     Some(Arc::new(RenderImage::new(smallvec![frame])))
 }
 
-pub fn decode_single_frame(path: &Path, time_secs: f32) -> Option<Arc<RenderImage>> {
+pub fn decode_single_frame(
+    path: &Path,
+    time_secs: f32,
+    aspect_ratio: AspectRatio,
+) -> Option<Arc<RenderImage>> {
+    let (pw, ph) = preview_dimensions(aspect_ratio);
+    let frame_bytes = (pw * ph * 4) as usize;
     let vf = format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
-        w = PREVIEW_WIDTH,
-        h = PREVIEW_HEIGHT
+        w = pw,
+        h = ph
     );
 
     let mut cmd = Command::new("ffmpeg");
@@ -80,13 +86,13 @@ pub fn decode_single_frame(path: &Path, time_secs: f32) -> Option<Arc<RenderImag
         .stderr(Stdio::null());
 
     let output = cmd.output().ok()?;
-    if !output.status.success() || output.stdout.len() < FRAME_BYTES {
+    if !output.status.success() || output.stdout.len() < frame_bytes {
         return None;
     }
 
     let mut buf = output.stdout;
-    buf.truncate(FRAME_BYTES);
-    bgra_bytes_to_render_image(buf)
+    buf.truncate(frame_bytes);
+    bgra_bytes_to_render_image(buf, pw, ph)
 }
 
 pub struct VideoStreamPlayer {
@@ -94,6 +100,7 @@ pub struct VideoStreamPlayer {
     child: Arc<Mutex<Option<Child>>>,
     latest_frame: Arc<Mutex<Option<Arc<RenderImage>>>>,
     active_clip_id: Option<usize>,
+    active_ratio: Option<AspectRatio>,
 }
 
 impl VideoStreamPlayer {
@@ -103,6 +110,7 @@ impl VideoStreamPlayer {
             child: Arc::new(Mutex::new(None)),
             latest_frame: Arc::new(Mutex::new(None)),
             active_clip_id: None,
+            active_ratio: None,
         }
     }
 
@@ -110,7 +118,17 @@ impl VideoStreamPlayer {
         self.active_clip_id
     }
 
-    pub fn start(&mut self, clip_id: usize, path: PathBuf, start_offset_secs: f32) {
+    pub fn active_ratio(&self) -> Option<AspectRatio> {
+        self.active_ratio
+    }
+
+    pub fn start(
+        &mut self,
+        clip_id: usize,
+        path: PathBuf,
+        start_offset_secs: f32,
+        aspect_ratio: AspectRatio,
+    ) {
         self.stop();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -121,12 +139,16 @@ impl VideoStreamPlayer {
         self.child = child_slot.clone();
         self.latest_frame = latest_frame.clone();
         self.active_clip_id = Some(clip_id);
+        self.active_ratio = Some(aspect_ratio);
+
+        let (pw, ph) = preview_dimensions(aspect_ratio);
+        let frame_bytes = (pw * ph * 4) as usize;
 
         std::thread::spawn(move || {
             let vf = format!(
                 "fps=24,scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
-                w = PREVIEW_WIDTH,
-                h = PREVIEW_HEIGHT
+                w = pw,
+                h = ph
             );
 
             let mut cmd = Command::new("ffmpeg");
@@ -166,12 +188,12 @@ impl VideoStreamPlayer {
                 }
             }
 
-            let mut buf = vec![0u8; FRAME_BYTES];
+            let mut buf = vec![0u8; frame_bytes];
             while !stop_flag.load(Ordering::Relaxed) {
                 if stdout.read_exact(&mut buf).is_err() {
                     break;
                 }
-                if let Some(render_img) = bgra_bytes_to_render_image(buf.clone()) {
+                if let Some(render_img) = bgra_bytes_to_render_image(buf.clone(), pw, ph) {
                     if let Ok(mut guard) = latest_frame.lock() {
                         *guard = Some(render_img);
                     }
@@ -345,6 +367,8 @@ pub struct ExportHandle {
 pub fn start_export_timeline(
     clips: Vec<TimelineClip>,
     track_flags: [TrackFlags; 3],
+    aspect_ratio: AspectRatio,
+    base_height: u32,
     output_path: PathBuf,
 ) -> ExportHandle {
     let progress_pct = Arc::new(Mutex::new(0.0_f32));
@@ -362,7 +386,11 @@ pub fn start_export_timeline(
         let valid_clips: Vec<TimelineClip> = clips
             .into_iter()
             .filter(|c| {
-                let flags = track_flags[c.track.index()];
+                let flags = if c.track.index() < 3 {
+                    track_flags[c.track.index()]
+                } else {
+                    TrackFlags::default()
+                };
                 let visible = c.track == TrackKind::Audio || !flags.hidden;
                 let audible = c.track != TrackKind::Audio || !flags.muted;
                 c.source_path.is_some() && c.duration_secs > 0.05 && (visible || audible)
@@ -383,15 +411,17 @@ pub fn start_export_timeline(
             .fold(0.0_f32, f32::max)
             .max(0.5);
 
+        let (out_w, out_h) = aspect_ratio.dimensions(base_height.max(360));
+
         let mut cmd = Command::new("ffmpeg");
         apply_no_window(&mut cmd);
 
-        // Input 0: black 1280x720 30fps base canvas
+        // Input 0: black canvas matching project aspect ratio at 30fps
         cmd.args([
             "-f",
             "lavfi",
             "-i",
-            &format!("color=c=black:s=1280x720:r=30:d={:.3}", export_duration),
+            &format!("color=c=black:s={}x{}:r=30:d={:.3}", out_w, out_h, export_duration),
         ]);
 
         // Input 1: silent stereo audio base
@@ -414,6 +444,8 @@ pub fn start_export_timeline(
             TrackKind::Video => (0, (c.start_secs * 100.0) as i64),
             TrackKind::Overlay => (1, (c.start_secs * 100.0) as i64),
             TrackKind::Audio => (2, (c.start_secs * 100.0) as i64),
+            TrackKind::Text => (3, (c.start_secs * 100.0) as i64),
+            TrackKind::Adjustment => (4, (c.start_secs * 100.0) as i64),
         });
 
         for (idx, clip) in sorted_clips.iter().enumerate() {
@@ -421,7 +453,11 @@ pub fn start_export_timeline(
             let Some(path) = &clip.source_path else {
                 continue;
             };
-            let flags = track_flags[clip.track.index()];
+            let flags = if clip.track.index() < 3 {
+                track_flags[clip.track.index()]
+            } else {
+                TrackFlags::default()
+            };
 
             match clip.track {
                 TrackKind::Video => {
@@ -440,8 +476,8 @@ pub fn start_export_timeline(
                         video_step += 1;
 
                         let scale_factor = (clip.scale as f32 / 100.0).clamp(0.1, 2.0);
-                        let target_w = ((1280.0 * scale_factor) as u32).max(16) & !1;
-                        let target_h = ((720.0 * scale_factor) as u32).max(16) & !1;
+                        let target_w = ((out_w as f32 * scale_factor) as u32).max(16) & !1;
+                        let target_h = ((out_h as f32 * scale_factor) as u32).max(16) & !1;
                         let opacity = (clip.opacity as f32 / 100.0).clamp(0.0, 1.0);
 
                         filter_parts.push(format!(
@@ -490,8 +526,8 @@ pub fn start_export_timeline(
                     video_step += 1;
 
                     let scale_factor = (clip.scale as f32 / 100.0).clamp(0.1, 2.0);
-                    let target_w = ((1280.0 * scale_factor) as u32).max(16) & !1;
-                    let target_h = ((720.0 * scale_factor) as u32).max(16) & !1;
+                    let target_w = ((out_w as f32 * scale_factor) as u32).max(16) & !1;
+                    let target_h = ((out_h as f32 * scale_factor) as u32).max(16) & !1;
                     let opacity = (clip.opacity as f32 / 100.0).clamp(0.0, 1.0);
 
                     filter_parts.push(format!(
@@ -539,6 +575,7 @@ pub fn start_export_timeline(
                         audio_labels.push(format!("[{}]", a_label));
                     }
                 }
+                TrackKind::Text | TrackKind::Adjustment => {}
             }
         }
 
