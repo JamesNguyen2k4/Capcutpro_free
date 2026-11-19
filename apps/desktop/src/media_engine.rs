@@ -10,8 +10,8 @@ use smallvec::smallvec;
 
 use opencut_core::{AspectRatio, TextAnimation, TextClipData, TimelineClip, Track, TrackFlags, TrackKind};
 
-pub fn preview_dimensions(aspect_ratio: AspectRatio) -> (u32, u32) {
-    aspect_ratio.dimensions(360)
+pub fn preview_dimensions(aspect_ratio: AspectRatio, preview_height: u32) -> (u32, u32) {
+    aspect_ratio.dimensions(preview_height.clamp(120, 1080))
 }
 
 #[cfg(windows)]
@@ -57,8 +57,9 @@ pub fn decode_single_frame(
     path: &Path,
     time_secs: f32,
     aspect_ratio: AspectRatio,
+    preview_height: u32,
 ) -> Option<Arc<RenderImage>> {
-    let (pw, ph) = preview_dimensions(aspect_ratio);
+    let (pw, ph) = preview_dimensions(aspect_ratio, preview_height);
     let frame_bytes = (pw * ph * 4) as usize;
     let vf = format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
@@ -101,6 +102,7 @@ pub struct VideoStreamPlayer {
     latest_frame: Arc<Mutex<Option<Arc<RenderImage>>>>,
     active_clip_id: Option<usize>,
     active_ratio: Option<AspectRatio>,
+    active_height: Option<u32>,
 }
 
 impl VideoStreamPlayer {
@@ -111,6 +113,7 @@ impl VideoStreamPlayer {
             latest_frame: Arc::new(Mutex::new(None)),
             active_clip_id: None,
             active_ratio: None,
+            active_height: None,
         }
     }
 
@@ -122,12 +125,17 @@ impl VideoStreamPlayer {
         self.active_ratio
     }
 
+    pub fn active_height(&self) -> Option<u32> {
+        self.active_height
+    }
+
     pub fn start(
         &mut self,
         clip_id: usize,
         path: PathBuf,
         start_offset_secs: f32,
         aspect_ratio: AspectRatio,
+        preview_height: u32,
     ) {
         self.stop();
 
@@ -140,8 +148,9 @@ impl VideoStreamPlayer {
         self.latest_frame = latest_frame.clone();
         self.active_clip_id = Some(clip_id);
         self.active_ratio = Some(aspect_ratio);
+        self.active_height = Some(preview_height);
 
-        let (pw, ph) = preview_dimensions(aspect_ratio);
+        let (pw, ph) = preview_dimensions(aspect_ratio, preview_height);
         let frame_bytes = (pw * ph * 4) as usize;
 
         std::thread::spawn(move || {
@@ -619,9 +628,11 @@ pub fn start_export_timeline(
                             vp = v_prep
                         ));
                         filter_parts.push(format!(
-                            "{prev}[{vp}]overlay=(W-w)/2:(H-h)/2:enable='between(t,{st:.3},{en:.3})'[{vo}]",
+                            "{prev}[{vp}]overlay=(W-w)/2+({ox:.0}):(H-h)/2+({oy:.0}):enable='between(t,{st:.3},{en:.3})'[{vo}]",
                             prev = last_video_label,
                             vp = v_prep,
+                            ox = clip.pos_x,
+                            oy = clip.pos_y,
                             st = clip.start_secs,
                             en = clip.end_secs(),
                             vo = v_out
@@ -669,9 +680,11 @@ pub fn start_export_timeline(
                         vp = v_prep
                     ));
                     filter_parts.push(format!(
-                        "{prev}[{vp}]overlay=(W-w)/2:(H-h)/2:enable='between(t,{st:.3},{en:.3})'[{vo}]",
+                        "{prev}[{vp}]overlay=(W-w)/2+({ox:.0}):(H-h)/2+({oy:.0}):enable='between(t,{st:.3},{en:.3})'[{vo}]",
                         prev = last_video_label,
                         vp = v_prep,
+                        ox = clip.pos_x,
+                        oy = clip.pos_y,
                         st = clip.start_secs,
                         en = clip.end_secs(),
                         vo = v_out

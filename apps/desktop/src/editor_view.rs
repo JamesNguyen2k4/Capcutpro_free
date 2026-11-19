@@ -89,6 +89,39 @@ struct PreviewTextDragState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum PreviewQuality {
+    Full,
+    Half,
+    Quarter,
+}
+
+impl PreviewQuality {
+    fn height(&self) -> u32 {
+        match self {
+            PreviewQuality::Full => 720,
+            PreviewQuality::Half => 360,
+            PreviewQuality::Quarter => 180,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            PreviewQuality::Full => "Full",
+            PreviewQuality::Half => "1/2",
+            PreviewQuality::Quarter => "1/4",
+        }
+    }
+
+    fn next(&self) -> Self {
+        match self {
+            PreviewQuality::Full => PreviewQuality::Half,
+            PreviewQuality::Half => PreviewQuality::Quarter,
+            PreviewQuality::Quarter => PreviewQuality::Full,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SliderField {
     Opacity,
     Scale,
@@ -125,6 +158,9 @@ pub struct EditorView {
     media_filter: Option<TrackKind>,
     editing_text_clip_id: Option<usize>,
     marked_text_range: Option<Range<usize>>,
+    preview_quality: PreviewQuality,
+    show_safe_zone: bool,
+    preview_fullscreen: bool,
     playback_started: bool,
     current_frame: Option<Arc<RenderImage>>,
     player: VideoStreamPlayer,
@@ -155,6 +191,9 @@ impl EditorView {
             media_filter: None,
             editing_text_clip_id: None,
             marked_text_range: None,
+            preview_quality: PreviewQuality::Half,
+            show_safe_zone: false,
+            preview_fullscreen: false,
             playback_started: false,
             current_frame: None,
             player: VideoStreamPlayer::new(),
@@ -318,28 +357,32 @@ impl EditorView {
         self.audio_player
             .sync_playing_clips(&audio_clips, self.state.playhead_secs);
 
-        let Some(active) = self.state.active_video_clip().cloned() else {
+        let active_video = self
+            .state
+            .active_clips_at_playhead()
+            .into_iter()
+            .find(|c| c.track == TrackKind::Video)
+            .cloned();
+
+        let Some(active) = active_video else {
             self.player.stop();
             self.set_current_frame(None, cx);
             return;
         };
 
-        if active.track != TrackKind::Video {
-            self.player.stop();
-            return;
-        }
-
         let Some(path) = active.source_path else {
             return;
         };
 
+        let ph = self.preview_quality.height();
         if self.player.active_clip_id() != Some(active.id)
             || self.player.active_ratio() != Some(self.state.aspect_ratio)
+            || self.player.active_height() != Some(ph)
         {
             let offset =
                 active.source_in_secs + (self.state.playhead_secs - active.start_secs).max(0.0);
             self.player
-                .start(active.id, path, offset, self.state.aspect_ratio);
+                .start(active.id, path, offset, self.state.aspect_ratio, ph);
         }
 
         if let Some(frame) = self.player.take_latest_frame() {
@@ -355,17 +398,18 @@ impl EditorView {
                 .sync_playing_clips(&audio_clips, self.state.playhead_secs);
         }
 
-        let Some(active) = self.state.active_video_clip().cloned() else {
+        let active_video = self
+            .state
+            .active_clips_at_playhead()
+            .into_iter()
+            .find(|c| c.track == TrackKind::Video)
+            .cloned();
+
+        let Some(active) = active_video else {
             self.player.stop();
             self.set_current_frame(None, cx);
             return;
         };
-
-        if active.track != TrackKind::Video {
-            self.player.stop();
-            self.set_current_frame(None, cx);
-            return;
-        }
 
         let Some(path) = active.source_path else {
             self.player.stop();
@@ -375,9 +419,10 @@ impl EditorView {
 
         let offset =
             active.source_in_secs + (self.state.playhead_secs - active.start_secs).max(0.0);
+        let ph = self.preview_quality.height();
         if self.state.is_playing {
             self.player
-                .start(active.id, path, offset, self.state.aspect_ratio);
+                .start(active.id, path, offset, self.state.aspect_ratio, ph);
         } else {
             self.player.stop();
             self.request_single_frame(path, offset, cx);
@@ -388,10 +433,11 @@ impl EditorView {
         self.decode_seq = self.decode_seq.wrapping_add(1);
         let seq = self.decode_seq;
         let ratio = self.state.aspect_ratio;
+        let ph = self.preview_quality.height();
 
         let task = cx
             .background_executor()
-            .spawn(async move { decode_single_frame(&path, offset_secs, ratio) });
+            .spawn(async move { decode_single_frame(&path, offset_secs, ratio, ph) });
 
         cx.spawn(async move |this, cx| {
             let frame = task.await;
@@ -658,6 +704,20 @@ impl EditorView {
             (false, false, "right") => {
                 self.state.step_by(0.5);
                 self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            (false, false, ",") => {
+                self.state.step_frames(-1);
+                self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            (false, false, ".") => {
+                self.state.step_frames(1);
+                self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            (false, false, "escape") if self.preview_fullscreen => {
+                self.preview_fullscreen = false;
                 cx.notify();
             }
             _ => {}
@@ -1424,47 +1484,103 @@ impl EditorView {
     }
 
     fn render_preview_panel(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_clips = self.state.active_clips_at_playhead();
+        let active_main_video = active_clips
+            .iter()
+            .find(|c| c.track == TrackKind::Video)
+            .cloned()
+            .cloned();
+        let active_overlays: Vec<_> = active_clips
+            .iter()
+            .filter(|c| c.track == TrackKind::Overlay)
+            .cloned()
+            .cloned()
+            .collect();
+        let active_texts: Vec<_> = active_clips
+            .iter()
+            .filter(|c| c.track == TrackKind::Text && c.text.is_some())
+            .cloned()
+            .cloned()
+            .collect();
         let active_video = self.state.active_video_clip().cloned();
-        let active_count = self.state.active_clips_at_playhead().len();
+        let active_count = active_clips.len();
         let timecode = format_timecode(self.state.playhead_secs);
         let total_timecode = format_timecode(self.state.total_duration_secs);
         let is_playing = self.state.is_playing;
 
         let win_w = f32::from(window.viewport_size().width);
         let win_h = f32::from(window.viewport_size().height);
-        let avail_w = (win_w - 280.0 - 260.0 - 40.0).max(200.0);
-        let avail_h = (win_h - 44.0 - 234.0 - 48.0 - 32.0).max(180.0);
+        let (avail_w, avail_h) = if self.preview_fullscreen {
+            ((win_w - 32.0).max(240.0), (win_h - 48.0 - 32.0).max(180.0))
+        } else {
+            (
+                (win_w - 280.0 - INSPECTOR_W - 40.0).max(200.0),
+                (win_h - 44.0 - 234.0 - 48.0 - 32.0).max(180.0),
+            )
+        };
         let target_ratio = self.state.aspect_ratio.ratio_f32();
         let (preview_w, preview_h) = if avail_w / avail_h > target_ratio {
             (avail_h * target_ratio, avail_h)
         } else {
             (avail_w, avail_w / target_ratio)
         };
+        let (_, out_h) = self.state.aspect_ratio.dimensions(self.state.base_height);
+        let preview_scale = preview_h / (out_h.max(1) as f32);
 
-        let preview_content = if let Some(clip) = active_video.clone() {
-            if clip.track == TrackKind::Overlay {
-                if let Some(path) = clip.source_path.clone() {
-                    div()
-                        .size_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(img(path).size_full().object_fit(ObjectFit::Contain))
-                } else {
-                    self.render_empty_preview(
-                        "No image path",
-                        &timecode,
-                        &total_timecode,
-                        active_count,
-                    )
-                }
-            } else if let Some(frame) = self.current_frame.clone() {
+        let base_layer = if let Some(vclip) = active_main_video {
+            if let Some(frame) = self.current_frame.clone() {
+                let vid = vclip.id;
+                let vscale = (vclip.scale as f32 / 100.0).clamp(0.1, 2.0);
+                let valpha = (vclip.opacity as f32 / 100.0).clamp(0.0, 1.0);
+                let vox = vclip.pos_x * preview_scale;
+                let voy = vclip.pos_y * preview_scale;
+                let init_px = vclip.pos_x;
+                let init_py = vclip.pos_y;
+                let is_sel = self.state.selected_clip_id == Some(vid);
+
                 div()
+                    .id(SharedString::from(format!("pv-vid-{}", vid)))
                     .size_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(img(frame).size_full().object_fit(ObjectFit::Contain))
+                    .cursor(gpui::CursorStyle::OpenHand)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.state.selected_clip_id = Some(vid);
+                            this.editing_text_clip_id = None;
+                            this.state.push_undo();
+                            this.preview_text_drag = Some(PreviewTextDragState {
+                                clip_id: vid,
+                                start_mouse_x: f32::from(event.position.x),
+                                start_mouse_y: f32::from(event.position.y),
+                                initial_pos_x: init_px,
+                                initial_pos_y: init_py,
+                                preview_scale,
+                                moved: false,
+                            });
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .left(px(vox))
+                            .top(px(voy))
+                            .w(px(preview_w * vscale))
+                            .h(px(preview_h * vscale))
+                            .opacity(valpha)
+                            .border_1()
+                            .border_color(if is_sel {
+                                Theme::accent()
+                            } else {
+                                gpui::rgba(0x00000000)
+                            })
+                            .child(img(frame).size_full().object_fit(ObjectFit::Contain)),
+                    )
+                    .into_any_element()
             } else {
                 self.render_empty_preview(
                     "Loading video frame...",
@@ -1472,25 +1588,20 @@ impl EditorView {
                     &total_timecode,
                     active_count,
                 )
+                .into_any_element()
             }
-        } else {
+        } else if active_overlays.is_empty() && active_texts.is_empty() {
             self.render_empty_preview(
                 "No video frame at playhead",
                 &timecode,
                 &total_timecode,
                 active_count,
             )
+            .into_any_element()
+        } else {
+            div().size_full().into_any_element()
         };
 
-        let active_texts: Vec<_> = self
-            .state
-            .active_clips_at_playhead()
-            .into_iter()
-            .filter(|c| c.track == TrackKind::Text && c.text.is_some())
-            .cloned()
-            .collect();
-        let (_, out_h) = self.state.aspect_ratio.dimensions(self.state.base_height);
-        let preview_scale = preview_h / (out_h.max(1) as f32);
         let is_editing_any_text = self.editing_text_clip_id.is_some();
         let focus_for_ime = self.focus_handle.clone();
         let view_entity = cx.entity().clone();
@@ -1536,7 +1647,76 @@ impl EditorView {
                                     .inset_0(),
                                 )
                             })
-                            .child(preview_content)
+                            .child(base_layer)
+                            .children(active_overlays.into_iter().filter_map(|oclip| {
+                                let path = oclip.source_path.clone()?;
+                                let oid = oclip.id;
+                                let oscale = (oclip.scale as f32 / 100.0).clamp(0.1, 2.0);
+                                let oalpha = (oclip.opacity as f32 / 100.0).clamp(0.0, 1.0);
+                                let ox = oclip.pos_x * preview_scale;
+                                let oy = oclip.pos_y * preview_scale;
+                                let init_px = oclip.pos_x;
+                                let init_py = oclip.pos_y;
+                                let is_sel = self.state.selected_clip_id == Some(oid);
+
+                                Some(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .child(
+                                            div()
+                                                .id(SharedString::from(format!("pv-ovl-{}", oid)))
+                                                .relative()
+                                                .left(px(ox))
+                                                .top(px(oy))
+                                                .w(px(preview_w * oscale))
+                                                .h(px(preview_h * oscale))
+                                                .opacity(oalpha)
+                                                .border_1()
+                                                .border_color(if is_sel {
+                                                    Theme::accent()
+                                                } else {
+                                                    gpui::rgba(0x00000000)
+                                                })
+                                                .cursor(gpui::CursorStyle::OpenHand)
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        move |this, event: &MouseDownEvent, _, cx| {
+                                                            cx.stop_propagation();
+                                                            this.state.selected_clip_id = Some(oid);
+                                                            this.editing_text_clip_id = None;
+                                                            this.state.push_undo();
+                                                            this.preview_text_drag = Some(
+                                                                PreviewTextDragState {
+                                                                    clip_id: oid,
+                                                                    start_mouse_x: f32::from(
+                                                                        event.position.x,
+                                                                    ),
+                                                                    start_mouse_y: f32::from(
+                                                                        event.position.y,
+                                                                    ),
+                                                                    initial_pos_x: init_px,
+                                                                    initial_pos_y: init_py,
+                                                                    preview_scale,
+                                                                    moved: false,
+                                                                },
+                                                            );
+                                                            cx.notify();
+                                                        },
+                                                    ),
+                                                )
+                                                .child(
+                                                    img(path)
+                                                        .size_full()
+                                                        .object_fit(ObjectFit::Contain),
+                                                ),
+                                        ),
+                                )
+                            }))
                             .children(active_texts.into_iter().map(|tclip| {
                                 let tclip_id = tclip.id;
                                 let is_sel = self.state.selected_clip_id == Some(tclip_id);
@@ -1709,6 +1889,65 @@ impl EditorView {
                                             ),
                                     )
                             }))
+                            .when(self.show_safe_zone, |el| {
+                                let gx1 = preview_w / 3.0;
+                                let gx2 = preview_w * 2.0 / 3.0;
+                                let gy1 = preview_h / 3.0;
+                                let gy2 = preview_h * 2.0 / 3.0;
+                                let sx = preview_w * 0.08;
+                                let sy = preview_h * 0.08;
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(gx1))
+                                                .top_0()
+                                                .w(px(1.))
+                                                .h_full()
+                                                .bg(gpui::rgba(0xffffff33)),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(gx2))
+                                                .top_0()
+                                                .w(px(1.))
+                                                .h_full()
+                                                .bg(gpui::rgba(0xffffff33)),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(px(gy1))
+                                                .left_0()
+                                                .h(px(1.))
+                                                .w_full()
+                                                .bg(gpui::rgba(0xffffff33)),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .top(px(gy2))
+                                                .left_0()
+                                                .h(px(1.))
+                                                .w_full()
+                                                .bg(gpui::rgba(0xffffff33)),
+                                        )
+                                        .child(
+                                            div()
+                                                .absolute()
+                                                .left(px(sx))
+                                                .top(px(sy))
+                                                .w(px(preview_w - sx * 2.0))
+                                                .h(px(preview_h - sy * 2.0))
+                                                .border_1()
+                                                .border_color(gpui::rgba(0xfacc1566)),
+                                        ),
+                                )
+                            })
                             .when_some(active_video, |el, clip| {
                                 el.child(
                                     div()
@@ -1759,7 +1998,7 @@ impl EditorView {
                         div()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap_1p5()
                             .child(
                                 self.icon_button("tr-start", "⏮", "Jump to Start", false, true)
                                     .on_click(cx.listener(|this, _, _, cx| {
@@ -1778,6 +2017,20 @@ impl EditorView {
                             )
                             .child(
                                 self.icon_button(
+                                    "tr-fback",
+                                    "‹|",
+                                    "Previous Frame (,)",
+                                    false,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.step_frames(-1);
+                                    this.sync_preview_after_seek(cx);
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
                                     "tr-play",
                                     if is_playing { "⏸" } else { "▶" },
                                     if is_playing {
@@ -1790,6 +2043,20 @@ impl EditorView {
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.state.toggle_play();
+                                    this.sync_preview_after_seek(cx);
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "tr-ffwd",
+                                    "|›",
+                                    "Next Frame (.)",
+                                    false,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.step_frames(1);
                                     this.sync_preview_after_seek(cx);
                                     cx.notify();
                                 })),
@@ -1814,9 +2081,58 @@ impl EditorView {
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(Theme::text_muted())
-                            .child("Space: Play • Ctrl+B: Split • Ctrl+Z: Undo"),
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(
+                                self.icon_button(
+                                    "pv-quality",
+                                    self.preview_quality.label(),
+                                    "Cycle Preview Quality (Full / 1/2 / 1/4)",
+                                    self.preview_quality != PreviewQuality::Half,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.preview_quality = this.preview_quality.next();
+                                    this.player.stop();
+                                    this.sync_preview_after_seek(cx);
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "pv-safezone",
+                                    "⊞",
+                                    if self.show_safe_zone {
+                                        "Hide Grid & Safe Zone"
+                                    } else {
+                                        "Show Grid & Safe Zone"
+                                    },
+                                    self.show_safe_zone,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.show_safe_zone = !this.show_safe_zone;
+                                    cx.notify();
+                                })),
+                            )
+                            .child(
+                                self.icon_button(
+                                    "pv-fullscreen",
+                                    "⛶",
+                                    if self.preview_fullscreen {
+                                        "Exit Fullscreen (Esc)"
+                                    } else {
+                                        "Fullscreen Preview"
+                                    },
+                                    self.preview_fullscreen,
+                                    true,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.preview_fullscreen = !this.preview_fullscreen;
+                                    cx.notify();
+                                })),
+                            ),
                     ),
             )
     }
@@ -3600,19 +3916,24 @@ impl Render for EditorView {
                     }
                 }),
             )
-            .child(self.render_header(cx))
-            .children(self.render_export_banner(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .w_full()
-                    .flex()
-                    .overflow_hidden()
-                    .child(self.render_media_pool(cx))
-                    .child(self.render_preview_panel(window, cx))
-                    .child(self.render_inspector(cx)),
-            )
-            .child(self.render_timeline(window, cx))
+            .when(!self.preview_fullscreen, |el| {
+                el.child(self.render_header(cx))
+                    .children(self.render_export_banner(cx))
+                    .child(
+                        div()
+                            .flex_1()
+                            .w_full()
+                            .flex()
+                            .overflow_hidden()
+                            .child(self.render_media_pool(cx))
+                            .child(self.render_preview_panel(window, cx))
+                            .child(self.render_inspector(cx)),
+                    )
+                    .child(self.render_timeline(window, cx))
+            })
+            .when(self.preview_fullscreen, |el| {
+                el.child(self.render_preview_panel(window, cx))
+            })
             .into_any_element()
     }
 }
