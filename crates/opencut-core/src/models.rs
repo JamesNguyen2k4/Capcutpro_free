@@ -179,28 +179,206 @@ pub enum TextAlign {
     Right,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextPreset {
+    Classic,
+    ShadowPop,
+    SubtitleBox,
+    YellowImpact,
+    NeonBlue,
+    Editorial,
+}
+
+impl TextPreset {
+    pub const fn all() -> &'static [TextPreset] {
+        &[
+            TextPreset::Classic,
+            TextPreset::ShadowPop,
+            TextPreset::SubtitleBox,
+            TextPreset::YellowImpact,
+            TextPreset::NeonBlue,
+            TextPreset::Editorial,
+        ]
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            TextPreset::Classic => "Classic",
+            TextPreset::ShadowPop => "Shadow",
+            TextPreset::SubtitleBox => "Box",
+            TextPreset::YellowImpact => "Impact",
+            TextPreset::NeonBlue => "Neon",
+            TextPreset::Editorial => "Serif",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextAnimation {
+    #[default]
+    None,
+    FadeIn,
+    FadeOut,
+    FadeInOut,
+    PopIn,
+    SlideUp,
+}
+
+impl TextAnimation {
+    pub const fn all() -> &'static [TextAnimation] {
+        &[
+            TextAnimation::None,
+            TextAnimation::FadeIn,
+            TextAnimation::FadeOut,
+            TextAnimation::FadeInOut,
+            TextAnimation::PopIn,
+            TextAnimation::SlideUp,
+        ]
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            TextAnimation::None => "None",
+            TextAnimation::FadeIn => "Fade In",
+            TextAnimation::FadeOut => "Fade Out",
+            TextAnimation::FadeInOut => "In & Out",
+            TextAnimation::PopIn => "Pop In",
+            TextAnimation::SlideUp => "Slide Up",
+        }
+    }
+}
+
+fn default_font_family() -> String {
+    "Be Vietnam Pro".into()
+}
+
+fn default_bg_padding() -> f32 {
+    8.0
+}
+
+fn default_anim_duration() -> f32 {
+    0.5
+}
+
+fn default_font_weight() -> u16 {
+    700
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextClipData {
     pub content: String,
+    #[serde(default = "default_font_family")]
     pub font_family: String,
+    #[serde(default)]
+    pub font_path: Option<PathBuf>,
+    #[serde(default = "default_font_weight")]
+    pub font_weight: u16,
     pub font_size: f32,
     pub color_hex: u32,
     pub bg_color_hex: Option<u32>,
+    #[serde(default = "default_bg_padding")]
+    pub bg_padding: f32,
     pub stroke_color_hex: Option<u32>,
     pub stroke_width: f32,
+    #[serde(default)]
+    pub shadow_color_hex: Option<u32>,
+    #[serde(default)]
+    pub shadow_offset_x: f32,
+    #[serde(default)]
+    pub shadow_offset_y: f32,
+    #[serde(default)]
+    pub animation: TextAnimation,
+    #[serde(default = "default_anim_duration")]
+    pub anim_duration_secs: f32,
     pub align: TextAlign,
+}
+
+impl TextClipData {
+    pub fn apply_preset(&mut self, preset: TextPreset) {
+        match preset {
+            TextPreset::Classic => {
+                self.font_family = "Be Vietnam Pro".into();
+                self.color_hex = 0xffffff;
+                self.bg_color_hex = None;
+                self.stroke_color_hex = Some(0x000000);
+                self.stroke_width = 2.0;
+                self.shadow_color_hex = None;
+                self.shadow_offset_x = 0.0;
+                self.shadow_offset_y = 0.0;
+            }
+            TextPreset::ShadowPop => {
+                self.font_family = "Montserrat".into();
+                self.color_hex = 0xffffff;
+                self.bg_color_hex = None;
+                self.stroke_color_hex = None;
+                self.stroke_width = 0.0;
+                self.shadow_color_hex = Some(0x000000);
+                self.shadow_offset_x = 3.0;
+                self.shadow_offset_y = 3.0;
+            }
+            TextPreset::SubtitleBox => {
+                self.font_family = "Roboto".into();
+                self.color_hex = 0xffffff;
+                self.bg_color_hex = Some(0x111115);
+                self.bg_padding = 10.0;
+                self.stroke_color_hex = None;
+                self.stroke_width = 0.0;
+                self.shadow_color_hex = None;
+            }
+            TextPreset::YellowImpact => {
+                self.font_family = "Oswald".into();
+                self.color_hex = 0xfacc15;
+                self.bg_color_hex = None;
+                self.stroke_color_hex = Some(0x000000);
+                self.stroke_width = 3.0;
+                self.shadow_color_hex = Some(0x000000);
+                self.shadow_offset_x = 3.0;
+                self.shadow_offset_y = 3.0;
+            }
+            TextPreset::NeonBlue => {
+                self.font_family = "Montserrat".into();
+                self.color_hex = 0x38bdf8;
+                self.bg_color_hex = Some(0x0f172a);
+                self.bg_padding = 10.0;
+                self.stroke_color_hex = Some(0x0284c7);
+                self.stroke_width = 1.5;
+                self.shadow_color_hex = Some(0x0284c7);
+                self.shadow_offset_x = 2.0;
+                self.shadow_offset_y = 2.0;
+            }
+            TextPreset::Editorial => {
+                self.font_family = "Playfair Display".into();
+                self.color_hex = 0xfef3c7;
+                self.bg_color_hex = None;
+                self.stroke_color_hex = None;
+                self.stroke_width = 0.0;
+                self.shadow_color_hex = Some(0x18181b);
+                self.shadow_offset_x = 2.0;
+                self.shadow_offset_y = 2.0;
+            }
+        }
+        self.font_path = None;
+    }
 }
 
 impl Default for TextClipData {
     fn default() -> Self {
         Self {
             content: "Default Text".into(),
-            font_family: "Sans".into(),
+            font_family: "Be Vietnam Pro".into(),
+            font_path: None,
+            font_weight: 700,
             font_size: 48.0,
             color_hex: 0xffffff,
             bg_color_hex: None,
+            bg_padding: 8.0,
             stroke_color_hex: Some(0x000000),
             stroke_width: 2.0,
+            shadow_color_hex: Some(0x000000),
+            shadow_offset_x: 2.0,
+            shadow_offset_y: 2.0,
+            animation: TextAnimation::None,
+            anim_duration_secs: 0.5,
             align: TextAlign::Center,
         }
     }

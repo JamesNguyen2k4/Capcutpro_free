@@ -8,7 +8,7 @@ use gpui::RenderImage;
 use image::{Frame, RgbaImage};
 use smallvec::smallvec;
 
-use opencut_core::{AspectRatio, TimelineClip, TrackFlags, TrackKind};
+use opencut_core::{AspectRatio, TextAnimation, TextClipData, TimelineClip, Track, TrackFlags, TrackKind};
 
 pub fn preview_dimensions(aspect_ratio: AspectRatio) -> (u32, u32) {
     aspect_ratio.dimensions(360)
@@ -364,9 +364,41 @@ pub struct ExportHandle {
     pub error: Arc<Mutex<Option<String>>>,
 }
 
+fn resolve_text_font_file(td: &TextClipData) -> Option<PathBuf> {
+    if let Some(ref p) = td.font_path {
+        if p.exists() {
+            return Some(p.clone());
+        }
+    }
+    let filename = match td.font_family.as_str() {
+        "Be Vietnam Pro" => match td.font_weight {
+            0..=350 => "BeVietnamPro-Light.ttf",
+            351..=450 => "BeVietnamPro-Regular.ttf",
+            451..=600 => "BeVietnamPro-Medium.ttf",
+            601..=800 => "BeVietnamPro-Bold.ttf",
+            _ => "BeVietnamPro-Black.ttf",
+        },
+        "Roboto" => "Roboto-Bold.ttf",
+        "Montserrat" => "Montserrat-Bold.ttf",
+        "Oswald" => "Oswald-Bold.ttf",
+        "Playfair Display" => "PlayfairDisplay-Bold.ttf",
+        "Quicksand" => "Quicksand-Bold.ttf",
+        "Pacifico" => "Pacifico-Regular.ttf",
+        "Lobster" => "Lobster-Regular.ttf",
+        "Space Grotesk" => "SpaceGrotesk-Bold.ttf",
+        "Merriweather" => "Merriweather-Bold.ttf",
+        _ => "BeVietnamPro-Bold.ttf",
+    };
+    let candidates = [
+        PathBuf::from("apps/desktop/assets/fonts").join(filename),
+        PathBuf::from("assets/fonts").join(filename),
+    ];
+    candidates.into_iter().find(|p| p.exists())
+}
+
 pub fn start_export_timeline(
     clips: Vec<TimelineClip>,
-    track_flags: [TrackFlags; 3],
+    tracks: Vec<Track>,
     aspect_ratio: AspectRatio,
     base_height: u32,
     output_path: PathBuf,
@@ -383,17 +415,23 @@ pub fn start_export_timeline(
     };
 
     std::thread::spawn(move || {
+        let resolve_flags = |clip: &TimelineClip| -> TrackFlags {
+            tracks
+                .iter()
+                .find(|t| t.id == clip.track_id)
+                .or_else(|| tracks.iter().find(|t| t.kind == clip.track))
+                .map(|t| t.flags)
+                .unwrap_or_default()
+        };
+
         let valid_clips: Vec<TimelineClip> = clips
             .into_iter()
             .filter(|c| {
-                let flags = if c.track.index() < 3 {
-                    track_flags[c.track.index()]
-                } else {
-                    TrackFlags::default()
-                };
+                let flags = resolve_flags(c);
                 let visible = c.track == TrackKind::Audio || !flags.hidden;
                 let audible = c.track != TrackKind::Audio || !flags.muted;
-                c.source_path.is_some() && c.duration_secs > 0.05 && (visible || audible)
+                let has_media = c.source_path.is_some() || (c.track == TrackKind::Text && c.text.is_some());
+                has_media && c.duration_secs > 0.05 && (visible || audible)
             })
             .collect();
 
@@ -448,16 +486,107 @@ pub fn start_export_timeline(
             TrackKind::Adjustment => (4, (c.start_secs * 100.0) as i64),
         });
 
-        for (idx, clip) in sorted_clips.iter().enumerate() {
-            let input_idx = idx + 2;
+        let mut next_input_idx = 2usize;
+        for clip in &sorted_clips {
+            let flags = resolve_flags(clip);
+
+            if clip.track == TrackKind::Text {
+                if !flags.hidden {
+                    if let Some(td) = &clip.text {
+                        if !td.content.is_empty() {
+                            let v_out = format!("vout{}", video_step);
+                            video_step += 1;
+                            let escaped = td
+                                .content
+                                .replace('\\', "\\\\")
+                                .replace(':', "\\:")
+                                .replace('\'', "\\'");
+                            let alpha = (clip.opacity as f32 / 100.0).clamp(0.0, 1.0);
+                            let box_part = if let Some(bg_hex) = td.bg_color_hex {
+                                format!(
+                                    ":box=1:boxcolor=0x{:06x}@0.75:boxborderw={:.0}",
+                                    bg_hex,
+                                    td.bg_padding.max(2.0)
+                                )
+                            } else {
+                                String::new()
+                            };
+                            let border_part = if td.stroke_width > 0.1 {
+                                let sc = td.stroke_color_hex.unwrap_or(0x000000);
+                                format!(":borderw={:.1}:bordercolor=0x{:06x}", td.stroke_width, sc)
+                            } else {
+                                String::new()
+                            };
+                            let shadow_part = if let Some(sh_hex) = td.shadow_color_hex {
+                                format!(
+                                    ":shadowx={:.1}:shadowy={:.1}:shadowcolor=0x{:06x}@0.75",
+                                    td.shadow_offset_x, td.shadow_offset_y, sh_hex
+                                )
+                            } else {
+                                String::new()
+                            };
+                            let font_part = resolve_text_font_file(td)
+                                .map(|p| {
+                                    let s = p.to_string_lossy().replace('\\', "/").replace(':', "\\:");
+                                    format!(":fontfile='{}'", s)
+                                })
+                                .unwrap_or_default();
+                            let st = clip.start_secs;
+                            let en = clip.end_secs();
+                            let ad = td.anim_duration_secs.clamp(0.1, (clip.duration_secs * 0.5).max(0.1));
+                            let base_fs =
+                                (td.font_size * (clip.scale as f32 / 100.0)).max(12.0);
+                            let alpha_expr = match td.animation {
+                                TextAnimation::FadeIn | TextAnimation::PopIn => {
+                                    format!(":alpha='if(lt(t-{st:.3},{ad:.3}),(t-{st:.3})/{ad:.3},1)'")
+                                }
+                                TextAnimation::FadeOut => {
+                                    format!(":alpha='if(gt(t,{en:.3}-{ad:.3}),({en:.3}-t)/{ad:.3},1)'")
+                                }
+                                TextAnimation::FadeInOut => {
+                                    format!(":alpha='if(lt(t-{st:.3},{ad:.3}),(t-{st:.3})/{ad:.3},if(gt(t,{en:.3}-{ad:.3}),({en:.3}-t)/{ad:.3},1))'")
+                                }
+                                TextAnimation::None | TextAnimation::SlideUp => String::new(),
+                            };
+                            let y_expr = match td.animation {
+                                TextAnimation::SlideUp => format!(
+                                    "(h-text_h)/2+({oy:.0})+if(lt(t-{st:.3},{ad:.3}),(1-(t-{st:.3})/{ad:.3})*80,0)",
+                                    oy = clip.pos_y,
+                                    st = st,
+                                    ad = ad
+                                ),
+                                _ => format!("(h-text_h)/2+({:.0})", clip.pos_y),
+                            };
+                            filter_parts.push(format!(
+                                "{prev}drawtext=text='{txt}'{fp}:fontsize={fs:.0}:fontcolor=0x{col:06x}@{op:.2}:x=(w-text_w)/2+({ox:.0}):y='{y}'{ae}{bp}{bd}{sh}:enable='between(t,{st:.3},{en:.3})'[{vo}]",
+                                prev = last_video_label,
+                                txt = escaped,
+                                fp = font_part,
+                                fs = base_fs,
+                                col = td.color_hex,
+                                op = alpha,
+                                ox = clip.pos_x,
+                                y = y_expr,
+                                ae = alpha_expr,
+                                bp = box_part,
+                                bd = border_part,
+                                sh = shadow_part,
+                                st = st,
+                                en = en,
+                                vo = v_out
+                            ));
+                            last_video_label = format!("[{}]", v_out);
+                        }
+                    }
+                }
+                continue;
+            }
+
             let Some(path) = &clip.source_path else {
                 continue;
             };
-            let flags = if clip.track.index() < 3 {
-                track_flags[clip.track.index()]
-            } else {
-                TrackFlags::default()
-            };
+            let input_idx = next_input_idx;
+            next_input_idx += 1;
 
             match clip.track {
                 TrackKind::Video => {

@@ -1,17 +1,19 @@
-﻿use std::path::PathBuf;
+﻿use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use gpui::{
-    AnyView, AppContext, Context, ExternalPaths, FocusHandle, InteractiveElement, IntoElement, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, ParentElement, PathPromptOptions,
-    Render, RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement,
-    Styled, StyledImage, Window, div, img, prelude::FluentBuilder, px, rgb,
+    AnyView, AppContext, Bounds, Context, ElementInputHandler, EntityInputHandler, ExternalPaths,
+    FocusHandle, InteractiveElement, IntoElement, KeyDownEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, ObjectFit, ParentElement, PathPromptOptions, Pixels, Point, Render,
+    RenderImage, ScrollDelta, ScrollWheelEvent, SharedString, StatefulInteractiveElement, Styled,
+    StyledImage, UTF16Selection, Window, canvas, div, img, prelude::FluentBuilder, px, rgb,
 };
 use opencut_core::{
-    AspectRatio, EditorCore, RecentProjectEntry, TrackKind, format_timecode, load_recent_projects,
-    record_recent_project,
+    AspectRatio, EditorCore, RecentProjectEntry, TextAnimation, TextPreset, TrackKind,
+    format_timecode, load_recent_projects, record_recent_project,
 };
 
 use crate::media_engine::{
@@ -20,7 +22,7 @@ use crate::media_engine::{
 };
 use crate::theme::Theme;
 
-const TRACK_HEADER_W: f32 = 124.0;
+const TRACK_HEADER_W: f32 = 152.0;
 
 struct TooltipView {
     text: SharedString,
@@ -75,6 +77,36 @@ struct ClipDragState {
     initial_duration_secs: f32,
 }
 
+#[derive(Clone, Copy)]
+struct PreviewTextDragState {
+    clip_id: usize,
+    start_mouse_x: f32,
+    start_mouse_y: f32,
+    initial_pos_x: f32,
+    initial_pos_y: f32,
+    preview_scale: f32,
+    moved: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SliderField {
+    Opacity,
+    Scale,
+    Volume,
+    FontSize,
+    FontWeight,
+    ColorR,
+    ColorG,
+    ColorB,
+    StrokeWidth,
+    ShadowOffset,
+    BgPadding,
+    AnimDuration,
+}
+
+const INSPECTOR_W: f32 = 280.0;
+const SLIDER_W: f32 = 136.0;
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppScreen {
     ProjectHub,
@@ -90,6 +122,9 @@ pub struct EditorView {
     pub(crate) draft_ratio: AspectRatio,
     pub(crate) draft_base_height: u32,
     pub(crate) hub_error: Option<String>,
+    media_filter: Option<TrackKind>,
+    editing_text_clip_id: Option<usize>,
+    marked_text_range: Option<Range<usize>>,
     playback_started: bool,
     current_frame: Option<Arc<RenderImage>>,
     player: VideoStreamPlayer,
@@ -101,6 +136,8 @@ pub struct EditorView {
     scrollbar_drag_start_scroll: f32,
     playhead_dragging: bool,
     clip_drag: Option<ClipDragState>,
+    preview_text_drag: Option<PreviewTextDragState>,
+    slider_drag: Option<SliderField>,
     export_status: ExportStatus,
 }
 
@@ -115,6 +152,9 @@ impl EditorView {
             draft_ratio: AspectRatio::Ratio16x9,
             draft_base_height: 1080,
             hub_error: None,
+            media_filter: None,
+            editing_text_clip_id: None,
+            marked_text_range: None,
             playback_started: false,
             current_frame: None,
             player: VideoStreamPlayer::new(),
@@ -126,10 +166,87 @@ impl EditorView {
             scrollbar_drag_start_scroll: 0.0,
             playhead_dragging: false,
             clip_drag: None,
+            preview_text_drag: None,
+            slider_drag: None,
             export_status: ExportStatus::Idle,
         };
         view.ensure_playback_loop(cx);
         view
+    }
+
+    fn apply_slider_ratio(&mut self, field: SliderField, ratio: f32) {
+        let r = ratio.clamp(0.0, 1.0);
+        let Some(c) = self.state.selected_clip_mut() else {
+            return;
+        };
+        match field {
+            SliderField::Opacity => c.opacity = (r * 100.0).round() as u8,
+            SliderField::Scale => c.scale = (10.0 + r * 190.0).round() as u16,
+            SliderField::Volume => c.volume = (r * 100.0).round() as u8,
+            SliderField::FontSize => {
+                if let Some(ref mut t) = c.text {
+                    t.font_size = (12.0 + r * 128.0).round();
+                }
+            }
+            SliderField::FontWeight => {
+                if let Some(ref mut t) = c.text {
+                    let weights = [300_u16, 400, 500, 700, 900];
+                    let idx = ((r * (weights.len() - 1) as f32).round() as usize)
+                        .min(weights.len() - 1);
+                    t.font_weight = weights[idx];
+                }
+            }
+            SliderField::ColorR => {
+                if let Some(ref mut t) = c.text {
+                    let red = ((r * 255.0).round() as u32) & 0xff;
+                    t.color_hex = (t.color_hex & 0x00ffff) | (red << 16);
+                }
+            }
+            SliderField::ColorG => {
+                if let Some(ref mut t) = c.text {
+                    let green = ((r * 255.0).round() as u32) & 0xff;
+                    t.color_hex = (t.color_hex & 0xff00ff) | (green << 8);
+                }
+            }
+            SliderField::ColorB => {
+                if let Some(ref mut t) = c.text {
+                    let blue = ((r * 255.0).round() as u32) & 0xff;
+                    t.color_hex = (t.color_hex & 0xffff00) | blue;
+                }
+            }
+            SliderField::StrokeWidth => {
+                if let Some(ref mut t) = c.text {
+                    t.stroke_width = (r * 8.0 * 2.0).round() / 2.0;
+                    t.stroke_color_hex = if t.stroke_width > 0.0 {
+                        Some(t.stroke_color_hex.unwrap_or(0x000000))
+                    } else {
+                        None
+                    };
+                }
+            }
+            SliderField::ShadowOffset => {
+                if let Some(ref mut t) = c.text {
+                    let off = (r * 12.0).round();
+                    t.shadow_offset_x = off;
+                    t.shadow_offset_y = off;
+                    t.shadow_color_hex = if off > 0.0 {
+                        Some(t.shadow_color_hex.unwrap_or(0x000000))
+                    } else {
+                        None
+                    };
+                }
+            }
+            SliderField::BgPadding => {
+                if let Some(ref mut t) = c.text {
+                    t.bg_padding = (2.0 + r * 22.0).round();
+                }
+            }
+            SliderField::AnimDuration => {
+                if let Some(ref mut t) = c.text {
+                    t.anim_duration_secs = ((0.1 + r * 1.9) * 10.0).round() / 10.0;
+                }
+            }
+        }
     }
 
     pub fn focus_handle(&self) -> &FocusHandle {
@@ -288,6 +405,44 @@ impl EditorView {
         .detach();
     }
 
+    fn prompt_import_font(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from("Import Font (.ttf, .otf)")),
+        });
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.into_iter().next() {
+                    if let Ok(bytes) = std::fs::read(&path) {
+                        let _ = this.update(cx, |view, cx| {
+                            let _ = cx
+                                .text_system()
+                                .add_fonts(vec![std::borrow::Cow::Owned(bytes)]);
+                            let family = path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("Custom Font")
+                                .replace(['-', '_'], " ");
+                            view.state.push_undo();
+                            if let Some(c) = view.state.selected_clip_mut() {
+                                if let Some(ref mut t) = c.text {
+                                    t.font_family = family.clone();
+                                    t.font_path = Some(path.clone());
+                                }
+                            }
+                            view.state.status_message = format!("Loaded font {}", family);
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
     fn prompt_import_media(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -424,6 +579,41 @@ impl EditorView {
         let ctrl = event.keystroke.modifiers.control;
         let shift = event.keystroke.modifiers.shift;
 
+        if let Some(edit_id) = self.editing_text_clip_id {
+            if self.state.selected_clip_id == Some(edit_id) {
+                match key {
+                    "escape" | "enter" => {
+                        self.editing_text_clip_id = None;
+                        self.marked_text_range = None;
+                        cx.notify();
+                        return;
+                    }
+                    "backspace" => {
+                        if let Some(c) = self.state.clips.iter_mut().find(|c| c.id == edit_id) {
+                            if let Some(ref mut td) = c.text {
+                                td.content.pop();
+                                c.name = if td.content.is_empty() {
+                                    "Text".into()
+                                } else {
+                                    td.content.clone()
+                                };
+                            }
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    _ if !ctrl => {
+                        // Printable characters and Vietnamese IME input are handled by EntityInputHandler
+                        return;
+                    }
+                    _ => {}
+                }
+            } else {
+                self.editing_text_clip_id = None;
+                self.marked_text_range = None;
+            }
+        }
+
         match (ctrl, shift, key) {
             (false, false, "space") => {
                 self.state.toggle_play();
@@ -543,11 +733,11 @@ impl EditorView {
 
                 let _ = this.update(cx, |view, cx| {
                     let clips = view.state.clips.clone();
-                    let flags = view.state.track_flags;
+                    let tracks = view.state.tracks.clone();
                     let ratio = view.state.aspect_ratio;
                     let base_height = view.state.base_height;
                     let handle =
-                        start_export_timeline(clips, flags, ratio, base_height, path.clone());
+                        start_export_timeline(clips, tracks, ratio, base_height, path.clone());
                     view.state.status_message = "Exporting... 0%".into();
                     view.export_status = ExportStatus::Exporting {
                         handle,
@@ -904,8 +1094,15 @@ impl EditorView {
     }
 
     fn render_media_pool(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let assets = self.state.assets.clone();
+        let assets: Vec<_> = self
+            .state
+            .filtered_assets("", self.media_filter)
+            .into_iter()
+            .cloned()
+            .collect();
+        let total_assets = self.state.assets.len();
         let selected_asset_id = self.state.selected_asset_id;
+        let active_filter = self.media_filter;
         let is_empty = assets.is_empty();
 
         div()
@@ -997,6 +1194,75 @@ impl EditorView {
                         ),
                 ),
             )
+            .child(
+                div()
+                    .px_2()
+                    .pb_2()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .children(
+                                [
+                                    (None, "All"),
+                                    (Some(TrackKind::Video), "Vid"),
+                                    (Some(TrackKind::Overlay), "Img"),
+                                    (Some(TrackKind::Audio), "Aud"),
+                                ]
+                                .into_iter()
+                                .map(|(filter_val, label)| {
+                                    let is_active = active_filter == filter_val;
+                                    div()
+                                        .id(SharedString::from(format!("mf-{}", label)))
+                                        .px_1p5()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .bg(if is_active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .text_xs()
+                                        .text_color(if is_active {
+                                            Theme::text_primary()
+                                        } else {
+                                            Theme::text_secondary()
+                                        })
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.media_filter = filter_val;
+                                            cx.notify();
+                                        }))
+                                        .child(label)
+                                }),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("mp-add-text")
+                            .px_1p5()
+                            .py_0p5()
+                            .rounded_sm()
+                            .bg(Theme::bg_surface())
+                            .border_1()
+                            .border_color(Theme::border())
+                            .text_xs()
+                            .text_color(Theme::text_primary())
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(Theme::accent()).bg(Theme::bg_hover()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.state.add_text_clip("Text", 4.0);
+                                cx.notify();
+                            }))
+                            .child("+ Text"),
+                    ),
+            )
             .child(if is_empty {
                 div()
                     .flex_1()
@@ -1010,7 +1276,11 @@ impl EditorView {
                         div()
                             .text_xs()
                             .text_color(Theme::text_secondary())
-                            .child("No media imported yet"),
+                            .child(if total_assets == 0 {
+                                "No media imported yet"
+                            } else {
+                                "No matching media in filter"
+                            }),
                     )
                     .child(
                         div()
@@ -1099,23 +1369,55 @@ impl EditorView {
                             )
                             .child(
                                 div()
-                                    .id(SharedString::from(format!("asset-insert-{}", asset_id)))
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(Theme::bg_panel())
-                                    .border_1()
-                                    .border_color(Theme::border())
-                                    .text_xs()
-                                    .text_color(Theme::text_primary())
-                                    .cursor_pointer()
-                                    .hover(|s| s.bg(Theme::accent()))
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.state.add_asset_to_timeline(asset_id);
-                                        this.sync_preview_after_seek(cx);
-                                        cx.notify();
-                                    }))
-                                    .child("+"),
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "asset-insert-{}",
+                                                asset_id
+                                            )))
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(Theme::bg_panel())
+                                            .border_1()
+                                            .border_color(Theme::border())
+                                            .text_xs()
+                                            .text_color(Theme::text_primary())
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(Theme::accent()))
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.add_asset_to_timeline(asset_id);
+                                                this.sync_preview_after_seek(cx);
+                                                cx.notify();
+                                            }))
+                                            .child("+"),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "asset-remove-{}",
+                                                asset_id
+                                            )))
+                                            .px_1p5()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .text_xs()
+                                            .text_color(Theme::text_muted())
+                                            .cursor_pointer()
+                                            .hover(|s| {
+                                                s.bg(Theme::bg_panel())
+                                                    .text_color(Theme::text_primary())
+                                            })
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                cx.stop_propagation();
+                                                this.state.remove_asset(asset_id);
+                                                cx.notify();
+                                            }))
+                                            .child("✕"),
+                                    ),
                             )
                     }))
             })
@@ -1180,6 +1482,19 @@ impl EditorView {
             )
         };
 
+        let active_texts: Vec<_> = self
+            .state
+            .active_clips_at_playhead()
+            .into_iter()
+            .filter(|c| c.track == TrackKind::Text && c.text.is_some())
+            .cloned()
+            .collect();
+        let (_, out_h) = self.state.aspect_ratio.dimensions(self.state.base_height);
+        let preview_scale = preview_h / (out_h.max(1) as f32);
+        let is_editing_any_text = self.editing_text_clip_id.is_some();
+        let focus_for_ime = self.focus_handle.clone();
+        let view_entity = cx.entity().clone();
+
         div()
             .flex_1()
             .h_full()
@@ -1203,7 +1518,197 @@ impl EditorView {
                             .border_color(Theme::border())
                             .overflow_hidden()
                             .relative()
+                            .when(is_editing_any_text, |el| {
+                                let fh = focus_for_ime.clone();
+                                let ent = view_entity.clone();
+                                el.child(
+                                    canvas(
+                                        |_, _, _| (),
+                                        move |bounds, _, window, cx| {
+                                            window.handle_input(
+                                                &fh,
+                                                ElementInputHandler::new(bounds, ent),
+                                                cx,
+                                            );
+                                        },
+                                    )
+                                    .absolute()
+                                    .inset_0(),
+                                )
+                            })
                             .child(preview_content)
+                            .children(active_texts.into_iter().map(|tclip| {
+                                let tclip_id = tclip.id;
+                                let is_sel = self.state.selected_clip_id == Some(tclip_id);
+                                let is_editing = self.editing_text_clip_id == Some(tclip_id);
+                                let td = tclip.text.clone().unwrap_or_default();
+
+                                let elapsed = (self.state.playhead_secs - tclip.start_secs).max(0.0);
+                                let remaining = (tclip.end_secs() - self.state.playhead_secs).max(0.0);
+                                let ad = td
+                                    .anim_duration_secs
+                                    .clamp(0.1, (tclip.duration_secs * 0.5).max(0.1));
+                                let (anim_alpha, anim_scale, anim_dy) = match td.animation {
+                                    TextAnimation::None => (1.0, 1.0, 0.0),
+                                    TextAnimation::FadeIn => ((elapsed / ad).clamp(0.0, 1.0), 1.0, 0.0),
+                                    TextAnimation::FadeOut => {
+                                        ((remaining / ad).clamp(0.0, 1.0), 1.0, 0.0)
+                                    }
+                                    TextAnimation::FadeInOut => {
+                                        let fin = (elapsed / ad).clamp(0.0, 1.0);
+                                        let fout = (remaining / ad).clamp(0.0, 1.0);
+                                        (fin.min(fout), 1.0, 0.0)
+                                    }
+                                    TextAnimation::PopIn => {
+                                        let p = (elapsed / ad).clamp(0.0, 1.0);
+                                        (p, 0.55 + 0.45 * p, 0.0)
+                                    }
+                                    TextAnimation::SlideUp => {
+                                        let p = (elapsed / ad).clamp(0.0, 1.0);
+                                        (p, 1.0, (1.0 - p) * 60.0)
+                                    }
+                                };
+
+                                let clip_scale = (tclip.scale as f32 / 100.0).clamp(0.1, 2.0);
+                                let scaled_font = (td.font_size
+                                    * clip_scale
+                                    * preview_scale
+                                    * anim_scale)
+                                    .clamp(8.0, 220.0);
+                                let ox = tclip.pos_x * preview_scale;
+                                let oy = (tclip.pos_y + anim_dy) * preview_scale;
+                                let init_px = tclip.pos_x;
+                                let init_py = tclip.pos_y;
+                                let alpha = ((tclip.opacity as f32 / 100.0) * anim_alpha)
+                                    .clamp(0.0, 1.0);
+                                let display_text = if is_editing {
+                                    format!("{}|", td.content)
+                                } else if td.content.is_empty() {
+                                    "Double-click to edit".to_string()
+                                } else {
+                                    td.content.clone()
+                                };
+                                let shadow_ox = td.shadow_offset_x * preview_scale;
+                                let shadow_oy = td.shadow_offset_y * preview_scale;
+                                let pad_px = (td.bg_padding * preview_scale).clamp(2.0, 24.0);
+
+                                div()
+                                    .absolute()
+                                    .inset_0()
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "pv-text-{}",
+                                                tclip_id
+                                            )))
+                                            .relative()
+                                            .left(px(ox))
+                                            .top(px(oy))
+                                            .px(px(pad_px))
+                                            .py(px(pad_px * 0.6))
+                                            .rounded_sm()
+                                            .when_some(td.bg_color_hex, |el, bg_hex| {
+                                                el.bg(rgb(bg_hex))
+                                            })
+                                            .border_1()
+                                            .border_color(if is_editing || is_sel {
+                                                Theme::accent()
+                                            } else {
+                                                gpui::rgba(0x00000000)
+                                            })
+                                            .opacity(alpha)
+                                            .font_family(td.font_family.clone())
+                                            .text_size(px(scaled_font))
+                                            .font_weight(gpui::FontWeight(td.font_weight as f32))
+                                            .cursor(if is_editing {
+                                                gpui::CursorStyle::IBeam
+                                            } else {
+                                                gpui::CursorStyle::OpenHand
+                                            })
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this, event: &MouseDownEvent, _, cx| {
+                                                        cx.stop_propagation();
+                                                        this.state.selected_clip_id =
+                                                            Some(tclip_id);
+                                                        if event.click_count >= 2 {
+                                                            if this.editing_text_clip_id
+                                                                != Some(tclip_id)
+                                                            {
+                                                                this.state.push_undo();
+                                                                this.editing_text_clip_id =
+                                                                    Some(tclip_id);
+                                                            }
+                                                            this.preview_text_drag = None;
+                                                        } else {
+                                                            this.state.push_undo();
+                                                            this.preview_text_drag = Some(
+                                                                PreviewTextDragState {
+                                                                    clip_id: tclip_id,
+                                                                    start_mouse_x: f32::from(
+                                                                        event.position.x,
+                                                                    ),
+                                                                    start_mouse_y: f32::from(
+                                                                        event.position.y,
+                                                                    ),
+                                                                    initial_pos_x: init_px,
+                                                                    initial_pos_y: init_py,
+                                                                    preview_scale,
+                                                                    moved: false,
+                                                                },
+                                                            );
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
+                                            .when_some(td.shadow_color_hex, |el, sh_hex| {
+                                                el.child(
+                                                    div()
+                                                        .absolute()
+                                                        .left(px(pad_px + shadow_ox))
+                                                        .top(px(pad_px * 0.6 + shadow_oy))
+                                                        .opacity(0.75)
+                                                        .text_color(rgb(sh_hex))
+                                                        .child(display_text.clone()),
+                                                )
+                                            })
+                                            .when(td.stroke_width > 0.1, |el| {
+                                                let sw = (td.stroke_width * preview_scale * 2.2)
+                                                    .clamp(1.2, 10.0);
+                                                let sc = td.stroke_color_hex.unwrap_or(0x000000);
+                                                let d = sw * 0.7;
+                                                let offsets = [
+                                                    (-sw, 0.0),
+                                                    (sw, 0.0),
+                                                    (0.0, -sw),
+                                                    (0.0, sw),
+                                                    (-d, -d),
+                                                    (d, -d),
+                                                    (-d, d),
+                                                    (d, d),
+                                                ];
+                                                el.children(offsets.into_iter().map(|(dx, dy)| {
+                                                    div()
+                                                        .absolute()
+                                                        .left(px(pad_px + dx))
+                                                        .top(px(pad_px * 0.6 + dy))
+                                                        .text_color(rgb(sc))
+                                                        .child(display_text.clone())
+                                                }))
+                                            })
+                                            .child(
+                                                div()
+                                                    .relative()
+                                                    .text_color(rgb(td.color_hex))
+                                                    .child(display_text),
+                                            ),
+                                    )
+                            }))
                             .when_some(active_video, |el, clip| {
                                 el.child(
                                     div()
@@ -1367,7 +1872,7 @@ impl EditorView {
         let selected = self.state.selected_clip().cloned();
 
         div()
-            .w(px(260.))
+            .w(px(INSPECTOR_W))
             .h_full()
             .flex()
             .flex_col()
@@ -1392,10 +1897,13 @@ impl EditorView {
             )
             .child(if let Some(clip) = selected {
                 div()
+                    .id("inspector-scroll")
+                    .flex_1()
+                    .overflow_y_scroll()
                     .p_3()
                     .flex()
                     .flex_col()
-                    .gap_3()
+                    .gap_2p5()
                     .child(
                         div()
                             .p_2p5()
@@ -1425,68 +1933,569 @@ impl EditorView {
                                     )),
                             ),
                     )
-                    .child(self.inspector_stepper(
+                    .child(self.inspector_slider(
                         "Opacity",
                         format!("{}%", clip.opacity),
-                        "op-dec",
-                        "op-inc",
-                        cx.listener(|this, _, _, cx| {
-                            this.state.push_undo();
-                            if let Some(c) = this.state.selected_clip_mut() {
-                                c.opacity = c.opacity.saturating_sub(10);
-                            }
-                            cx.notify();
-                        }),
-                        cx.listener(|this, _, _, cx| {
-                            this.state.push_undo();
-                            if let Some(c) = this.state.selected_clip_mut() {
-                                c.opacity = (c.opacity + 10).min(100);
-                            }
-                            cx.notify();
-                        }),
+                        clip.opacity as f32 / 100.0,
+                        Theme::accent(),
+                        SliderField::Opacity,
+                        cx,
                     ))
-                    .child(self.inspector_stepper(
-                        "Scale",
-                        format!("{}%", clip.scale),
-                        "sc-dec",
-                        "sc-inc",
-                        cx.listener(|this, _, _, cx| {
-                            this.state.push_undo();
-                            if let Some(c) = this.state.selected_clip_mut() {
-                                c.scale = c.scale.saturating_sub(10).max(10);
-                            }
-                            cx.notify();
-                        }),
-                        cx.listener(|this, _, _, cx| {
-                            this.state.push_undo();
-                            if let Some(c) = this.state.selected_clip_mut() {
-                                c.scale = (c.scale + 10).min(200);
-                            }
-                            cx.notify();
-                        }),
-                    ))
-                    .child(self.inspector_stepper(
-                        "Volume",
-                        format!("{}%", clip.volume),
-                        "vol-dec",
-                        "vol-inc",
-                        cx.listener(|this, _, _, cx| {
-                            this.state.push_undo();
-                            if let Some(c) = this.state.selected_clip_mut() {
-                                c.volume = c.volume.saturating_sub(10);
-                            }
-                            cx.notify();
-                        }),
-                        cx.listener(|this, _, _, cx| {
-                            this.state.push_undo();
-                            if let Some(c) = this.state.selected_clip_mut() {
-                                c.volume = (c.volume + 10).min(100);
-                            }
-                            cx.notify();
-                        }),
-                    ))
+                    .when(clip.track != TrackKind::Text, |el| {
+                        el.child(self.inspector_slider(
+                            "Scale",
+                            format!("{}%", clip.scale),
+                            ((clip.scale as f32 - 10.0) / 190.0).clamp(0.0, 1.0),
+                            Theme::accent(),
+                            SliderField::Scale,
+                            cx,
+                        ))
+                    })
+                    .when(clip.track.is_audible(), |el| {
+                        el.child(self.inspector_slider(
+                            "Volume",
+                            format!("{}%", clip.volume),
+                            clip.volume as f32 / 100.0,
+                            Theme::accent(),
+                            SliderField::Volume,
+                            cx,
+                        ))
+                    })
+                    .when(clip.track == TrackKind::Text, |el| {
+                        let td = clip.text.clone().unwrap_or_default();
+                        let col_r = ((td.color_hex >> 16) & 0xff) as u8;
+                        let col_g = ((td.color_hex >> 8) & 0xff) as u8;
+                        let col_b = (td.color_hex & 0xff) as u8;
+
+                        el.child(div().h(px(1.)).w_full().bg(Theme::border()))
+                            .child(
+                                div()
+                                    .p_2()
+                                    .rounded_md()
+                                    .bg(Theme::bg_surface())
+                                    .text_xs()
+                                    .text_color(Theme::text_muted())
+                                    .child("Double-click text in Preview to type • Drag to move"),
+                            )
+                            // Style Presets
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(Theme::text_secondary())
+                                            .child("Style Presets"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_1()
+                                            .children(TextPreset::all().iter().map(|&preset| {
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "tp-{}",
+                                                        preset.label()
+                                                    )))
+                                                    .px_2()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .bg(Theme::bg_surface())
+                                                    .border_1()
+                                                    .border_color(Theme::border())
+                                                    .text_xs()
+                                                    .text_color(Theme::text_primary())
+                                                    .cursor_pointer()
+                                                    .hover(|s| {
+                                                        s.border_color(Theme::accent())
+                                                            .bg(Theme::bg_hover())
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.state.push_undo();
+                                                        if let Some(c) =
+                                                            this.state.selected_clip_mut()
+                                                        {
+                                                            if let Some(ref mut t) = c.text {
+                                                                t.apply_preset(preset);
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child(preset.label())
+                                            })),
+                                    ),
+                            )
+                            // 10 Vietnamese-ready Fonts + Import
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(Theme::text_secondary())
+                                                    .child("Font Family"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .id("btn-import-font")
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .bg(Theme::bg_surface())
+                                                    .border_1()
+                                                    .border_color(Theme::border())
+                                                    .text_xs()
+                                                    .text_color(Theme::accent())
+                                                    .cursor_pointer()
+                                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.prompt_import_font(cx);
+                                                    }))
+                                                    .child("+ Font"),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_1()
+                                            .children(
+                                                [
+                                                    "Be Vietnam Pro",
+                                                    "Roboto",
+                                                    "Montserrat",
+                                                    "Oswald",
+                                                    "Playfair Display",
+                                                    "Quicksand",
+                                                    "Pacifico",
+                                                    "Lobster",
+                                                    "Space Grotesk",
+                                                    "Merriweather",
+                                                ]
+                                                .into_iter()
+                                                .map(|fname| {
+                                                    let active = td.font_family == fname;
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "ff-{}",
+                                                            fname
+                                                        )))
+                                                        .px_1p5()
+                                                        .py_0p5()
+                                                        .rounded_sm()
+                                                        .bg(if active {
+                                                            Theme::accent()
+                                                        } else {
+                                                            Theme::bg_surface()
+                                                        })
+                                                        .border_1()
+                                                        .border_color(Theme::border())
+                                                        .text_xs()
+                                                        .text_color(Theme::text_primary())
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.state.push_undo();
+                                                                if let Some(c) =
+                                                                    this.state.selected_clip_mut()
+                                                                {
+                                                                    if let Some(ref mut t) = c.text
+                                                                    {
+                                                                        t.font_family =
+                                                                            fname.into();
+                                                                        t.font_path = None;
+                                                                    }
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                        .child(fname)
+                                                }),
+                                            ),
+                                    ),
+                            )
+                            // Font Size & Weight sliders
+                            .child(self.inspector_slider(
+                                "Size",
+                                format!("{:.0}px", td.font_size),
+                                ((td.font_size - 12.0) / 128.0).clamp(0.0, 1.0),
+                                Theme::accent(),
+                                SliderField::FontSize,
+                                cx,
+                            ))
+                            .child(self.inspector_slider(
+                                "Weight",
+                                match td.font_weight {
+                                    0..=350 => "Light",
+                                    351..=450 => "Regular",
+                                    451..=600 => "Medium",
+                                    601..=800 => "Bold",
+                                    _ => "Black",
+                                }
+                                .into(),
+                                ((td.font_weight as f32 - 300.0) / 600.0).clamp(0.0, 1.0),
+                                Theme::accent(),
+                                SliderField::FontWeight,
+                                cx,
+                            ))
+                            // RGB Color Picker + Quick swatches
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_1p5()
+                                                    .child(
+                                                        div()
+                                                            .w(px(14.))
+                                                            .h(px(14.))
+                                                            .rounded_sm()
+                                                            .bg(rgb(td.color_hex))
+                                                            .border_1()
+                                                            .border_color(Theme::border()),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(Theme::text_secondary())
+                                                            .child(format!(
+                                                                "RGB #{:06X}",
+                                                                td.color_hex
+                                                            )),
+                                                    ),
+                                            )
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .gap_1()
+                                                    .children(
+                                                        [
+                                                            0xffffff_u32,
+                                                            0x000000,
+                                                            0xfacc15,
+                                                            0xef4444,
+                                                            0x3b82f6,
+                                                            0x22c55e,
+                                                        ]
+                                                        .into_iter()
+                                                        .map(|hex| {
+                                                            let active = td.color_hex == hex;
+                                                            div()
+                                                                .id(SharedString::from(format!(
+                                                                    "tc-{:06x}",
+                                                                    hex
+                                                                )))
+                                                                .w(px(14.))
+                                                                .h(px(14.))
+                                                                .rounded_sm()
+                                                                .bg(rgb(hex))
+                                                                .border_1()
+                                                                .border_color(if active {
+                                                                    Theme::accent()
+                                                                } else {
+                                                                    Theme::border()
+                                                                })
+                                                                .cursor_pointer()
+                                                                .on_click(cx.listener(
+                                                                    move |this, _, _, cx| {
+                                                                        this.state.push_undo();
+                                                                        if let Some(c) = this
+                                                                            .state
+                                                                            .selected_clip_mut()
+                                                                        {
+                                                                            if let Some(ref mut t) =
+                                                                                c.text
+                                                                            {
+                                                                                t.color_hex = hex;
+                                                                            }
+                                                                        }
+                                                                        cx.notify();
+                                                                    },
+                                                                ))
+                                                        }),
+                                                    ),
+                                            ),
+                                    )
+                                    .child(self.inspector_slider(
+                                        "Red",
+                                        format!("{}", col_r),
+                                        col_r as f32 / 255.0,
+                                        rgb(0xef4444),
+                                        SliderField::ColorR,
+                                        cx,
+                                    ))
+                                    .child(self.inspector_slider(
+                                        "Green",
+                                        format!("{}", col_g),
+                                        col_g as f32 / 255.0,
+                                        rgb(0x22c55e),
+                                        SliderField::ColorG,
+                                        cx,
+                                    ))
+                                    .child(self.inspector_slider(
+                                        "Blue",
+                                        format!("{}", col_b),
+                                        col_b as f32 / 255.0,
+                                        rgb(0x3b82f6),
+                                        SliderField::ColorB,
+                                        cx,
+                                    )),
+                            )
+                            // Effects: Stroke, Shadow, Background
+                            .child(div().h(px(1.)).w_full().bg(Theme::border()))
+                            .child(self.inspector_slider(
+                                "Stroke",
+                                format!("{:.1}px", td.stroke_width),
+                                (td.stroke_width / 8.0).clamp(0.0, 1.0),
+                                Theme::accent(),
+                                SliderField::StrokeWidth,
+                                cx,
+                            ))
+                            .when(td.stroke_width > 0.0, |el| {
+                                let cur_sc = td.stroke_color_hex.unwrap_or(0x000000);
+                                el.child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(Theme::text_secondary())
+                                                .child("Stroke Color"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .children(
+                                                    [
+                                                        0x000000_u32,
+                                                        0xffffff,
+                                                        0xfacc15,
+                                                        0xef4444,
+                                                        0x3b82f6,
+                                                        0xec4899,
+                                                    ]
+                                                    .into_iter()
+                                                    .map(|hex| {
+                                                        let active = cur_sc == hex;
+                                                        div()
+                                                            .id(SharedString::from(format!(
+                                                                "sc-{:06x}",
+                                                                hex
+                                                            )))
+                                                            .w(px(14.))
+                                                            .h(px(14.))
+                                                            .rounded_sm()
+                                                            .bg(rgb(hex))
+                                                            .border_1()
+                                                            .border_color(if active {
+                                                                Theme::accent()
+                                                            } else {
+                                                                Theme::border()
+                                                            })
+                                                            .cursor_pointer()
+                                                            .on_click(cx.listener(
+                                                                move |this, _, _, cx| {
+                                                                    this.state.push_undo();
+                                                                    if let Some(c) = this
+                                                                        .state
+                                                                        .selected_clip_mut()
+                                                                    {
+                                                                        if let Some(ref mut t) =
+                                                                            c.text
+                                                                        {
+                                                                            t.stroke_color_hex =
+                                                                                Some(hex);
+                                                                        }
+                                                                    }
+                                                                    cx.notify();
+                                                                },
+                                                            ))
+                                                    }),
+                                                ),
+                                        ),
+                                )
+                            })
+                            .child(self.inspector_slider(
+                                "Shadow",
+                                if td.shadow_color_hex.is_some() {
+                                    format!("{:.0}px", td.shadow_offset_x)
+                                } else {
+                                    "Off".into()
+                                },
+                                if td.shadow_color_hex.is_some() {
+                                    (td.shadow_offset_x / 12.0).clamp(0.0, 1.0)
+                                } else {
+                                    0.0
+                                },
+                                Theme::accent(),
+                                SliderField::ShadowOffset,
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(Theme::text_secondary())
+                                            .child("Background"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .children(
+                                                [
+                                                    (None, "Off"),
+                                                    (Some(0x111115_u32), "Dark"),
+                                                    (Some(0xef4444_u32), "Red"),
+                                                    (Some(0x2563eb_u32), "Blue"),
+                                                ]
+                                                .into_iter()
+                                                .map(|(bg_opt, label)| {
+                                                    let active = td.bg_color_hex == bg_opt;
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "tbg-{}",
+                                                            label
+                                                        )))
+                                                        .px_1p5()
+                                                        .py_0p5()
+                                                        .rounded_sm()
+                                                        .bg(if active {
+                                                            Theme::accent()
+                                                        } else {
+                                                            Theme::bg_surface()
+                                                        })
+                                                        .border_1()
+                                                        .border_color(Theme::border())
+                                                        .text_xs()
+                                                        .text_color(Theme::text_primary())
+                                                        .cursor_pointer()
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.state.push_undo();
+                                                                if let Some(c) =
+                                                                    this.state.selected_clip_mut()
+                                                                {
+                                                                    if let Some(ref mut t) = c.text
+                                                                    {
+                                                                        t.bg_color_hex = bg_opt;
+                                                                    }
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        ))
+                                                        .child(label)
+                                                }),
+                                            ),
+                                    ),
+                            )
+                            .when(td.bg_color_hex.is_some(), |el| {
+                                el.child(self.inspector_slider(
+                                    "Pad",
+                                    format!("{:.0}px", td.bg_padding),
+                                    ((td.bg_padding - 2.0) / 22.0).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::BgPadding,
+                                    cx,
+                                ))
+                            })
+                            // Text Animations
+                            .child(div().h(px(1.)).w_full().bg(Theme::border()))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(Theme::text_secondary())
+                                            .child("Animation"),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .flex_wrap()
+                                            .gap_1()
+                                            .children(TextAnimation::all().iter().map(|&anim| {
+                                                let active = td.animation == anim;
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "ta-{}",
+                                                        anim.label()
+                                                    )))
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .bg(if active {
+                                                        Theme::accent()
+                                                    } else {
+                                                        Theme::bg_surface()
+                                                    })
+                                                    .border_1()
+                                                    .border_color(Theme::border())
+                                                    .text_xs()
+                                                    .text_color(Theme::text_primary())
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.state.push_undo();
+                                                        if let Some(c) =
+                                                            this.state.selected_clip_mut()
+                                                        {
+                                                            if let Some(ref mut t) = c.text {
+                                                                t.animation = anim;
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child(anim.label())
+                                            })),
+                                    ),
+                            )
+                            .when(td.animation != TextAnimation::None, |el| {
+                                el.child(self.inspector_slider(
+                                    "Anim Dur",
+                                    format!("{:.1}s", td.anim_duration_secs),
+                                    ((td.anim_duration_secs - 0.1) / 1.9).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::AnimDuration,
+                                    cx,
+                                ))
+                            })
+                    })
             } else {
                 div()
+                    .id("inspector-empty")
                     .p_4()
                     .text_xs()
                     .text_color(Theme::text_muted())
@@ -1494,76 +2503,88 @@ impl EditorView {
             })
     }
 
-    fn inspector_stepper(
+    fn inspector_slider(
         &self,
         label: &'static str,
         value: String,
-        dec_id: &'static str,
-        inc_id: &'static str,
-        on_dec: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
-        on_inc: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+        ratio: f32,
+        fill_color: gpui::Rgba,
+        field: SliderField,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let clamped = ratio.clamp(0.0, 1.0);
+        let fill_w = SLIDER_W * clamped;
+        let thumb_x = (fill_w - 5.0).clamp(0.0, SLIDER_W - 10.0);
+
         div()
             .flex()
             .items_center()
             .justify_between()
+            .gap_2()
             .child(
                 div()
+                    .w(px(56.))
                     .text_xs()
                     .text_color(Theme::text_secondary())
                     .child(label),
             )
             .child(
                 div()
+                    .id(SharedString::from(format!("sld-{}", label)))
+                    .w(px(SLIDER_W))
+                    .h(px(20.))
                     .flex()
                     .items_center()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .id(dec_id)
-                            .w(px(24.))
-                            .h(px(24.))
-                            .rounded_sm()
-                            .bg(Theme::bg_surface())
-                            .border_1()
-                            .border_color(Theme::border())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .text_color(Theme::text_primary())
-                            .cursor_pointer()
-                            .hover(|s| s.bg(Theme::bg_hover()))
-                            .on_click(on_dec)
-                            .child("-"),
+                    .relative()
+                    .cursor_ew_resize()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                            cx.stop_propagation();
+                            this.state.push_undo();
+                            this.slider_drag = Some(field);
+                            let slider_left =
+                                f32::from(window.viewport_size().width) - 62.0 - SLIDER_W;
+                            let r = (f32::from(event.position.x) - slider_left) / SLIDER_W;
+                            this.apply_slider_ratio(field, r);
+                            cx.notify();
+                        }),
                     )
                     .child(
                         div()
-                            .w(px(44.))
-                            .text_xs()
-                            .text_center()
-                            .text_color(Theme::text_primary())
-                            .child(value),
-                    )
-                    .child(
-                        div()
-                            .id(inc_id)
-                            .w(px(24.))
-                            .h(px(24.))
-                            .rounded_sm()
+                            .w_full()
+                            .h(px(6.))
+                            .rounded_full()
                             .bg(Theme::bg_surface())
                             .border_1()
                             .border_color(Theme::border())
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .text_xs()
-                            .text_color(Theme::text_primary())
-                            .cursor_pointer()
-                            .hover(|s| s.bg(Theme::bg_hover()))
-                            .on_click(on_inc)
-                            .child("+"),
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .w(px(fill_w))
+                                    .h_full()
+                                    .bg(fill_color),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(thumb_x))
+                            .w(px(10.))
+                            .h(px(10.))
+                            .rounded_full()
+                            .bg(Theme::text_primary())
+                            .border_1()
+                            .border_color(Theme::bg_app()),
                     ),
+            )
+            .child(
+                div()
+                    .w(px(42.))
+                    .text_xs()
+                    .text_right()
+                    .text_color(Theme::text_primary())
+                    .child(value),
             )
     }
 
@@ -1576,8 +2597,8 @@ impl EditorView {
     ) -> gpui::Stateful<gpui::Div> {
         div()
             .id(id)
-            .w(px(18.))
-            .h(px(18.))
+            .w(px(20.))
+            .h(px(20.))
             .rounded_sm()
             .bg(if active {
                 rgb(Theme::PLAYHEAD)
@@ -1617,6 +2638,11 @@ impl EditorView {
         };
 
         let selected_clip_id = self.state.selected_clip_id;
+        let is_linked = self
+            .state
+            .selected_clip()
+            .and_then(|c| c.linked_clip_id)
+            .is_some();
         let snap_enabled = self.state.snap_enabled;
         let magnet_enabled = self.state.main_track_magnet;
 
@@ -1630,7 +2656,8 @@ impl EditorView {
             20
         };
         let ruler_marks: Vec<u32> = (0..=(total_secs as u32)).step_by(ruler_step).collect();
-        let tracks = [TrackKind::Overlay, TrackKind::Video, TrackKind::Audio];
+        let tracks = self.state.tracks.clone();
+        let markers = self.state.markers.clone();
 
         div()
             .id("timeline-root")
@@ -1779,6 +2806,52 @@ impl EditorView {
                                     cx.notify();
                                 })),
                             )
+                            .child(
+                                self.icon_button(
+                                    "tl-link",
+                                    "🔗",
+                                    if is_linked {
+                                        "Unlink Clip"
+                                    } else {
+                                        "Link with Overlapping Clip"
+                                    },
+                                    is_linked,
+                                    selected_clip_id.is_some(),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    let Some(sel_id) = this.state.selected_clip_id else {
+                                        return;
+                                    };
+                                    if this
+                                        .state
+                                        .selected_clip()
+                                        .and_then(|c| c.linked_clip_id)
+                                        .is_some()
+                                    {
+                                        this.state.unlink_clip(sel_id);
+                                    } else if let Some(sel) = this.state.selected_clip().cloned() {
+                                        if let Some(partner_id) = this
+                                            .state
+                                            .clips
+                                            .iter()
+                                            .find(|c| {
+                                                c.id != sel_id
+                                                    && c.track != sel.track
+                                                    && c.start_secs < sel.end_secs()
+                                                    && c.end_secs() > sel.start_secs
+                                            })
+                                            .map(|c| c.id)
+                                        {
+                                            this.state.link_clips(sel_id, partner_id);
+                                        } else {
+                                            this.state.status_message =
+                                                "No overlapping clip on another track to link"
+                                                    .into();
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                            )
                             .child(div().w(px(1.)).h(px(16.)).mx_1().bg(Theme::border()))
                             .child(
                                 self.icon_button(
@@ -1866,15 +2939,66 @@ impl EditorView {
                                     .px_2()
                                     .flex()
                                     .items_center()
+                                    .justify_between()
                                     .text_xs()
                                     .text_color(Theme::text_muted())
                                     .border_b_1()
                                     .border_color(Theme::border())
-                                    .child("Tracks"),
+                                    .child("Tracks")
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_1()
+                                            .children(
+                                                [
+                                                    (TrackKind::Video, "🎬", "Add Video Track"),
+                                                    (
+                                                        TrackKind::Overlay,
+                                                        "🖼",
+                                                        "Add Overlay/Image Track",
+                                                    ),
+                                                    (TrackKind::Audio, "🎵", "Add Audio Track"),
+                                                ]
+                                                .into_iter()
+                                                .map(|(kind, icon, tip)| {
+                                                    div()
+                                                        .id(SharedString::from(format!(
+                                                            "add-tr-{}",
+                                                            kind.label()
+                                                        )))
+                                                        .w(px(20.))
+                                                        .h(px(20.))
+                                                        .rounded_sm()
+                                                        .bg(Theme::bg_surface())
+                                                        .border_1()
+                                                        .border_color(Theme::border())
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .text_xs()
+                                                        .text_color(Theme::text_secondary())
+                                                        .cursor_pointer()
+                                                        .hover(|s| {
+                                                            s.bg(Theme::bg_hover())
+                                                                .text_color(Theme::text_primary())
+                                                        })
+                                                        .tooltip(build_tooltip(tip))
+                                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                                            this.state.add_track(kind);
+                                                            cx.notify();
+                                                        }))
+                                                        .child(icon)
+                                                }),
+                                            ),
+                                    ),
                             )
                             .children(tracks.iter().map(|track| {
-                                let t = *track;
-                                let flags = self.state.track_flags(t);
+                                let track_id = track.id;
+                                let t = track.kind;
+                                let flags = track.flags;
+                                let track_name = track.name.clone();
+                                let is_main = track.is_main;
 
                                 div()
                                     .h(px(48.))
@@ -1901,7 +3025,7 @@ impl EditorView {
                                                     .text_xs()
                                                     .font_weight(gpui::FontWeight::MEDIUM)
                                                     .text_color(Theme::text_secondary())
-                                                    .child(t.label()),
+                                                    .child(track_name),
                                             ),
                                     )
                                     .child(
@@ -1909,45 +3033,45 @@ impl EditorView {
                                             .flex()
                                             .items_center()
                                             .gap_1()
-                                            .when(t != TrackKind::Overlay, |el| {
+                                            .when(t.is_audible(), |el| {
                                                 el.child(
                                                     self.track_flag_btn(
                                                         SharedString::from(format!(
                                                             "mute-{}",
-                                                            t.label()
+                                                            track_id
                                                         )),
-                                                        "M",
+                                                        if flags.muted { "🔇" } else { "🔊" },
                                                         if flags.muted {
-                                                            "Unmute Track"
+                                                            "Unmute Track (Muted)"
                                                         } else {
-                                                            "Mute Track"
+                                                            "Mute Track (Audio On)"
                                                         },
                                                         flags.muted,
                                                     )
                                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.state.toggle_mute(t);
+                                                        this.state.toggle_mute_track(track_id);
                                                         this.sync_preview_after_seek(cx);
                                                         cx.notify();
                                                     })),
                                                 )
                                             })
-                                            .when(t != TrackKind::Audio, |el| {
+                                            .when(t.is_visual(), |el| {
                                                 el.child(
                                                     self.track_flag_btn(
                                                         SharedString::from(format!(
                                                             "hide-{}",
-                                                            t.label()
+                                                            track_id
                                                         )),
-                                                        "H",
+                                                        if flags.hidden { "🚫" } else { "👁" },
                                                         if flags.hidden {
-                                                            "Show Track"
+                                                            "Show Track (Hidden)"
                                                         } else {
-                                                            "Hide Track"
+                                                            "Hide Track (Visible)"
                                                         },
                                                         flags.hidden,
                                                     )
                                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.state.toggle_hide(t);
+                                                        this.state.toggle_hide_track(track_id);
                                                         this.sync_preview_after_seek(cx);
                                                         cx.notify();
                                                     })),
@@ -1957,21 +3081,39 @@ impl EditorView {
                                                 self.track_flag_btn(
                                                     SharedString::from(format!(
                                                         "lock-{}",
-                                                        t.label()
+                                                        track_id
                                                     )),
-                                                    "L",
+                                                    if flags.locked { "🔒" } else { "🔓" },
                                                     if flags.locked {
-                                                        "Unlock Track"
+                                                        "Unlock Track (Locked)"
                                                     } else {
-                                                        "Lock Track"
+                                                        "Lock Track (Unlocked)"
                                                     },
                                                     flags.locked,
                                                 )
                                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.state.toggle_lock(t);
+                                                    this.state.toggle_lock_track(track_id);
                                                     cx.notify();
                                                 })),
-                                            ),
+                                            )
+                                            .when(!is_main, |el| {
+                                                el.child(
+                                                    self.track_flag_btn(
+                                                        SharedString::from(format!(
+                                                            "rm-track-{}",
+                                                            track_id
+                                                        )),
+                                                        "🗑",
+                                                        "Remove Track",
+                                                        false,
+                                                    )
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        let _ = this.state.remove_track(track_id);
+                                                        this.sync_preview_after_seek(cx);
+                                                        cx.notify();
+                                                    })),
+                                                )
+                                            }),
                                     )
                             })),
                     )
@@ -2029,15 +3171,62 @@ impl EditorView {
                                                     .text_xs()
                                                     .text_color(Theme::text_muted())
                                                     .child(format!("{}s", sec))
+                                            }))
+                                            .children(markers.into_iter().map(|m| {
+                                                let m_id = m.id;
+                                                let m_time = m.time_secs;
+                                                let left = m_time * px_per_sec;
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "marker-{}",
+                                                        m_id
+                                                    )))
+                                                    .absolute()
+                                                    .left(px(left - 6.0))
+                                                    .top(px(2.))
+                                                    .px_1()
+                                                    .rounded_sm()
+                                                    .bg(rgb(m.color_hex))
+                                                    .text_xs()
+                                                    .font_weight(gpui::FontWeight::BOLD)
+                                                    .text_color(Theme::bg_app())
+                                                    .cursor_pointer()
+                                                    .tooltip(build_tooltip(
+                                                        "Click: Jump to Marker • Shift+Click: Remove",
+                                                    ))
+                                                    .on_mouse_down(
+                                                        MouseButton::Left,
+                                                        cx.listener(
+                                                            move |this,
+                                                                  event: &MouseDownEvent,
+                                                                  _,
+                                                                  cx| {
+                                                                cx.stop_propagation();
+                                                                if event.modifiers.shift {
+                                                                    this.state.remove_marker(m_id);
+                                                                } else {
+                                                                    this.state.seek_to(m_time);
+                                                                    this.sync_preview_after_seek(cx);
+                                                                }
+                                                                cx.notify();
+                                                            },
+                                                        ),
+                                                    )
+                                                    .child("⚑")
                                             })),
                                     )
                                     // Track lanes
-                                    .children(tracks.iter().map(|track_kind| {
+                                    .children(tracks.iter().map(|track| {
+                                        let track_id = track.id;
+                                        let track_kind = track.kind;
                                         let track_clips: Vec<_> = self
                                             .state
                                             .clips
                                             .iter()
-                                            .filter(|c| c.track == *track_kind)
+                                            .filter(|c| {
+                                                c.track_id == track_id
+                                                    || (c.track_id == 0 && c.track == track_kind)
+                                            })
                                             .cloned()
                                             .collect();
 
@@ -2309,6 +3498,34 @@ impl Render for EditorView {
                 this.handle_key_down(event, cx);
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if let Some(field) = this.slider_drag {
+                    let slider_left = f32::from(window.viewport_size().width) - 62.0 - SLIDER_W;
+                    let r = (f32::from(event.position.x) - slider_left) / SLIDER_W;
+                    this.apply_slider_ratio(field, r);
+                    cx.notify();
+                    return;
+                }
+
+                if let Some(mut pdrag) = this.preview_text_drag {
+                    let dx = f32::from(event.position.x) - pdrag.start_mouse_x;
+                    let dy = f32::from(event.position.y) - pdrag.start_mouse_y;
+                    if dx.abs() > 2.0 || dy.abs() > 2.0 {
+                        pdrag.moved = true;
+                        this.preview_text_drag = Some(pdrag);
+                    }
+                    let inv = if pdrag.preview_scale > 0.001 {
+                        1.0 / pdrag.preview_scale
+                    } else {
+                        1.0
+                    };
+                    if let Some(c) = this.state.clips.iter_mut().find(|c| c.id == pdrag.clip_id) {
+                        c.pos_x = pdrag.initial_pos_x + dx * inv;
+                        c.pos_y = pdrag.initial_pos_y + dy * inv;
+                    }
+                    cx.notify();
+                    return;
+                }
+
                 if let Some(drag) = this.clip_drag {
                     let dx = f32::from(event.position.x) - drag.start_mouse_x;
                     let dt = dx / this.state.px_per_sec;
@@ -2359,6 +3576,12 @@ impl Render for EditorView {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     let mut changed = false;
+                    if this.slider_drag.take().is_some() {
+                        changed = true;
+                    }
+                    if this.preview_text_drag.take().is_some() {
+                        changed = true;
+                    }
                     if this.clip_drag.is_some() {
                         this.clip_drag = None;
                         this.sync_preview_after_seek(cx);
@@ -2391,5 +3614,163 @@ impl Render for EditorView {
             )
             .child(self.render_timeline(window, cx))
             .into_any_element()
+    }
+}
+
+fn utf16_offset_to_utf8_idx(s: &str, utf16_off: usize) -> usize {
+    let mut u16_count = 0usize;
+    for (byte_idx, ch) in s.char_indices() {
+        if u16_count >= utf16_off {
+            return byte_idx;
+        }
+        u16_count += ch.len_utf16();
+    }
+    s.len()
+}
+
+impl EntityInputHandler for EditorView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let edit_id = self.editing_text_clip_id?;
+        let clip = self.state.clips.iter().find(|c| c.id == edit_id)?;
+        let content = &clip.text.as_ref()?.content;
+        let total_u16: usize = content.encode_utf16().count();
+        let start = range_utf16.start.min(total_u16);
+        let end = range_utf16.end.min(total_u16).max(start);
+        *adjusted_range = Some(start..end);
+        let b_start = utf16_offset_to_utf8_idx(content, start);
+        let b_end = utf16_offset_to_utf8_idx(content, end);
+        Some(content[b_start..b_end].to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let edit_id = self.editing_text_clip_id?;
+        let clip = self.state.clips.iter().find(|c| c.id == edit_id)?;
+        let len_u16: usize = clip.text.as_ref()?.content.encode_utf16().count();
+        Some(UTF16Selection {
+            range: len_u16..len_u16,
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        self.marked_text_range.clone()
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.marked_text_range = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit_id) = self.editing_text_clip_id else {
+            return;
+        };
+        let Some(clip) = self.state.clips.iter_mut().find(|c| c.id == edit_id) else {
+            return;
+        };
+        let Some(ref mut td) = clip.text else {
+            return;
+        };
+
+        let replace_range = range_utf16
+            .or_else(|| self.marked_text_range.take())
+            .unwrap_or_else(|| {
+                let len_u16: usize = td.content.encode_utf16().count();
+                len_u16..len_u16
+            });
+
+        let b_start = utf16_offset_to_utf8_idx(&td.content, replace_range.start);
+        let b_end = utf16_offset_to_utf8_idx(&td.content, replace_range.end).max(b_start);
+        td.content.replace_range(b_start..b_end, text);
+        clip.name = if td.content.is_empty() {
+            "Text".into()
+        } else {
+            td.content.clone()
+        };
+        self.marked_text_range = None;
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        _new_selected_range: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(edit_id) = self.editing_text_clip_id else {
+            return;
+        };
+        let Some(clip) = self.state.clips.iter_mut().find(|c| c.id == edit_id) else {
+            return;
+        };
+        let Some(ref mut td) = clip.text else {
+            return;
+        };
+
+        let replace_range = range_utf16
+            .or_else(|| self.marked_text_range.clone())
+            .unwrap_or_else(|| {
+                let len_u16: usize = td.content.encode_utf16().count();
+                len_u16..len_u16
+            });
+
+        let b_start = utf16_offset_to_utf8_idx(&td.content, replace_range.start);
+        let b_end = utf16_offset_to_utf8_idx(&td.content, replace_range.end).max(b_start);
+        td.content.replace_range(b_start..b_end, new_text);
+        clip.name = if td.content.is_empty() {
+            "Text".into()
+        } else {
+            td.content.clone()
+        };
+
+        if !new_text.is_empty() {
+            let new_u16_len: usize = new_text.encode_utf16().count();
+            self.marked_text_range =
+                Some(replace_range.start..(replace_range.start + new_u16_len));
+        } else {
+            self.marked_text_range = None;
+        }
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(element_bounds)
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
