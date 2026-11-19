@@ -25,6 +25,7 @@ pub struct EditorCore {
     pub status_message: String,
     pub snap_enabled: bool,
     pub next_id: usize,
+    pub copied_clip: Option<TimelineClip>,
     undo_stack: Vec<ProjectSnapshot>,
     redo_stack: Vec<ProjectSnapshot>,
 }
@@ -84,6 +85,7 @@ impl EditorCore {
             status_message: "Drop or import media to begin".into(),
             snap_enabled: true,
             next_id: 10,
+            copied_clip: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
         }
@@ -1045,6 +1047,68 @@ impl EditorCore {
         self.status_message = format!("Ripple deleted {}", removed.name);
     }
 
+    pub fn copy_selected_clip(&mut self) -> bool {
+        let Some(clip) = self.selected_clip().cloned() else {
+            self.status_message = "No clip selected to copy".into();
+            return false;
+        };
+        let name = clip.name.clone();
+        self.copied_clip = Some(clip);
+        self.status_message = format!("Copied {}", name);
+        true
+    }
+
+    pub fn paste_clip_at_playhead(&mut self) -> Option<usize> {
+        let mut clip = self.copied_clip.clone()?;
+        if self.is_clip_track_locked(&clip) {
+            self.status_message = format!("Track {} is locked", clip.track.label());
+            return None;
+        }
+        self.push_undo();
+        self.next_id += 1;
+        let new_id = self.next_id;
+        clip.id = new_id;
+        clip.start_secs = self.playhead_secs.max(0.0);
+        clip.linked_clip_id = None;
+        let name = clip.name.clone();
+        let is_main_video = clip.track == TrackKind::Video
+            && (clip.track_id == 0
+                || self
+                    .tracks
+                    .iter()
+                    .find(|t| t.id == clip.track_id)
+                    .map(|t| t.is_main)
+                    .unwrap_or(false));
+        let clip_end = clip.end_secs();
+        self.clips.push(clip);
+        if self.main_track_magnet && is_main_video {
+            self.compact_main_track();
+        }
+        if clip_end + 5.0 > self.total_duration_secs {
+            self.total_duration_secs = (clip_end + 5.0).ceil();
+        }
+        self.selected_clip_id = Some(new_id);
+        self.status_message = format!("Pasted {}", name);
+        Some(new_id)
+    }
+
+    pub fn reset_crop_selected(&mut self) -> bool {
+        let Some(id) = self.selected_clip_id else {
+            return false;
+        };
+        let Some(pos) = self.clips.iter().position(|c| c.id == id) else {
+            return false;
+        };
+        if self.is_clip_track_locked(&self.clips[pos]) {
+            self.status_message = format!("Track {} is locked", self.clips[pos].track.label());
+            return false;
+        }
+        self.push_undo();
+        self.clips[pos].crop = ClipCrop::default();
+        self.status_message = "Reset crop".into();
+        true
+    }
+
     pub fn adjust_zoom(&mut self, factor: f32) {
         self.px_per_sec = (self.px_per_sec * factor).clamp(4.0, 120.0);
     }
@@ -1152,13 +1216,28 @@ impl EditorCore {
         }
 
         self.push_undo();
-        let local_t = (playhead - self.clips[pos].start_secs).max(0.0);
-        if let Some(kf_idx) = self.clips[pos]
+        let local_t = (playhead - self.clips[pos].start_secs).clamp(0.0, self.clips[pos].duration_secs);
+        let nearest_idx = self.clips[pos]
             .keyframes
             .iter()
-            .position(|k| (k.time_offset_secs - local_t).abs() < 0.1)
-        {
-            self.clips[pos].keyframes.remove(kf_idx);
+            .enumerate()
+            .filter(|(_, k)| (k.time_offset_secs - local_t).abs() < 0.08)
+            .min_by(|(_, a), (_, b)| {
+                (a.time_offset_secs - local_t)
+                    .abs()
+                    .partial_cmp(&(b.time_offset_secs - local_t).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i);
+        if let Some(kf_idx) = nearest_idx {
+            let removed = self.clips[pos].keyframes.remove(kf_idx);
+            if self.clips[pos].keyframes.is_empty() {
+                self.clips[pos].pos_x = removed.pos_x;
+                self.clips[pos].pos_y = removed.pos_y;
+                self.clips[pos].scale = removed.scale;
+                self.clips[pos].rotation_deg = removed.rotation_deg;
+                self.clips[pos].opacity = removed.opacity;
+            }
             self.status_message = format!("Removed keyframe at {:.1}s", local_t);
             return true;
         }
@@ -1483,5 +1562,21 @@ mod tests {
         assert!(core.clips[0].reversed);
         assert!(core.set_selected_speed(2.0));
         assert!((core.clips[0].duration_secs - 2.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn copy_and_paste_clip_at_playhead() {
+        let mut core = EditorCore::new();
+        core.clips.push(sample_clip(1, 0.0, 3.0));
+        core.selected_clip_id = Some(1);
+        assert!(core.copy_selected_clip());
+
+        core.seek_to(5.0);
+        let pasted_id = core.paste_clip_at_playhead().expect("should paste");
+        assert_ne!(pasted_id, 1);
+        assert_eq!(core.clips.len(), 2);
+        let pasted = core.clips.iter().find(|c| c.id == pasted_id).unwrap();
+        assert!((pasted.start_secs - 5.0).abs() < 0.01);
+        assert_eq!(core.selected_clip_id, Some(pasted_id));
     }
 }

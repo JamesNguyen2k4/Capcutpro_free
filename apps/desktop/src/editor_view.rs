@@ -14,14 +14,14 @@ use gpui::{
     px, rgb,
 };
 use opencut_core::{
-    AspectRatio, EditorCore, RecentProjectEntry, TextAnimation, TextPreset, TrackKind,
+    AspectRatio, ClipCrop, EditorCore, RecentProjectEntry, TextAnimation, TextPreset, TrackKind,
     format_timecode, load_recent_projects, record_recent_project,
 };
 
 use crate::media_engine::{
-    AudioStreamPlayer, ExportHandle, VideoStreamPlayer, decode_single_frame, export_freeze_frame,
-    probe_duration_secs, probe_media_dimensions, render_rotated_text_frame, reveal_in_explorer,
-    start_export_timeline,
+    AudioStreamPlayer, ExportFormat, ExportHandle, ExportOptions, VideoStreamPlayer,
+    decode_single_frame, detect_gpu_encoder, export_freeze_frame, probe_duration_secs,
+    probe_media_dimensions, render_rotated_text_frame, reveal_in_explorer, start_export_timeline,
 };
 use crate::theme::Theme;
 
@@ -188,6 +188,12 @@ enum SliderField {
     ShadowOffset,
     BgPadding,
     AnimDuration,
+    CropLeft,
+    CropRight,
+    CropTop,
+    CropBottom,
+    FadeIn,
+    FadeOut,
 }
 
 const INSPECTOR_W: f32 = 280.0;
@@ -199,6 +205,12 @@ pub(crate) enum AppScreen {
     Editor,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MediaPanelTab {
+    Media,
+    Text,
+}
+
 pub struct EditorView {
     pub(crate) state: EditorCore,
     pub(crate) focus_handle: FocusHandle,
@@ -208,7 +220,11 @@ pub struct EditorView {
     pub(crate) draft_ratio: AspectRatio,
     pub(crate) draft_base_height: u32,
     pub(crate) hub_error: Option<String>,
+    media_panel_tab: MediaPanelTab,
+    menu_open: bool,
     media_filter: Option<TrackKind>,
+    media_search_query: String,
+    media_search_focused: bool,
     editing_text_clip_id: Option<usize>,
     marked_text_range: Option<Range<usize>>,
     preview_quality: PreviewQuality,
@@ -220,6 +236,9 @@ pub struct EditorView {
     player: VideoStreamPlayer,
     audio_player: AudioStreamPlayer,
     decode_seq: u64,
+    decode_applied_seq: u64,
+    decode_in_flight: bool,
+    decode_dirty: bool,
     timeline_scroll_x: f32,
     scrollbar_dragging: bool,
     scrollbar_drag_start_x: f32,
@@ -233,7 +252,12 @@ pub struct EditorView {
     active_snap_guides: PreviewSnapGuides,
     rotated_text_cache: HashMap<usize, (u64, Arc<RenderImage>, u32, u32)>,
     rotated_text_seq: HashMap<usize, u64>,
+    rotated_text_applied_seq: HashMap<usize, u64>,
+    rot_text_in_flight: HashMap<usize, bool>,
+    rot_text_dirty: HashMap<usize, bool>,
     export_status: ExportStatus,
+    export_modal_open: bool,
+    export_options: ExportOptions,
 }
 
 impl EditorView {
@@ -247,7 +271,11 @@ impl EditorView {
             draft_ratio: AspectRatio::Ratio16x9,
             draft_base_height: 1080,
             hub_error: None,
+            media_panel_tab: MediaPanelTab::Media,
+            menu_open: false,
             media_filter: None,
+            media_search_query: String::new(),
+            media_search_focused: false,
             editing_text_clip_id: None,
             marked_text_range: None,
             preview_quality: PreviewQuality::Half,
@@ -259,6 +287,9 @@ impl EditorView {
             player: VideoStreamPlayer::new(),
             audio_player: AudioStreamPlayer::new(),
             decode_seq: 0,
+            decode_applied_seq: 0,
+            decode_in_flight: false,
+            decode_dirty: false,
             timeline_scroll_x: 0.0,
             scrollbar_dragging: false,
             scrollbar_drag_start_x: 0.0,
@@ -272,7 +303,12 @@ impl EditorView {
             active_snap_guides: PreviewSnapGuides::default(),
             rotated_text_cache: HashMap::new(),
             rotated_text_seq: HashMap::new(),
+            rotated_text_applied_seq: HashMap::new(),
+            rot_text_in_flight: HashMap::new(),
+            rot_text_dirty: HashMap::new(),
             export_status: ExportStatus::Idle,
+            export_modal_open: false,
+            export_options: ExportOptions::default(),
         };
         view.ensure_playback_loop(cx);
         view
@@ -301,15 +337,35 @@ impl EditorView {
 
     fn apply_slider_ratio(&mut self, field: SliderField, ratio: f32) {
         let r = ratio.clamp(0.0, 1.0);
+        let playhead = self.state.playhead_secs;
         let Some(c) = self.state.selected_clip_mut() else {
             return;
         };
+        let is_kf_field = matches!(
+            field,
+            SliderField::Opacity | SliderField::Scale | SliderField::Rotation
+        );
+        if is_kf_field && !c.keyframes.is_empty() {
+            let (epx, epy, esc, erot, eop) = c.evaluate_at(playhead);
+            c.pos_x = epx;
+            c.pos_y = epy;
+            c.scale = esc;
+            c.rotation_deg = erot;
+            c.opacity = eop;
+        }
         match field {
-            SliderField::Opacity => c.opacity = (r * 100.0).round() as u8,
-            SliderField::Scale => c.scale = (10.0 + r * 190.0).round() as u16,
+            SliderField::Opacity => {
+                c.opacity = (r * 100.0).round() as u8;
+                c.sync_keyframe_if_animated(playhead);
+            }
+            SliderField::Scale => {
+                c.scale = (10.0 + r * 190.0).round() as u16;
+                c.sync_keyframe_if_animated(playhead);
+            }
             SliderField::Rotation => {
                 let (snapped, _) = snap_rotation_angle((r * 360.0).round(), false);
                 c.rotation_deg = snapped;
+                c.sync_keyframe_if_animated(playhead);
             }
             SliderField::Speed => {
                 let spd = ((0.25 + r * 3.75) * 4.0).round() / 4.0;
@@ -378,6 +434,18 @@ impl EditorView {
                 if let Some(ref mut t) = c.text {
                     t.anim_duration_secs = ((0.1 + r * 1.9) * 10.0).round() / 10.0;
                 }
+            }
+            SliderField::CropLeft => c.crop.left = ((r * 0.45) * 100.0).round() / 100.0,
+            SliderField::CropRight => c.crop.right = ((r * 0.45) * 100.0).round() / 100.0,
+            SliderField::CropTop => c.crop.top = ((r * 0.45) * 100.0).round() / 100.0,
+            SliderField::CropBottom => c.crop.bottom = ((r * 0.45) * 100.0).round() / 100.0,
+            SliderField::FadeIn => {
+                let max_fade = (c.duration_secs * 0.5).clamp(0.1, 5.0);
+                c.fade_in_secs = ((r * max_fade) * 10.0).round() / 10.0;
+            }
+            SliderField::FadeOut => {
+                let max_fade = (c.duration_secs * 0.5).clamp(0.1, 5.0);
+                c.fade_out_secs = ((r * max_fade) * 10.0).round() / 10.0;
             }
         }
     }
@@ -470,15 +538,19 @@ impl EditorView {
         };
 
         let ph = self.preview_quality.height();
-        let (cur_flip, cur_rot) = self.player.active_transform();
+        let (cur_flip, cur_rot, cur_crop, cur_rev) = self.player.active_transform();
         if self.player.active_clip_id() != Some(active.id)
             || self.player.active_ratio() != Some(self.state.aspect_ratio)
             || self.player.active_height() != Some(ph)
             || cur_flip != active.flip_h
             || (cur_rot - rot).abs() > 1.0
+            || cur_crop != active.crop
+            || cur_rev != active.reversed
         {
-            let offset =
-                active.source_in_secs + (self.state.playhead_secs - active.start_secs).max(0.0);
+            let dt = (self.state.playhead_secs - active.start_secs).max(0.0);
+            let spd = active.speed.clamp(0.25, 4.0);
+            let offset = active.source_in_secs + dt * spd;
+            let rev_src_dur = ((active.duration_secs - dt) * spd).max(0.1);
             self.player.start(
                 active.id,
                 path,
@@ -487,6 +559,10 @@ impl EditorView {
                 ph,
                 active.flip_h,
                 rot,
+                active.crop,
+                active.reversed,
+                active.source_in_secs,
+                rev_src_dur,
             );
         }
 
@@ -524,8 +600,14 @@ impl EditorView {
             return;
         };
 
-        let offset =
-            active.source_in_secs + (self.state.playhead_secs - active.start_secs).max(0.0);
+        let dt = (self.state.playhead_secs - active.start_secs).clamp(0.0, active.duration_secs);
+        let spd = active.speed.clamp(0.25, 4.0);
+        let offset = if active.reversed {
+            active.source_in_secs + ((active.duration_secs - dt) * spd).max(0.0)
+        } else {
+            active.source_in_secs + dt * spd
+        };
+        let rev_src_dur = ((active.duration_secs - dt) * spd).max(0.1);
         let ph = self.preview_quality.height();
         let paths_to_probe: Vec<PathBuf> = self
             .state
@@ -547,10 +629,14 @@ impl EditorView {
                 ph,
                 active.flip_h,
                 rot,
+                active.crop,
+                active.reversed,
+                active.source_in_secs,
+                rev_src_dur,
             );
         } else {
             self.player.stop();
-            self.request_single_frame(path, offset, active.flip_h, rot, cx);
+            self.request_single_frame(path, offset, active.flip_h, rot, active.crop, cx);
         }
     }
 
@@ -587,12 +673,12 @@ impl EditorView {
             }
             let lines = lines.max(1) as f32;
             let pad = td.bg_padding.clamp(2.0, 24.0);
-            let box_w = ((max_cols as f32 * font_sz * 0.62) + pad * 2.0 + 24.0)
+            let box_w = ((max_cols as f32 * font_sz * 0.56) + pad * 2.0 + 10.0)
                 .ceil()
-                .max(48.0) as u32;
-            let box_h = ((lines * font_sz * 1.35) + pad * 1.5 + 16.0)
+                .max(40.0) as u32;
+            let box_h = ((lines * font_sz * 1.30) + pad * 1.2 + 8.0)
                 .ceil()
-                .max(32.0) as u32;
+                .max(26.0) as u32;
 
             let mut hasher = DefaultHasher::new();
             td.content.hash(&mut hasher);
@@ -616,6 +702,13 @@ impl EditorView {
                 continue;
             }
 
+            if self.rot_text_in_flight.get(&tclip.id).copied().unwrap_or(false) {
+                self.rot_text_dirty.insert(tclip.id, true);
+                continue;
+            }
+            self.rot_text_in_flight.insert(tclip.id, true);
+            self.rot_text_dirty.insert(tclip.id, false);
+
             let seq = self
                 .rotated_text_seq
                 .entry(tclip.id)
@@ -630,14 +723,22 @@ impl EditorView {
             });
 
             cx.spawn(async move |this, cx| {
-                if let Some((r_img, rw, rh)) = task.await {
-                    let _ = this.update(cx, |view, cx| {
-                        if view.rotated_text_seq.get(&cid).copied() == Some(seq_val) {
+                let res = task.await;
+                let _ = this.update(cx, |view, cx| {
+                    view.rot_text_in_flight.insert(cid, false);
+                    if let Some((r_img, rw, rh)) = res {
+                        let applied = view.rotated_text_applied_seq.get(&cid).copied().unwrap_or(0);
+                        if seq_val > applied {
+                            view.rotated_text_applied_seq.insert(cid, seq_val);
                             view.rotated_text_cache.insert(cid, (sig, r_img, rw, rh));
                             cx.notify();
                         }
-                    });
-                }
+                    }
+                    if view.rot_text_dirty.get(&cid).copied().unwrap_or(false) {
+                        view.rot_text_dirty.insert(cid, false);
+                        view.sync_rotated_texts(cx);
+                    }
+                });
             })
             .detach();
         }
@@ -691,23 +792,36 @@ impl EditorView {
         offset_secs: f32,
         flip_h: bool,
         rotation_deg: f32,
+        crop: ClipCrop,
         cx: &mut Context<Self>,
     ) {
+        if self.decode_in_flight {
+            self.decode_dirty = true;
+            return;
+        }
+        self.decode_in_flight = true;
+        self.decode_dirty = false;
         self.decode_seq = self.decode_seq.wrapping_add(1);
         let seq = self.decode_seq;
         let ratio = self.state.aspect_ratio;
         let ph = self.preview_quality.height();
 
         let task = cx.background_executor().spawn(async move {
-            decode_single_frame(&path, offset_secs, ratio, ph, flip_h, rotation_deg)
+            decode_single_frame(&path, offset_secs, ratio, ph, flip_h, rotation_deg, crop)
         });
 
         cx.spawn(async move |this, cx| {
             let frame = task.await;
             let _ = this.update(cx, |view, cx| {
-                if view.decode_seq == seq && !view.state.is_playing {
+                view.decode_in_flight = false;
+                if seq > view.decode_applied_seq && !view.state.is_playing {
+                    view.decode_applied_seq = seq;
                     view.set_current_frame(frame, cx);
                     cx.notify();
+                }
+                if view.decode_dirty && !view.state.is_playing {
+                    view.decode_dirty = false;
+                    view.sync_preview_after_seek(cx);
                 }
             });
         })
@@ -923,10 +1037,49 @@ impl EditorView {
             }
         }
 
+        if self.media_search_focused {
+            match key {
+                "escape" | "enter" => {
+                    self.media_search_focused = false;
+                    cx.notify();
+                    return;
+                }
+                "backspace" => {
+                    self.media_search_query.pop();
+                    cx.notify();
+                    return;
+                }
+                _ if !ctrl => {
+                    if let Some(ref kc) = event.keystroke.key_char {
+                        self.media_search_query.push_str(kc);
+                        cx.notify();
+                    } else if key.len() == 1 {
+                        self.media_search_query.push_str(key);
+                        cx.notify();
+                    } else if key == "space" {
+                        self.media_search_query.push(' ');
+                        cx.notify();
+                    }
+                    return;
+                }
+                _ => {}
+            }
+        }
+
         match (ctrl, shift, key) {
             (false, false, "space") => {
                 self.state.toggle_play();
                 self.sync_preview_after_seek(cx);
+                cx.notify();
+            }
+            (true, false, "c") => {
+                self.state.copy_selected_clip();
+                cx.notify();
+            }
+            (true, false, "v") => {
+                if self.state.paste_clip_at_playhead().is_some() {
+                    self.sync_preview_after_seek(cx);
+                }
                 cx.notify();
             }
             (true, false, "z") => {
@@ -1046,12 +1199,14 @@ impl EditorView {
             .next()
             .unwrap_or_else(|| PathBuf::from("."));
 
-        let rx = cx.prompt_for_new_path(&default_dir, Some("opencut_export.mp4"));
+        let ext = self.export_options.format.extension();
+        let default_name = format!("opencut_export.{}", ext);
+        let rx = cx.prompt_for_new_path(&default_dir, Some(&default_name));
 
         cx.spawn(async move |this, cx| {
             if let Ok(Ok(Some(mut path))) = rx.await {
                 if path.extension().is_none() {
-                    path.set_extension("mp4");
+                    path.set_extension(ext);
                 }
 
                 let _ = this.update(cx, |view, cx| {
@@ -1059,8 +1214,15 @@ impl EditorView {
                     let tracks = view.state.tracks.clone();
                     let ratio = view.state.aspect_ratio;
                     let base_height = view.state.base_height;
-                    let handle =
-                        start_export_timeline(clips, tracks, ratio, base_height, path.clone());
+                    let options = view.export_options;
+                    let handle = start_export_timeline(
+                        clips,
+                        tracks,
+                        ratio,
+                        base_height,
+                        options,
+                        path.clone(),
+                    );
                     view.state.status_message = "Exporting... 0%".into();
                     view.export_status = ExportStatus::Exporting {
                         handle,
@@ -1071,6 +1233,333 @@ impl EditorView {
             }
         })
         .detach();
+    }
+
+    fn render_export_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let opts = self.export_options;
+        let audio_only = opts.format.is_audio_only();
+
+        div()
+            .id("export-modal-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(gpui::rgba(0x00000099))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(420.))
+                    .p_5()
+                    .rounded_lg()
+                    .bg(Theme::bg_panel())
+                    .border_1()
+                    .border_color(Theme::border())
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_3p5()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(Theme::text_primary())
+                                    .child("Export Settings"),
+                            )
+                            .child(
+                                div()
+                                    .id("exp-close")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .text_color(Theme::text_muted())
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.export_modal_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("✕"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(Theme::text_secondary())
+                                    .child("Format"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1p5()
+                                    .children(ExportFormat::all().iter().copied().map(|fmt| {
+                                        let active = opts.format == fmt;
+                                        div()
+                                            .id(SharedString::from(format!("exp-fmt-{:?}", fmt)))
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(if active { Theme::accent() } else { Theme::bg_surface() })
+                                            .border_1()
+                                            .border_color(if active { Theme::accent() } else { Theme::border() })
+                                            .text_xs()
+                                            .text_color(Theme::text_primary())
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.export_options.format = fmt;
+                                                cx.notify();
+                                            }))
+                                            .child(fmt.label())
+                                    })),
+                            ),
+                    )
+                    .when(!audio_only, |el| {
+                        el.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(Theme::text_secondary())
+                                        .child("Resolution"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_1p5()
+                                        .children(
+                                            [
+                                                (480_u32, "480p"),
+                                                (720, "720p"),
+                                                (1080, "1080p"),
+                                                (1440, "2K"),
+                                                (2160, "4K"),
+                                            ]
+                                            .into_iter()
+                                            .map(|(h, lbl)| {
+                                                let active = opts.height == h;
+                                                div()
+                                                    .id(SharedString::from(format!("exp-res-{}", h)))
+                                                    .px_2p5()
+                                                    .py_1()
+                                                    .rounded_sm()
+                                                    .bg(if active { Theme::accent() } else { Theme::bg_surface() })
+                                                    .border_1()
+                                                    .border_color(if active { Theme::accent() } else { Theme::border() })
+                                                    .text_xs()
+                                                    .text_color(Theme::text_primary())
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.export_options.height = h;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(lbl)
+                                            }),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(Theme::text_secondary())
+                                        .child("Frame Rate (FPS)"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_1p5()
+                                        .children([24_u32, 25, 30, 50, 60].into_iter().map(|fps| {
+                                            let active = opts.fps == fps;
+                                            div()
+                                                .id(SharedString::from(format!("exp-fps-{}", fps)))
+                                                .px_2p5()
+                                                .py_1()
+                                                .rounded_sm()
+                                                .bg(if active { Theme::accent() } else { Theme::bg_surface() })
+                                                .border_1()
+                                                .border_color(if active { Theme::accent() } else { Theme::border() })
+                                                .text_xs()
+                                                .text_color(Theme::text_primary())
+                                                .cursor_pointer()
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.export_options.fps = fps;
+                                                    cx.notify();
+                                                }))
+                                                .child(format!("{} fps", fps))
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(Theme::text_secondary())
+                                        .child("Quality"),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_1p5()
+                                        .children(
+                                            [
+                                                (18_u8, "High (CRF 18)"),
+                                                (22, "Standard (CRF 22)"),
+                                                (26, "Compact (CRF 26)"),
+                                            ]
+                                            .into_iter()
+                                            .map(|(crf, lbl)| {
+                                                let active = opts.crf == crf;
+                                                div()
+                                                    .id(SharedString::from(format!("exp-crf-{}", crf)))
+                                                    .px_2p5()
+                                                    .py_1()
+                                                    .rounded_sm()
+                                                    .bg(if active { Theme::accent() } else { Theme::bg_surface() })
+                                                    .border_1()
+                                                    .border_color(if active { Theme::accent() } else { Theme::border() })
+                                                    .text_xs()
+                                                    .text_color(Theme::text_primary())
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.export_options.crf = crf;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(lbl)
+                                            }),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(Theme::text_secondary())
+                                        .child("Hardware Acceleration"),
+                                )
+                                .child({
+                                    let is_hevc = opts.format == ExportFormat::Mp4Hevc;
+                                    let detected = detect_gpu_encoder(is_hevc);
+                                    let gpu_label = match detected {
+                                        Some(enc) => format!("GPU ({})", enc),
+                                        None => "GPU (Auto / Fallback CPU)".to_string(),
+                                    };
+                                    div()
+                                        .flex()
+                                        .gap_1p5()
+                                        .children(
+                                            [
+                                                (true, gpu_label),
+                                                (false, "CPU (x264 / x265)".to_string()),
+                                            ]
+                                            .into_iter()
+                                            .map(|(use_gpu, lbl)| {
+                                                let active = opts.use_gpu == use_gpu;
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "exp-gpu-{}",
+                                                        use_gpu
+                                                    )))
+                                                    .px_2p5()
+                                                    .py_1()
+                                                    .rounded_sm()
+                                                    .bg(if active {
+                                                        Theme::accent()
+                                                    } else {
+                                                        Theme::bg_surface()
+                                                    })
+                                                    .border_1()
+                                                    .border_color(if active {
+                                                        Theme::accent()
+                                                    } else {
+                                                        Theme::border()
+                                                    })
+                                                    .text_xs()
+                                                    .text_color(Theme::text_primary())
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.export_options.use_gpu = use_gpu;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(lbl)
+                                            }),
+                                        )
+                                }),
+                        )
+                    })
+                    .child(
+                        div()
+                            .pt_2()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("exp-cancel")
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(Theme::bg_surface())
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .text_xs()
+                                    .text_color(Theme::text_secondary())
+                                    .cursor_pointer()
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.export_modal_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            )
+                            .child(
+                                div()
+                                    .id("exp-start")
+                                    .px_4()
+                                    .py_1p5()
+                                    .rounded_md()
+                                    .bg(Theme::accent())
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(Theme::text_primary())
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(rgb(Theme::ACCENT_HOVER)))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.export_modal_open = false;
+                                        this.prompt_export_video(cx);
+                                    }))
+                                    .child("Choose File & Export"),
+                            ),
+                    ),
+            )
     }
 
     fn render_export_banner(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -1228,9 +1717,9 @@ impl EditorView {
         let project_name = self.state.project_name.clone();
 
         div()
-            .h(px(44.))
+            .h(px(36.))
             .w_full()
-            .px_4()
+            .px_3()
             .flex()
             .items_center()
             .justify_between()
@@ -1241,56 +1730,54 @@ impl EditorView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_2p5()
-                    .child(
-                        self.icon_button("btn-home-hub", "🏠", "Back to Projects", false, true)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.is_playing = false;
-                                this.player.stop();
-                                this.audio_player.stop();
-                                this.recent_projects = load_recent_projects();
-                                this.screen = AppScreen::ProjectHub;
-                                cx.notify();
-                            })),
-                    )
+                    .gap_2()
                     .child(
                         div()
-                            .px_2()
+                            .id("btn-top-menu")
+                            .px_2p5()
                             .py_1()
-                            .rounded_md()
-                            .bg(Theme::accent())
+                            .rounded_sm()
+                            .bg(if self.menu_open {
+                                Theme::bg_hover()
+                            } else {
+                                Theme::bg_surface()
+                            })
+                            .border_1()
+                            .border_color(if self.menu_open {
+                                Theme::accent()
+                            } else {
+                                Theme::border()
+                            })
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
                             .text_xs()
-                            .font_weight(gpui::FontWeight::BOLD)
+                            .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(Theme::text_primary())
-                            .child("OpenCut"),
+                            .cursor_pointer()
+                            .hover(|s| s.bg(Theme::bg_hover()))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.menu_open = !this.menu_open;
+                                cx.notify();
+                            }))
+                            .child("≡ Menu"),
                     )
+                    .child(div().w(px(1.)).h(px(16.)).bg(Theme::border()))
                     .child(
                         div()
-                            .text_sm()
+                            .text_xs()
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(Theme::text_primary())
                             .child(project_name),
                     )
                     .child(
-                        self.icon_button("btn-open-proj", "📂", "Open Project (.opencut)", false, true)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.prompt_open_project(cx);
-                            })),
-                    )
-                    .child(
-                        self.icon_button("btn-save-proj", "💾", "Save Project (Ctrl+S)", false, true)
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.save_project(cx);
-                            })),
-                    )
-                    .child(
                         div()
-                            .px_2()
+                            .px_1p5()
                             .py_0p5()
                             .rounded_sm()
                             .bg(Theme::bg_surface())
                             .text_xs()
-                            .text_color(Theme::text_secondary())
+                            .text_color(Theme::text_muted())
                             .child(status),
                     ),
             )
@@ -1320,15 +1807,108 @@ impl EditorView {
                             if matches!(self.export_status, ExportStatus::Exporting { .. }) {
                                 "Exporting..."
                             } else {
-                                "⬆ Export"
+                                "Export"
                             },
                             true,
                         )
-                        .tooltip(build_tooltip("Export Video (MP4)"))
+                        .tooltip(build_tooltip("Export Video / Audio"))
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.prompt_export_video(cx);
+                            if !matches!(this.export_status, ExportStatus::Exporting { .. }) {
+                                this.export_options.height = this.state.base_height.max(480);
+                                this.export_options.fps = this.state.fps.clamp(24, 60);
+                                this.export_modal_open = true;
+                                this.menu_open = false;
+                                cx.notify();
+                            }
                         })),
                     ),
+            )
+    }
+
+    fn render_menu_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let item = |id: &'static str, label: &'static str, shortcut: &'static str| {
+            div()
+                .id(id)
+                .w_full()
+                .px_3()
+                .py_1p5()
+                .rounded_sm()
+                .flex()
+                .items_center()
+                .justify_between()
+                .text_xs()
+                .text_color(Theme::text_primary())
+                .cursor_pointer()
+                .hover(|s| s.bg(Theme::bg_hover()))
+                .child(label)
+                .child(div().text_xs().text_color(Theme::text_muted()).child(shortcut))
+        };
+
+        div()
+            .id("top-menu-backdrop")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.menu_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("top-menu-dropdown")
+                    .absolute()
+                    .top(px(38.))
+                    .left(px(12.))
+                    .w(px(230.))
+                    .p_1p5()
+                    .rounded_md()
+                    .bg(Theme::bg_panel())
+                    .border_1()
+                    .border_color(Theme::border())
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+                    .child(item("menu-home", "Back to Projects", "").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.menu_open = false;
+                            this.state.is_playing = false;
+                            this.player.stop();
+                            this.audio_player.stop();
+                            this.recent_projects = load_recent_projects();
+                            this.screen = AppScreen::ProjectHub;
+                            cx.notify();
+                        },
+                    )))
+                    .child(div().my_1().h(px(1.)).w_full().bg(Theme::border()))
+                    .child(item("menu-open", "Open Project...", "").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.menu_open = false;
+                            this.prompt_open_project(cx);
+                        },
+                    )))
+                    .child(item("menu-save", "Save Project", "Ctrl+S").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.menu_open = false;
+                            this.save_project(cx);
+                        },
+                    )))
+                    .child(div().my_1().h(px(1.)).w_full().bg(Theme::border()))
+                    .child(item("menu-import", "Import Media...", "").on_click(cx.listener(
+                        |this, _, _, cx| {
+                            this.menu_open = false;
+                            this.prompt_import_media(cx);
+                        },
+                    )))
+                    .child(item("menu-import-font", "Import Font (.ttf/.otf)...", "").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.menu_open = false;
+                            this.prompt_import_font(cx);
+                        }),
+                    )),
             )
     }
 
@@ -1417,20 +1997,25 @@ impl EditorView {
     }
 
     fn render_media_pool(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let effective_filter = match self.media_panel_tab {
+            MediaPanelTab::Media => self.media_filter,
+            MediaPanelTab::Text => None,
+        };
         let assets: Vec<_> = self
             .state
-            .filtered_assets("", self.media_filter)
+            .filtered_assets(&self.media_search_query, effective_filter)
             .into_iter()
             .cloned()
             .collect();
         let total_assets = self.state.assets.len();
         let selected_asset_id = self.state.selected_asset_id;
         let active_filter = self.media_filter;
+        let active_tab = self.media_panel_tab;
         let is_empty = assets.is_empty();
 
         div()
             .id("media-pool-dropzone")
-            .w(px(280.))
+            .w(px(272.))
             .h_full()
             .flex()
             .flex_col()
@@ -1448,101 +2033,245 @@ impl EditorView {
                     .import_paths_with_probe(paths.paths().to_vec(), probe_duration_secs);
                 cx.notify();
             }))
+            // CapCut-style top tab strip: Media | Text
             .child(
                 div()
-                    .h(px(36.))
-                    .px_3()
+                    .h(px(34.))
+                    .px_2()
                     .flex()
                     .items_center()
-                    .justify_between()
+                    .gap_1()
                     .border_b_1()
                     .border_color(Theme::border())
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(Theme::text_secondary())
-                            .child("MEDIA POOL"),
-                    )
-                    .child(
-                        div()
-                            .id("media-add-btn")
-                            .px_2()
-                            .py_0p5()
-                            .rounded_sm()
-                            .bg(Theme::accent())
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(Theme::text_primary())
-                            .cursor_pointer()
-                            .hover(|s| s.bg(rgb(Theme::ACCENT_HOVER)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.prompt_import_media(cx);
-                            }))
-                            .child("+ Import"),
+                    .children(
+                        [
+                            (MediaPanelTab::Media, "Media"),
+                            (MediaPanelTab::Text, "Text"),
+                        ]
+                        .into_iter()
+                        .map(|(tab, label)| {
+                            let is_active = active_tab == tab;
+                            div()
+                                .id(SharedString::from(format!("mp-tab-{}", label)))
+                                .px_2p5()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(if is_active {
+                                    Theme::bg_surface()
+                                } else {
+                                    Theme::bg_panel()
+                                })
+                                .border_b_2()
+                                .border_color(if is_active {
+                                    Theme::accent()
+                                } else {
+                                    Theme::bg_panel()
+                                })
+                                .text_xs()
+                                .font_weight(if is_active {
+                                    gpui::FontWeight::SEMIBOLD
+                                } else {
+                                    gpui::FontWeight::MEDIUM
+                                })
+                                .text_color(if is_active {
+                                    Theme::text_primary()
+                                } else {
+                                    Theme::text_secondary()
+                                })
+                                .cursor_pointer()
+                                .hover(|s| s.bg(Theme::bg_hover()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.media_panel_tab = tab;
+                                    cx.notify();
+                                }))
+                                .child(label)
+                        }),
                     ),
             )
-            .child(
-                div().p_2().child(
+            .when(active_tab == MediaPanelTab::Text, |el| {
+                el.child(
                     div()
-                        .id("media-drop-box")
-                        .p_3()
-                        .rounded_md()
-                        .bg(Theme::bg_surface())
-                        .border_1()
-                        .border_dashed()
-                        .border_color(Theme::border())
+                        .flex_1()
+                        .p_2p5()
                         .flex()
                         .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap_1p5()
-                        .cursor_pointer()
-                        .hover(|s| s.border_color(Theme::accent()).bg(Theme::bg_hover()))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.prompt_import_media(cx);
-                        }))
+                        .gap_3()
                         .child(
                             div()
+                                .id("mp-add-default-text")
+                                .w_full()
+                                .py_2()
+                                .rounded_md()
+                                .bg(Theme::accent())
                                 .text_xs()
                                 .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_center()
                                 .text_color(Theme::text_primary())
-                                .child("Drop files here or click to browse"),
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(Theme::ACCENT_HOVER)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.add_text_clip("Text", 4.0);
+                                    this.sync_preview_after_seek(cx);
+                                    cx.notify();
+                                }))
+                                .child("+ Add Default Text"),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(Theme::text_muted())
-                                .child("Video (MP4, MOV) • Image (PNG, JPG) • Audio (MP3, WAV)"),
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_secondary())
+                                .child("Text Presets"),
+                        )
+                        .child(
+                            div()
+                                .grid()
+                                .grid_cols(2)
+                                .gap_1p5()
+                                .children(TextPreset::all().iter().copied().map(|preset| {
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "mp-preset-{:?}",
+                                            preset
+                                        )))
+                                        .p_2()
+                                        .rounded_md()
+                                        .bg(Theme::bg_surface())
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .text_xs()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_center()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .hover(|s| {
+                                            s.border_color(Theme::accent()).bg(Theme::bg_hover())
+                                        })
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(cid) =
+                                                this.state.add_text_clip(preset.label(), 4.0)
+                                            {
+                                                if let Some(c) =
+                                                    this.state.clips.iter_mut().find(|c| c.id == cid)
+                                                {
+                                                    if let Some(ref mut td) = c.text {
+                                                        td.apply_preset(preset);
+                                                    }
+                                                }
+                                                this.sync_preview_after_seek(cx);
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .child(preset.label())
+                                })),
                         ),
-                ),
-            )
-            .child(
-                div()
-                    .px_2()
-                    .pb_2()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_1()
-                    .child(
+                )
+            })
+            .when(active_tab != MediaPanelTab::Text, |el| {
+                el.child(
+                    div()
+                        .p_2()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .id("media-search-box")
+                                .flex_1()
+                                .h(px(26.))
+                                .px_2()
+                                .rounded_sm()
+                                .bg(Theme::bg_surface())
+                                .border_1()
+                                .border_color(if self.media_search_focused {
+                                    Theme::accent()
+                                } else {
+                                    Theme::border()
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .cursor_text()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.media_search_focused = true;
+                                    this.editing_text_clip_id = None;
+                                    cx.notify();
+                                }))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(if self.media_search_query.is_empty() {
+                                            Theme::text_muted()
+                                        } else {
+                                            Theme::text_primary()
+                                        })
+                                        .child(if self.media_search_query.is_empty() {
+                                            if self.media_search_focused {
+                                                "Type to search...".to_string()
+                                            } else {
+                                                "Search...".to_string()
+                                            }
+                                        } else {
+                                            self.media_search_query.clone()
+                                        }),
+                                )
+                                .when(!self.media_search_query.is_empty(), |el| {
+                                    el.child(
+                                        div()
+                                            .id("media-search-clear")
+                                            .px_1()
+                                            .text_xs()
+                                            .text_color(Theme::text_muted())
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.media_search_query.clear();
+                                                cx.notify();
+                                            }))
+                                            .child("✕"),
+                                    )
+                                }),
+                        )
+                        .child(
+                            div()
+                                .id("media-add-btn")
+                                .h(px(26.))
+                                .px_2p5()
+                                .rounded_sm()
+                                .bg(Theme::accent())
+                                .flex()
+                                .items_center()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(Theme::text_primary())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(Theme::ACCENT_HOVER)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.prompt_import_media(cx);
+                                }))
+                                .child("+ Import"),
+                        ),
+                )
+                .when(active_tab == MediaPanelTab::Media, |el| {
+                    el.child(
                         div()
+                            .px_2()
+                            .pb_1p5()
                             .flex()
                             .items_center()
                             .gap_1()
                             .children(
                                 [
                                     (None, "All"),
-                                    (Some(TrackKind::Video), "Vid"),
-                                    (Some(TrackKind::Overlay), "Img"),
-                                    (Some(TrackKind::Audio), "Aud"),
+                                    (Some(TrackKind::Video), "Video"),
+                                    (Some(TrackKind::Overlay), "Image"),
+                                    (Some(TrackKind::Audio), "Audio"),
                                 ]
                                 .into_iter()
                                 .map(|(filter_val, label)| {
                                     let is_active = active_filter == filter_val;
                                     div()
                                         .id(SharedString::from(format!("mf-{}", label)))
-                                        .px_1p5()
+                                        .px_2()
                                         .py_0p5()
                                         .rounded_sm()
                                         .bg(if is_active {
@@ -1566,27 +2295,8 @@ impl EditorView {
                                 }),
                             ),
                     )
-                    .child(
-                        div()
-                            .id("mp-add-text")
-                            .px_1p5()
-                            .py_0p5()
-                            .rounded_sm()
-                            .bg(Theme::bg_surface())
-                            .border_1()
-                            .border_color(Theme::border())
-                            .text_xs()
-                            .text_color(Theme::text_primary())
-                            .cursor_pointer()
-                            .hover(|s| s.border_color(Theme::accent()).bg(Theme::bg_hover()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.state.add_text_clip("Text", 4.0);
-                                cx.notify();
-                            }))
-                            .child("+ Text"),
-                    ),
-            )
-            .child(if is_empty {
+                })
+                .child(if is_empty {
                 div()
                     .flex_1()
                     .px_4()
@@ -1744,6 +2454,7 @@ impl EditorView {
                             )
                     }))
             })
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1918,18 +2629,22 @@ impl EditorView {
                         cx.listener(move |this, event: &MouseDownEvent, _, cx| {
                             cx.stop_propagation();
                             this.state.push_undo();
+                            let mx = f32::from(event.position.x);
+                            let my = f32::from(event.position.y);
+                            let exact_cx = mx - (rh.0 - rel_cx);
+                            let exact_cy = my - (rh.1 - rel_cy);
                             this.preview_text_drag = Some(PreviewTextDragState {
                                 clip_id,
                                 kind: PreviewTransformKind::Rotate,
-                                start_mouse_x: f32::from(event.position.x),
-                                start_mouse_y: f32::from(event.position.y),
+                                start_mouse_x: mx,
+                                start_mouse_y: my,
                                 initial_pos_x: init_px,
                                 initial_pos_y: init_py,
                                 initial_scale: init_scale,
                                 initial_font_size: init_font,
                                 initial_rot: init_rot,
-                                center_x,
-                                center_y,
+                                center_x: exact_cx,
+                                center_y: exact_cy,
                                 preview_scale,
                                 moved: false,
                             });
@@ -2021,7 +2736,6 @@ impl EditorView {
             .cloned()
             .cloned()
             .collect();
-        let active_video = self.state.active_video_clip().cloned();
         let active_count = active_clips.len();
         let timecode = format_timecode(self.state.playhead_secs);
         let total_timecode = format_timecode(self.state.total_duration_secs);
@@ -2030,11 +2744,11 @@ impl EditorView {
         let win_w = f32::from(window.viewport_size().width);
         let win_h = f32::from(window.viewport_size().height);
         let (avail_w, avail_h) = if self.preview_fullscreen {
-            ((win_w - 32.0).max(240.0), (win_h - 48.0 - 32.0).max(180.0))
+            ((win_w - 48.0).max(240.0), (win_h - 48.0 - 48.0).max(180.0))
         } else {
             (
-                (win_w - 280.0 - INSPECTOR_W - 40.0).max(200.0),
-                (win_h - 44.0 - 234.0 - 48.0 - 32.0).max(180.0),
+                (win_w - 272.0 - INSPECTOR_W - 64.0).max(200.0),
+                (win_h - 36.0 - 234.0 - 48.0 - 56.0).max(180.0),
             )
         };
         let target_ratio = self.state.aspect_ratio.ratio_f32();
@@ -2050,12 +2764,12 @@ impl EditorView {
         let pv_center_x = if self.preview_fullscreen {
             win_w * 0.5
         } else {
-            280.0 + (win_w - 280.0 - INSPECTOR_W) * 0.5
+            272.0 + (win_w - 272.0 - INSPECTOR_W) * 0.5
         };
         let pv_center_y = if self.preview_fullscreen {
             (win_h - 48.0) * 0.5
         } else {
-            44.0 + (win_h - 44.0 - 234.0 - 48.0) * 0.5
+            36.0 + (win_h - 36.0 - 234.0 - 48.0) * 0.5
         };
 
         let mut selected_handle_overlay: Option<gpui::AnyElement> = None;
@@ -2545,32 +3259,6 @@ impl EditorView {
                         this.preview_zoom = (this.preview_zoom * factor).clamp(0.35, 2.5);
                         cx.notify();
                     }))
-                    .when_some(active_video, |el, clip| {
-                        el.child(
-                            div()
-                                .absolute()
-                                .top_2()
-                                .left_3()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_sm()
-                                .bg(Theme::bg_panel())
-                                .border_1()
-                                .border_color(Theme::border())
-                                .text_xs()
-                                .text_color(if is_playing {
-                                    rgb(Theme::SUCCESS)
-                                } else {
-                                    Theme::text_secondary()
-                                })
-                                .child(format!(
-                                    "{} • {} • {}",
-                                    if is_playing { "PLAYING" } else { "PAUSED" },
-                                    clip.name,
-                                    timecode
-                                )),
-                        )
-                    })
                     .child(
                         div()
                             .w(px(preview_w))
@@ -3101,34 +3789,42 @@ impl EditorView {
                                     )),
                             ),
                     )
-                    .child(self.inspector_slider(
-                        "Opacity",
-                        format!("{}%", clip.opacity),
-                        clip.opacity as f32 / 100.0,
-                        Theme::accent(),
-                        SliderField::Opacity,
-                        cx,
-                    ))
+                    .child({
+                        let (_, _, _, _, eop) = clip.evaluate_at(self.state.playhead_secs);
+                        self.inspector_slider(
+                            "Opacity",
+                            format!("{}%", eop),
+                            eop as f32 / 100.0,
+                            Theme::accent(),
+                            SliderField::Opacity,
+                            cx,
+                        )
+                    })
                     .when(clip.track != TrackKind::Text, |el| {
+                        let (_, _, esc, _, _) = clip.evaluate_at(self.state.playhead_secs);
                         el.child(self.inspector_slider(
                             "Scale",
-                            format!("{}%", clip.scale),
-                            ((clip.scale as f32 - 10.0) / 190.0).clamp(0.0, 1.0),
+                            format!("{}%", esc),
+                            ((esc as f32 - 10.0) / 190.0).clamp(0.0, 1.0),
                             Theme::accent(),
                             SliderField::Scale,
                             cx,
                         ))
                     })
-                    .child(self.inspector_slider(
-                        "Rotate",
-                        format!("{:.0}°", clip.rotation_deg),
-                        (clip.rotation_deg.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0),
-                        Theme::accent(),
-                        SliderField::Rotation,
-                        cx,
-                    ))
+                    .child({
+                        let (_, _, _, erot, _) = clip.evaluate_at(self.state.playhead_secs);
+                        self.inspector_slider(
+                            "Rotate",
+                            format!("{:.0}°", erot),
+                            (erot.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0),
+                            Theme::accent(),
+                            SliderField::Rotation,
+                            cx,
+                        )
+                    })
                     .when(clip.track.is_visual(), |el| {
-                        let cur_rot = clip.rotation_deg.rem_euclid(360.0);
+                        let (_, _, _, erot, _) = clip.evaluate_at(self.state.playhead_secs);
+                        let cur_rot = erot.rem_euclid(360.0);
                         let presets: [(&str, f32, bool); 5] = [
                             ("-90°", -90.0, true),
                             ("0°", 0.0, false),
@@ -3178,14 +3874,26 @@ impl EditorView {
                                         .child(lbl)
                                         .on_click(cx.listener(move |this, _, _, cx| {
                                             this.state.push_undo();
+                                            let playhead = this.state.playhead_secs;
                                             if let Some(c) = this.state.selected_clip_mut() {
+                                                if !c.keyframes.is_empty() {
+                                                    let (epx, epy, esc, erot, eop) =
+                                                        c.evaluate_at(playhead);
+                                                    c.pos_x = epx;
+                                                    c.pos_y = epy;
+                                                    c.scale = esc;
+                                                    c.rotation_deg = erot;
+                                                    c.opacity = eop;
+                                                }
                                                 c.rotation_deg = if is_rel {
                                                     (c.rotation_deg + val).rem_euclid(360.0)
                                                 } else {
                                                     val
                                                 };
+                                                let deg = c.rotation_deg;
+                                                c.sync_keyframe_if_animated(playhead);
                                                 this.state.status_message =
-                                                    format!("Angle: {:.0}°", c.rotation_deg);
+                                                    format!("Angle: {:.0}°", deg);
                                             }
                                             this.sync_preview_after_seek(cx);
                                             cx.notify();
@@ -3330,7 +4038,9 @@ impl EditorView {
                                         .text_color(Theme::text_primary())
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            this.state.toggle_reverse_selected();
+                                            if this.state.toggle_reverse_selected() {
+                                                this.sync_preview_after_seek(cx);
+                                            }
                                             cx.notify();
                                         }))
                                         .child("⟲ Reverse"),
@@ -3357,6 +4067,7 @@ impl EditorView {
                             ),
                     )
                     .when(clip.track.is_audible(), |el| {
+                        let max_fade = (clip.duration_secs * 0.5).clamp(0.1, 5.0);
                         el.child(self.inspector_slider(
                             "Volume",
                             format!("{}%", clip.volume),
@@ -3365,7 +4076,98 @@ impl EditorView {
                             SliderField::Volume,
                             cx,
                         ))
+                        .child(self.inspector_slider(
+                            "Fade In",
+                            format!("{:.1}s", clip.fade_in_secs),
+                            (clip.fade_in_secs / max_fade).clamp(0.0, 1.0),
+                            Theme::accent(),
+                            SliderField::FadeIn,
+                            cx,
+                        ))
+                        .child(self.inspector_slider(
+                            "Fade Out",
+                            format!("{:.1}s", clip.fade_out_secs),
+                            (clip.fade_out_secs / max_fade).clamp(0.0, 1.0),
+                            Theme::accent(),
+                            SliderField::FadeOut,
+                            cx,
+                        ))
                     })
+                    .when(
+                        clip.track == TrackKind::Video || clip.track == TrackKind::Overlay,
+                        |el| {
+                            let has_crop = clip.crop.left > 0.001
+                                || clip.crop.right > 0.001
+                                || clip.crop.top > 0.001
+                                || clip.crop.bottom > 0.001;
+                            el.child(div().h(px(1.)).w_full().bg(Theme::border()))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(Theme::text_secondary())
+                                                .child("CROP"),
+                                        )
+                                        .when(has_crop, |el| {
+                                            el.child(
+                                                div()
+                                                    .id("ins-reset-crop")
+                                                    .px_1p5()
+                                                    .py_0p5()
+                                                    .rounded_sm()
+                                                    .bg(Theme::bg_surface())
+                                                    .text_xs()
+                                                    .text_color(Theme::text_muted())
+                                                    .cursor_pointer()
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        if this.state.reset_crop_selected() {
+                                                            this.sync_preview_after_seek(cx);
+                                                        }
+                                                        cx.notify();
+                                                    }))
+                                                    .child("Reset"),
+                                            )
+                                        }),
+                                )
+                                .child(self.inspector_slider(
+                                    "Left",
+                                    format!("{}%", (clip.crop.left * 100.0).round() as u32),
+                                    (clip.crop.left / 0.45).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::CropLeft,
+                                    cx,
+                                ))
+                                .child(self.inspector_slider(
+                                    "Right",
+                                    format!("{}%", (clip.crop.right * 100.0).round() as u32),
+                                    (clip.crop.right / 0.45).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::CropRight,
+                                    cx,
+                                ))
+                                .child(self.inspector_slider(
+                                    "Top",
+                                    format!("{}%", (clip.crop.top * 100.0).round() as u32),
+                                    (clip.crop.top / 0.45).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::CropTop,
+                                    cx,
+                                ))
+                                .child(self.inspector_slider(
+                                    "Bottom",
+                                    format!("{}%", (clip.crop.bottom * 100.0).round() as u32),
+                                    (clip.crop.bottom / 0.45).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::CropBottom,
+                                    cx,
+                                ))
+                        },
+                    )
                     .when(clip.track == TrackKind::Text, |el| {
                         let td = clip.text.clone().unwrap_or_default();
                         let col_r = ((td.color_hex >> 16) & 0xff) as u8;
@@ -5013,6 +5815,31 @@ impl Render for EditorView {
                     let slider_left = f32::from(window.viewport_size().width) - 62.0 - SLIDER_W;
                     let r = (f32::from(event.position.x) - slider_left) / SLIDER_W;
                     this.apply_slider_ratio(field, r);
+                    if matches!(
+                        field,
+                        SliderField::Rotation
+                            | SliderField::FontSize
+                            | SliderField::FontWeight
+                            | SliderField::ColorR
+                            | SliderField::ColorG
+                            | SliderField::ColorB
+                            | SliderField::StrokeWidth
+                            | SliderField::ShadowOffset
+                            | SliderField::BgPadding
+                    ) {
+                        let now = Instant::now();
+                        let due = this
+                            .last_rotate_sync
+                            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(35));
+                        if due {
+                            this.last_rotate_sync = Some(now);
+                            if field == SliderField::Rotation {
+                                this.sync_preview_after_seek(cx);
+                            } else {
+                                this.sync_rotated_texts(cx);
+                            }
+                        }
+                    }
                     cx.notify();
                     return;
                 }
@@ -5041,7 +5868,16 @@ impl Render for EditorView {
                     let (half_w, half_h) = this.clip_canvas_half_extents(pdrag.clip_id);
                     let mut next_guides = PreviewSnapGuides::default();
 
+                    let playhead = this.state.playhead_secs;
                     if let Some(c) = this.state.clips.iter_mut().find(|c| c.id == pdrag.clip_id) {
+                        if !c.keyframes.is_empty() {
+                            let (epx, epy, esc, erot, eop) = c.evaluate_at(playhead);
+                            c.pos_x = epx;
+                            c.pos_y = epy;
+                            c.scale = esc;
+                            c.rotation_deg = erot;
+                            c.opacity = eop;
+                        }
                         match pdrag.kind {
                             PreviewTransformKind::Move => {
                                 let mut nx = pdrag.initial_pos_x + dx * inv;
@@ -5103,16 +5939,20 @@ impl Render for EditorView {
                                 .sqrt()
                                 .max(6.0);
                                 let factor = (d_cur / d_init).clamp(0.2, 4.0);
-                                if c.track == TrackKind::Text {
+                                if c.track == TrackKind::Text && c.keyframes.is_empty() {
                                     if let Some(ref mut t) = c.text {
                                         t.font_size =
                                             (pdrag.initial_font_size * factor).clamp(12.0, 140.0);
                                     }
+                                    rotate_sync_needed = true;
                                 } else {
                                     c.scale = ((pdrag.initial_scale as f32) * factor)
                                         .round()
                                         .clamp(10.0, 200.0)
                                         as u16;
+                                    if c.track == TrackKind::Text {
+                                        rotate_sync_needed = true;
+                                    }
                                 }
                             }
                             PreviewTransformKind::Rotate => {
@@ -5134,13 +5974,14 @@ impl Render for EditorView {
                                     c.track == TrackKind::Video || c.track == TrackKind::Text;
                             }
                         }
+                        c.sync_keyframe_if_animated(playhead);
                     }
                     this.active_snap_guides = next_guides;
                     if rotate_sync_needed {
                         let now = Instant::now();
                         let due = this
                             .last_rotate_sync
-                            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(60));
+                            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(35));
                         if due {
                             this.last_rotate_sync = Some(now);
                             this.sync_preview_after_seek(cx);
@@ -5200,12 +6041,37 @@ impl Render for EditorView {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     let mut changed = false;
-                    if this.slider_drag.take().is_some() {
+                    if let Some(sf) = this.slider_drag.take() {
+                        if matches!(
+                            sf,
+                            SliderField::CropLeft
+                                | SliderField::CropRight
+                                | SliderField::CropTop
+                                | SliderField::CropBottom
+                                | SliderField::Rotation
+                                | SliderField::FontSize
+                                | SliderField::FontWeight
+                                | SliderField::ColorR
+                                | SliderField::ColorG
+                                | SliderField::ColorB
+                                | SliderField::StrokeWidth
+                                | SliderField::ShadowOffset
+                                | SliderField::BgPadding
+                                | SliderField::Volume
+                                | SliderField::FadeIn
+                                | SliderField::FadeOut
+                                | SliderField::Speed
+                        ) {
+                            this.sync_preview_after_seek(cx);
+                        }
                         changed = true;
                     }
                     if let Some(pdrag) = this.preview_text_drag.take() {
                         this.active_snap_guides = PreviewSnapGuides::default();
-                        if matches!(pdrag.kind, PreviewTransformKind::Rotate) {
+                        if matches!(
+                            pdrag.kind,
+                            PreviewTransformKind::Rotate | PreviewTransformKind::ResizeCorner
+                        ) {
                             this.sync_preview_after_seek(cx);
                         }
                         changed = true;
@@ -5245,6 +6111,12 @@ impl Render for EditorView {
             })
             .when(self.preview_fullscreen, |el| {
                 el.child(self.render_preview_panel(window, cx))
+            })
+            .when(self.export_modal_open, |el| {
+                el.child(self.render_export_modal(cx))
+            })
+            .when(self.menu_open, |el| {
+                el.child(self.render_menu_dropdown(cx))
             })
             .into_any_element()
     }

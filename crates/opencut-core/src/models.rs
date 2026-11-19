@@ -513,11 +513,16 @@ impl TimelineClip {
                 let span = (b.time_offset_secs - a.time_offset_secs).max(0.0001);
                 let t = ((local_t - a.time_offset_secs) / span).clamp(0.0, 1.0);
                 let lerp = |x: f32, y: f32| x + (y - x) * t;
+                let mut rot_diff = (b.rotation_deg - a.rotation_deg).rem_euclid(360.0);
+                if rot_diff > 180.0 {
+                    rot_diff -= 360.0;
+                }
+                let rot = (a.rotation_deg + rot_diff * t).rem_euclid(360.0);
                 return (
                     lerp(a.pos_x, b.pos_x),
                     lerp(a.pos_y, b.pos_y),
                     lerp(a.scale as f32, b.scale as f32).round() as u16,
-                    lerp(a.rotation_deg, b.rotation_deg),
+                    rot,
                     lerp(a.opacity as f32, b.opacity as f32).round() as u8,
                 );
             }
@@ -530,6 +535,48 @@ impl TimelineClip {
             self.rotation_deg,
             self.opacity,
         )
+    }
+
+    /// When keyframes exist on this clip, update the keyframe at `time_secs` (or insert one)
+    /// using the clip's current transform/opacity fields.
+    pub fn sync_keyframe_if_animated(&mut self, time_secs: f32) {
+        if self.keyframes.is_empty() {
+            return;
+        }
+        let local_t = (time_secs - self.start_secs).clamp(0.0, self.duration_secs);
+        let nearest = self
+            .keyframes
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, k)| (k.time_offset_secs - local_t).abs() < 0.08)
+            .min_by(|(_, a), (_, b)| {
+                (a.time_offset_secs - local_t)
+                    .abs()
+                    .partial_cmp(&(b.time_offset_secs - local_t).abs())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(_, k)| k);
+        if let Some(kf) = nearest {
+            kf.pos_x = self.pos_x;
+            kf.pos_y = self.pos_y;
+            kf.scale = self.scale;
+            kf.rotation_deg = self.rotation_deg;
+            kf.opacity = self.opacity;
+        } else {
+            self.keyframes.push(ClipKeyframe {
+                time_offset_secs: local_t,
+                pos_x: self.pos_x,
+                pos_y: self.pos_y,
+                scale: self.scale,
+                rotation_deg: self.rotation_deg,
+                opacity: self.opacity,
+            });
+            self.keyframes.sort_by(|a, b| {
+                a.time_offset_secs
+                    .partial_cmp(&b.time_offset_secs)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
     }
 }
 
