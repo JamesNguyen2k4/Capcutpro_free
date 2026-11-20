@@ -87,10 +87,223 @@ pub fn probe_media_dimensions(path: &Path) -> Option<(u32, u32)> {
     }
 }
 
-fn bgra_bytes_to_render_image(bytes: Vec<u8>, width: u32, height: u32) -> Option<Arc<RenderImage>> {
+pub fn bgra_bytes_to_render_image(bytes: Vec<u8>, width: u32, height: u32) -> Option<Arc<RenderImage>> {
     let img = RgbaImage::from_raw(width, height, bytes)?;
     let frame = Frame::new(img);
     Some(Arc::new(RenderImage::new(smallvec![frame])))
+}
+
+pub fn load_overlay_bgra(path: &Path) -> Option<(Vec<u8>, u32, u32)> {
+    let dyn_img = image::open(path).ok()?;
+    let w = dyn_img.width();
+    let h = dyn_img.height();
+    let max_dim = 480_u32;
+    let rgba = if w > max_dim || h > max_dim {
+        dyn_img
+            .resize(max_dim, max_dim, image::imageops::FilterType::Triangle)
+            .to_rgba8()
+    } else {
+        dyn_img.to_rgba8()
+    };
+    let rw = rgba.width();
+    let rh = rgba.height();
+    let mut bgra = rgba.into_raw();
+    for px in bgra.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    Some((bgra, rw, rh))
+}
+
+pub fn rotate_bgra_bytes(
+    src: &[u8],
+    w: u32,
+    h: u32,
+    flip_h: bool,
+    rot_deg: f32,
+) -> (Vec<u8>, u32, u32) {
+    let norm_rot = rot_deg.rem_euclid(360.0);
+    if !flip_h && (norm_rot <= 0.5 || norm_rot >= 359.5) {
+        return (src.to_vec(), w, h);
+    }
+    if w == 0 || h == 0 || src.len() < (w * h * 4) as usize {
+        return (src.to_vec(), w, h);
+    }
+
+    let sw = w as usize;
+    let sh = h as usize;
+
+    // Fast exact path for 90/180/270 degrees
+    if (norm_rot - 90.0).abs() <= 0.5 {
+        let mut dst = vec![0u8; sw * sh * 4];
+        for y in 0..sh {
+            for x in 0..sw {
+                let sx = if flip_h { sw - 1 - x } else { x };
+                let dx = sh - 1 - y;
+                let dy = x;
+                let si = (y * sw + sx) * 4;
+                let di = (dy * sh + dx) * 4;
+                dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+        return (dst, h, w);
+    }
+    if (norm_rot - 180.0).abs() <= 0.5 {
+        let mut dst = vec![0u8; sw * sh * 4];
+        for y in 0..sh {
+            for x in 0..sw {
+                let sx = if flip_h { sw - 1 - x } else { x };
+                let dx = sw - 1 - x;
+                let dy = sh - 1 - y;
+                let si = (y * sw + sx) * 4;
+                let di = (dy * sw + dx) * 4;
+                dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+        return (dst, w, h);
+    }
+    if (norm_rot - 270.0).abs() <= 0.5 {
+        let mut dst = vec![0u8; sw * sh * 4];
+        for y in 0..sh {
+            for x in 0..sw {
+                let sx = if flip_h { sw - 1 - x } else { x };
+                let dx = y;
+                let dy = sw - 1 - x;
+                let si = (y * sw + sx) * 4;
+                let di = (dy * sh + dx) * 4;
+                dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+        return (dst, h, w);
+    }
+    if norm_rot <= 0.5 || norm_rot >= 359.5 {
+        // flip_h only
+        let mut dst = vec![0u8; sw * sh * 4];
+        for y in 0..sh {
+            for x in 0..sw {
+                let sx = sw - 1 - x;
+                let si = (y * sw + sx) * 4;
+                let di = (y * sw + x) * 4;
+                dst[di..di + 4].copy_from_slice(&src[si..si + 4]);
+            }
+        }
+        return (dst, w, h);
+    }
+
+    let rad = norm_rot.to_radians();
+    let cos_a = rad.cos();
+    let sin_a = rad.sin();
+    let dw = ((w as f32 * cos_a.abs() + h as f32 * sin_a.abs()).ceil() as usize).max(2);
+    let dh = ((w as f32 * sin_a.abs() + h as f32 * cos_a.abs()).ceil() as usize).max(2);
+    let mut dst = vec![0u8; dw * dh * 4];
+
+    let scx = (sw as f32 - 1.0) * 0.5;
+    let scy = (sh as f32 - 1.0) * 0.5;
+    let dcx = (dw as f32 - 1.0) * 0.5;
+    let dcy = (dh as f32 - 1.0) * 0.5;
+
+    for dy in 0..dh {
+        let ry = dy as f32 - dcy;
+        let row_off = dy * dw * 4;
+        for dx in 0..dw {
+            let rx = dx as f32 - dcx;
+            let mut sx = rx * cos_a + ry * sin_a + scx;
+            let sy = -rx * sin_a + ry * cos_a + scy;
+            if flip_h {
+                sx = (sw as f32 - 1.0) - sx;
+            }
+            if sx >= 0.0 && sx < (sw - 1) as f32 && sy >= 0.0 && sy < (sh - 1) as f32 {
+                let x0 = sx as usize;
+                let y0 = sy as usize;
+                let fx = sx - x0 as f32;
+                let fy = sy - y0 as f32;
+                let w00 = (1.0 - fx) * (1.0 - fy);
+                let w10 = fx * (1.0 - fy);
+                let w01 = (1.0 - fx) * fy;
+                let w11 = fx * fy;
+
+                let i00 = (y0 * sw + x0) * 4;
+                let i10 = i00 + 4;
+                let i01 = i00 + sw * 4;
+                let i11 = i01 + 4;
+                let di = row_off + dx * 4;
+                for c in 0..4 {
+                    let v = src[i00 + c] as f32 * w00
+                        + src[i10 + c] as f32 * w10
+                        + src[i01 + c] as f32 * w01
+                        + src[i11 + c] as f32 * w11;
+                    dst[di + c] = v as u8;
+                }
+            }
+        }
+    }
+    (dst, dw as u32, dh as u32)
+}
+
+pub fn apply_color_bgra(
+    bytes: &mut [u8],
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+    temperature: f32,
+) {
+    if brightness.abs() < 0.005
+        && contrast.abs() < 0.005
+        && saturation.abs() < 0.005
+        && temperature.abs() < 0.005
+    {
+        return;
+    }
+    let bright_off = brightness * 128.0;
+    let c_fac = 1.0 + contrast.clamp(-0.9, 1.5);
+    let sat_fac = (1.0 + saturation).max(0.0);
+    let temp_r = temperature * 36.0;
+    let temp_b = -temperature * 36.0;
+
+    for px in bytes.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        let mut b = px[0] as f32 + bright_off + temp_b;
+        let mut g = px[1] as f32 + bright_off;
+        let mut r = px[2] as f32 + bright_off + temp_r;
+
+        if contrast.abs() >= 0.005 {
+            b = (b - 128.0) * c_fac + 128.0;
+            g = (g - 128.0) * c_fac + 128.0;
+            r = (r - 128.0) * c_fac + 128.0;
+        }
+        if saturation.abs() >= 0.005 {
+            let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+            r = luma + (r - luma) * sat_fac;
+            g = luma + (g - luma) * sat_fac;
+            b = luma + (b - luma) * sat_fac;
+        }
+        px[0] = b.clamp(0.0, 255.0) as u8;
+        px[1] = g.clamp(0.0, 255.0) as u8;
+        px[2] = r.clamp(0.0, 255.0) as u8;
+    }
+}
+
+fn append_color_filter(
+    parts: &mut Vec<String>,
+    brightness: f32,
+    contrast: f32,
+    saturation: f32,
+    temperature: f32,
+) {
+    if brightness.abs() >= 0.005 || contrast.abs() >= 0.005 || saturation.abs() >= 0.005 {
+        let eq_b = (brightness * 0.5).clamp(-0.5, 0.5);
+        let eq_c = (1.0 + contrast).clamp(0.2, 2.5);
+        let eq_s = (1.0 + saturation).clamp(0.0, 2.5);
+        parts.push(format!(
+            "eq=brightness={eq_b:.3}:contrast={eq_c:.3}:saturation={eq_s:.3}"
+        ));
+    }
+    if temperature.abs() >= 0.005 {
+        let rs = (temperature * 0.25).clamp(-0.4, 0.4);
+        let bs = (-temperature * 0.25).clamp(-0.4, 0.4);
+        parts.push(format!("colorbalance=rs={rs:.3}:bs={bs:.3}"));
+    }
 }
 
 fn append_crop_filter(parts: &mut Vec<String>, crop: ClipCrop) {
@@ -150,20 +363,17 @@ pub fn export_freeze_frame(path: &Path, time_secs: f32) -> Option<PathBuf> {
     }
 }
 
-pub fn decode_single_frame(
+pub fn decode_single_frame_raw(
     path: &Path,
     time_secs: f32,
     aspect_ratio: AspectRatio,
     preview_height: u32,
-    flip_h: bool,
-    rotation_deg: f32,
     crop: ClipCrop,
-) -> Option<Arc<RenderImage>> {
+) -> Option<(Vec<u8>, u32, u32)> {
     let (pw, ph) = preview_dimensions(aspect_ratio, preview_height);
     let frame_bytes = (pw * ph * 4) as usize;
     let mut vf_parts = Vec::new();
     append_crop_filter(&mut vf_parts, crop);
-    append_flip_rotate_filters(&mut vf_parts, flip_h, rotation_deg);
     vf_parts.push(format!(
         "scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black",
         w = pw,
@@ -197,26 +407,18 @@ pub fn decode_single_frame(
 
     let mut buf = output.stdout;
     buf.truncate(frame_bytes);
-    bgra_bytes_to_render_image(buf, pw, ph)
+    Some((buf, pw, ph))
 }
 
-pub fn render_rotated_text_frame(
+pub fn render_unrotated_text_bgra(
     td: &TextClipData,
     font_size_px: f32,
     box_w: u32,
     box_h: u32,
-    flip_h: bool,
-    rotation_deg: f32,
-) -> Option<(Arc<RenderImage>, u32, u32)> {
-    let base_w = (box_w + 8).max(32);
-    let base_h = (box_h + 8).max(32);
-    let norm_rot = rotation_deg.rem_euclid(360.0);
-    let rad = norm_rot * std::f32::consts::PI / 180.0;
-    let c = rad.cos().abs();
-    let s = rad.sin().abs();
-    let rot_w = ((base_w as f32 * c + base_h as f32 * s).ceil() as u32).max(16);
-    let rot_h = ((base_w as f32 * s + base_h as f32 * c).ceil() as u32).max(16);
-    let frame_bytes = (rot_w * rot_h * 4) as usize;
+) -> Option<(Vec<u8>, u32, u32)> {
+    let base_w = (box_w + 16).max(32);
+    let base_h = (box_h + 16).max(32);
+    let frame_bytes = (base_w * base_h * 4) as usize;
 
     let display_text = if td.content.is_empty() {
         "Text"
@@ -257,7 +459,7 @@ pub fn render_rotated_text_frame(
         })
         .unwrap_or_default();
 
-    let mut xf = format!(
+    let xf = format!(
         "color=c=black@0.0:s={w}x{h}:d=0.1,format=rgba,drawtext=text='{txt}'{fp}:fontsize={fs:.1}:fontcolor=0x{col:06x}:x=(w-text_w)/2:y=(h-text_h)/2{bp}{bd}{sh}",
         w = base_w,
         h = base_h,
@@ -269,15 +471,6 @@ pub fn render_rotated_text_frame(
         bd = border_part,
         sh = shadow_part,
     );
-    if flip_h {
-        xf.push_str(",hflip");
-    }
-    xf.push_str(&format!(
-        ",rotate={rad:.5}:ow={ow}:oh={oh}:fillcolor=none",
-        rad = rad,
-        ow = rot_w,
-        oh = rot_h
-    ));
 
     let mut cmd = Command::new("ffmpeg");
     apply_no_window(&mut cmd);
@@ -293,14 +486,14 @@ pub fn render_rotated_text_frame(
 
     let mut buf = output.stdout;
     buf.truncate(frame_bytes);
-    let img = bgra_bytes_to_render_image(buf, rot_w, rot_h)?;
-    Some((img, rot_w, rot_h))
+    Some((buf, base_w, base_h))
 }
 
 pub struct VideoStreamPlayer {
     stop_flag: Arc<AtomicBool>,
     child: Arc<Mutex<Option<Child>>>,
     latest_frame: Arc<Mutex<Option<Arc<RenderImage>>>>,
+    latest_raw_frame: Arc<Mutex<Option<(Vec<u8>, u32, u32)>>>,
     active_clip_id: Option<usize>,
     active_ratio: Option<AspectRatio>,
     active_height: Option<u32>,
@@ -316,6 +509,7 @@ impl VideoStreamPlayer {
             stop_flag: Arc::new(AtomicBool::new(false)),
             child: Arc::new(Mutex::new(None)),
             latest_frame: Arc::new(Mutex::new(None)),
+            latest_raw_frame: Arc::new(Mutex::new(None)),
             active_clip_id: None,
             active_ratio: None,
             active_height: None,
@@ -361,10 +555,12 @@ impl VideoStreamPlayer {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let child_slot: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
         let latest_frame = Arc::new(Mutex::new(None));
+        let latest_raw_frame = Arc::new(Mutex::new(None));
 
         self.stop_flag = stop_flag.clone();
         self.child = child_slot.clone();
         self.latest_frame = latest_frame.clone();
+        self.latest_raw_frame = latest_raw_frame.clone();
         self.active_clip_id = Some(clip_id);
         self.active_ratio = Some(aspect_ratio);
         self.active_height = Some(preview_height);
@@ -445,10 +641,8 @@ impl VideoStreamPlayer {
                 if stdout.read_exact(&mut buf).is_err() {
                     break;
                 }
-                if let Some(render_img) = bgra_bytes_to_render_image(buf.clone(), pw, ph) {
-                    if let Ok(mut guard) = latest_frame.lock() {
-                        *guard = Some(render_img);
-                    }
+                if let Ok(mut guard) = latest_raw_frame.lock() {
+                    *guard = Some((buf.clone(), pw, ph));
                 }
             }
 
@@ -461,8 +655,8 @@ impl VideoStreamPlayer {
         });
     }
 
-    pub fn take_latest_frame(&self) -> Option<Arc<RenderImage>> {
-        self.latest_frame.lock().ok()?.take()
+    pub fn take_latest_raw_frame(&self) -> Option<(Vec<u8>, u32, u32)> {
+        self.latest_raw_frame.lock().ok()?.take()
     }
 
     pub fn stop(&mut self) {
@@ -936,6 +1130,8 @@ fn append_visual_clip_filters(
         vf_parts.push("reverse".into());
     }
     append_crop_filter(&mut vf_parts, clip.crop);
+    let (cb, cc, cs, ct) = clip.effective_color();
+    append_color_filter(&mut vf_parts, cb, cc, cs, ct);
     if clip.flip_h {
         vf_parts.push("hflip".into());
     }
@@ -1015,9 +1211,23 @@ fn append_visual_clip_filters(
         if op_val < 100 {
             let opacity = (op_val as f32 / 100.0).clamp(0.0, 1.0);
             vf_parts.push(format!("format=yuva420p,colorchannelmixer=aa={opacity:.2}"));
-        } else if is_video {
+        } else if is_video && matches!(clip.transition_in, TransitionKind::None | TransitionKind::SlideLeft | TransitionKind::SlideRight) {
             vf_parts.push("format=yuv420p".into());
         }
+    }
+
+    let td = clip
+        .transition_dur_secs
+        .clamp(0.1, (clip.duration_secs * 0.5).max(0.1));
+    if matches!(
+        clip.transition_in,
+        TransitionKind::Dissolve | TransitionKind::ZoomIn
+    ) {
+        vf_parts.push(format!(
+            "format=rgba,fade=t=in:st={st:.3}:d={td:.3}:alpha=1",
+            st = clip.start_secs,
+            td = td
+        ));
     }
 
     let ox_raw = build_keyframe_expr(
@@ -1032,10 +1242,25 @@ fn append_visual_clip_filters(
         clip.pos_y,
         |k| k.pos_y,
     );
-    let ox_expr = if (res_scale - 1.0).abs() > 0.001 {
+    let ox_base = if (res_scale - 1.0).abs() > 0.001 {
         format!("({ox_raw})*{res_scale:.4}")
     } else {
         ox_raw
+    };
+    let ox_expr = match clip.transition_in {
+        TransitionKind::SlideLeft => format!(
+            "if(lt(t-{st:.3},{td:.3}),({ox_base})+({ow:.0}*(1-(t-{st:.3})/{td:.3})),{ox_base})",
+            st = clip.start_secs,
+            td = td,
+            ow = out_w as f32
+        ),
+        TransitionKind::SlideRight => format!(
+            "if(lt(t-{st:.3},{td:.3}),({ox_base})-({ow:.0}*(1-(t-{st:.3})/{td:.3})),{ox_base})",
+            st = clip.start_secs,
+            td = td,
+            ow = out_w as f32
+        ),
+        _ => ox_base,
     };
     let oy_expr = if (res_scale - 1.0).abs() > 0.001 {
         format!("({oy_raw})*{res_scale:.4}")

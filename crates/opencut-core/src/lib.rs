@@ -664,6 +664,9 @@ impl EditorCore {
             fade_in_secs: 0.0,
             fade_out_secs: 0.0,
             color: ColorAdjustment::default(),
+            filter_preset: ColorFilterPreset::None,
+            transition_in: TransitionKind::None,
+            transition_dur_secs: 0.5,
             text: None,
             linked_clip_id: None,
             keyframes: Vec::new(),
@@ -1148,8 +1151,17 @@ impl EditorCore {
             return false;
         }
         self.push_undo();
-        self.clips[pos].rotation_deg = (self.clips[pos].rotation_deg + 90.0) % 360.0;
-        self.status_message = format!("Rotated to {:.0}°", self.clips[pos].rotation_deg);
+        let playhead = self.playhead_secs;
+        let (px, py, sc, cur_rot, op) = self.clips[pos].evaluate_at(playhead);
+        let idx = (((cur_rot + 0.5).rem_euclid(360.0) / 90.0).floor() as i32).rem_euclid(4);
+        let next_rot = (((idx + 1) % 4) as f32) * 90.0;
+        self.clips[pos].pos_x = px;
+        self.clips[pos].pos_y = py;
+        self.clips[pos].scale = sc;
+        self.clips[pos].rotation_deg = next_rot;
+        self.clips[pos].opacity = op;
+        self.clips[pos].sync_keyframe_if_animated(playhead);
+        self.status_message = format!("Rotated → {:.0}°", next_rot);
         true
     }
 
@@ -1578,5 +1590,25 @@ mod tests {
         let pasted = core.clips.iter().find(|c| c.id == pasted_id).unwrap();
         assert!((pasted.start_secs - 5.0).abs() < 0.01);
         assert_eq!(core.selected_clip_id, Some(pasted_id));
+    }
+
+    #[test]
+    fn phase4_color_filter_and_transition_evaluate() {
+        let mut clip = sample_clip(1, 2.0, 4.0);
+        clip.filter_preset = ColorFilterPreset::Bw;
+        clip.color.brightness = 0.1;
+        let (b, c, s, _t) = clip.effective_color();
+        assert!((b - 0.12).abs() < 0.01);
+        assert!((c - 0.25).abs() < 0.01);
+        assert!((s + 1.0).abs() < 0.01);
+
+        clip.transition_in = TransitionKind::Dissolve;
+        clip.transition_dur_secs = 1.0;
+        let (a0, _, _) = clip.evaluate_transition(2.0);
+        let (a_mid, _, _) = clip.evaluate_transition(2.5);
+        let (a_end, _, _) = clip.evaluate_transition(3.0);
+        assert!(a0 < 0.01);
+        assert!((a_mid - 0.75).abs() < 0.01);
+        assert!((a_end - 1.0).abs() < 0.01);
     }
 }

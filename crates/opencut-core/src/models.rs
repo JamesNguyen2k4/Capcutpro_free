@@ -172,6 +172,89 @@ pub struct ColorAdjustment {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ColorFilterPreset {
+    #[default]
+    None,
+    Vivid,
+    Warm,
+    Cool,
+    Bw,
+    Vintage,
+    Cinema,
+}
+
+impl ColorFilterPreset {
+    pub const fn all() -> &'static [ColorFilterPreset] {
+        &[
+            ColorFilterPreset::None,
+            ColorFilterPreset::Vivid,
+            ColorFilterPreset::Warm,
+            ColorFilterPreset::Cool,
+            ColorFilterPreset::Bw,
+            ColorFilterPreset::Vintage,
+            ColorFilterPreset::Cinema,
+        ]
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            ColorFilterPreset::None => "None",
+            ColorFilterPreset::Vivid => "Vivid",
+            ColorFilterPreset::Warm => "Warm",
+            ColorFilterPreset::Cool => "Cool",
+            ColorFilterPreset::Bw => "B&W",
+            ColorFilterPreset::Vintage => "Vintage",
+            ColorFilterPreset::Cinema => "Cinema",
+        }
+    }
+
+    /// Returns base (brightness, contrast, saturation, temperature) offsets.
+    pub const fn offsets(&self) -> (f32, f32, f32, f32) {
+        match self {
+            ColorFilterPreset::None => (0.0, 0.0, 0.0, 0.0),
+            ColorFilterPreset::Vivid => (0.04, 0.22, 0.40, 0.05),
+            ColorFilterPreset::Warm => (0.04, 0.08, 0.14, 0.38),
+            ColorFilterPreset::Cool => (0.0, 0.10, 0.05, -0.38),
+            ColorFilterPreset::Bw => (0.02, 0.25, -1.0, 0.0),
+            ColorFilterPreset::Vintage => (-0.03, -0.10, -0.32, 0.28),
+            ColorFilterPreset::Cinema => (-0.04, 0.28, -0.12, -0.15),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TransitionKind {
+    #[default]
+    None,
+    Dissolve,
+    SlideLeft,
+    SlideRight,
+    ZoomIn,
+}
+
+impl TransitionKind {
+    pub const fn all() -> &'static [TransitionKind] {
+        &[
+            TransitionKind::None,
+            TransitionKind::Dissolve,
+            TransitionKind::SlideLeft,
+            TransitionKind::SlideRight,
+            TransitionKind::ZoomIn,
+        ]
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            TransitionKind::None => "None",
+            TransitionKind::Dissolve => "Dissolve",
+            TransitionKind::SlideLeft => "Slide L",
+            TransitionKind::SlideRight => "Slide R",
+            TransitionKind::ZoomIn => "Zoom In",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextAlign {
     Left,
     #[default]
@@ -455,11 +538,21 @@ pub struct TimelineClip {
     #[serde(default)]
     pub color: ColorAdjustment,
     #[serde(default)]
+    pub filter_preset: ColorFilterPreset,
+    #[serde(default)]
+    pub transition_in: TransitionKind,
+    #[serde(default = "default_transition_dur")]
+    pub transition_dur_secs: f32,
+    #[serde(default)]
     pub text: Option<TextClipData>,
     #[serde(default)]
     pub linked_clip_id: Option<usize>,
     #[serde(default)]
     pub keyframes: Vec<ClipKeyframe>,
+}
+
+fn default_transition_dur() -> f32 {
+    0.5
 }
 
 impl TimelineClip {
@@ -469,6 +562,40 @@ impl TimelineClip {
 
     pub fn contains(&self, time_secs: f32) -> bool {
         time_secs >= self.start_secs && time_secs < self.end_secs()
+    }
+
+    /// Combined (brightness, contrast, saturation, temperature) in [-1.0, 1.0].
+    pub fn effective_color(&self) -> (f32, f32, f32, f32) {
+        let (pb, pc, ps, pt) = self.filter_preset.offsets();
+        (
+            (pb + self.color.brightness).clamp(-1.0, 1.0),
+            (pc + self.color.contrast).clamp(-1.0, 1.0),
+            (ps + self.color.saturation).clamp(-1.0, 1.0),
+            (pt + self.color.temperature).clamp(-1.0, 1.0),
+        )
+    }
+
+    /// Returns (alpha_mult, scale_mult, x_offset_ratio) for `transition_in` at `time_secs`.
+    pub fn evaluate_transition(&self, time_secs: f32) -> (f32, f32, f32) {
+        if self.transition_in == TransitionKind::None {
+            return (1.0, 1.0, 0.0);
+        }
+        let td = self
+            .transition_dur_secs
+            .clamp(0.1, (self.duration_secs * 0.5).max(0.1));
+        let local_t = (time_secs - self.start_secs).max(0.0);
+        if local_t >= td {
+            return (1.0, 1.0, 0.0);
+        }
+        let p = (local_t / td).clamp(0.0, 1.0);
+        let ease = 1.0 - (1.0 - p) * (1.0 - p);
+        match self.transition_in {
+            TransitionKind::None => (1.0, 1.0, 0.0),
+            TransitionKind::Dissolve => (ease, 1.0, 0.0),
+            TransitionKind::SlideLeft => (1.0, 1.0, 1.0 - ease),
+            TransitionKind::SlideRight => (1.0, 1.0, -(1.0 - ease)),
+            TransitionKind::ZoomIn => (ease, 0.72 + 0.28 * ease, 0.0),
+        }
     }
 
     /// Evaluate animated (pos_x, pos_y, scale, rotation_deg, opacity) at timeline `time_secs`.

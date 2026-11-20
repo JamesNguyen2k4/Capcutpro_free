@@ -3,7 +3,7 @@ use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use gpui::{
     AnyView, AppContext, Bounds, Context, ElementInputHandler, EntityInputHandler, ExternalPaths,
@@ -14,14 +14,16 @@ use gpui::{
     px, rgb,
 };
 use opencut_core::{
-    AspectRatio, ClipCrop, EditorCore, RecentProjectEntry, TextAnimation, TextPreset, TrackKind,
-    format_timecode, load_recent_projects, record_recent_project,
+    AspectRatio, ClipCrop, ColorFilterPreset, EditorCore, RecentProjectEntry, TextAnimation,
+    TextPreset, TrackKind, TransitionKind, format_timecode, load_recent_projects,
+    record_recent_project,
 };
 
 use crate::media_engine::{
     AudioStreamPlayer, ExportFormat, ExportHandle, ExportOptions, VideoStreamPlayer,
-    decode_single_frame, detect_gpu_encoder, export_freeze_frame, probe_duration_secs,
-    probe_media_dimensions, render_rotated_text_frame, reveal_in_explorer, start_export_timeline,
+    apply_color_bgra, bgra_bytes_to_render_image, decode_single_frame_raw, detect_gpu_encoder,
+    export_freeze_frame, load_overlay_bgra, probe_duration_secs, probe_media_dimensions,
+    render_unrotated_text_bgra, reveal_in_explorer, rotate_bgra_bytes, start_export_timeline,
 };
 use crate::theme::Theme;
 
@@ -194,6 +196,11 @@ enum SliderField {
     CropBottom,
     FadeIn,
     FadeOut,
+    Brightness,
+    Contrast,
+    Saturation,
+    Temperature,
+    TransitionDur,
 }
 
 const INSPECTOR_W: f32 = 280.0;
@@ -209,6 +216,7 @@ pub(crate) enum AppScreen {
 enum MediaPanelTab {
     Media,
     Text,
+    Filters,
 }
 
 pub struct EditorView {
@@ -248,13 +256,18 @@ pub struct EditorView {
     preview_text_drag: Option<PreviewTextDragState>,
     slider_drag: Option<SliderField>,
     media_dim_cache: HashMap<PathBuf, (u32, u32)>,
-    last_rotate_sync: Option<Instant>,
     active_snap_guides: PreviewSnapGuides,
     rotated_text_cache: HashMap<usize, (u64, Arc<RenderImage>, u32, u32)>,
     rotated_text_seq: HashMap<usize, u64>,
     rotated_text_applied_seq: HashMap<usize, u64>,
     rot_text_in_flight: HashMap<usize, bool>,
     rot_text_dirty: HashMap<usize, bool>,
+    rotated_overlay_cache: HashMap<usize, (u64, Arc<RenderImage>, u32, u32)>,
+    rotated_overlay_seq: HashMap<usize, u64>,
+    raw_video_frame: Option<(Vec<u8>, u32, u32)>,
+    raw_video_sig: u64,
+    raw_overlay_cache: HashMap<PathBuf, Arc<(Vec<u8>, u32, u32)>>,
+    raw_text_cache: HashMap<usize, (u64, Arc<(Vec<u8>, u32, u32)>)>,
     export_status: ExportStatus,
     export_modal_open: bool,
     export_options: ExportOptions,
@@ -299,13 +312,18 @@ impl EditorView {
             preview_text_drag: None,
             slider_drag: None,
             media_dim_cache: HashMap::new(),
-            last_rotate_sync: None,
             active_snap_guides: PreviewSnapGuides::default(),
             rotated_text_cache: HashMap::new(),
             rotated_text_seq: HashMap::new(),
             rotated_text_applied_seq: HashMap::new(),
             rot_text_in_flight: HashMap::new(),
             rot_text_dirty: HashMap::new(),
+            rotated_overlay_cache: HashMap::new(),
+            rotated_overlay_seq: HashMap::new(),
+            raw_video_frame: None,
+            raw_video_sig: 0,
+            raw_overlay_cache: HashMap::new(),
+            raw_text_cache: HashMap::new(),
             export_status: ExportStatus::Idle,
             export_modal_open: false,
             export_options: ExportOptions::default(),
@@ -447,6 +465,16 @@ impl EditorView {
                 let max_fade = (c.duration_secs * 0.5).clamp(0.1, 5.0);
                 c.fade_out_secs = ((r * max_fade) * 10.0).round() / 10.0;
             }
+            SliderField::Brightness => c.color.brightness = ((r * 2.0 - 1.0) * 100.0).round() / 100.0,
+            SliderField::Contrast => c.color.contrast = ((r * 2.0 - 1.0) * 100.0).round() / 100.0,
+            SliderField::Saturation => c.color.saturation = ((r * 2.0 - 1.0) * 100.0).round() / 100.0,
+            SliderField::Temperature => {
+                c.color.temperature = ((r * 2.0 - 1.0) * 100.0).round() / 100.0
+            }
+            SliderField::TransitionDur => {
+                let max_td = (c.duration_secs * 0.5).clamp(0.2, 3.0);
+                c.transition_dur_secs = ((0.1 + r * (max_td - 0.1)) * 10.0).round() / 10.0;
+            }
         }
     }
 
@@ -514,7 +542,25 @@ impl EditorView {
         .detach();
     }
 
+    fn refresh_video_frame_transform(&mut self, flip_h: bool, rot: f32, cx: &mut Context<Self>) {
+        let norm_rot = rot.rem_euclid(360.0);
+        let sig = ((flip_h as u64) << 32) | ((norm_rot * 2.0).round() as u64);
+        if self.raw_video_sig == sig && self.current_frame.is_some() {
+            return;
+        }
+        let Some((ref bytes, w, h)) = self.raw_video_frame else {
+            return;
+        };
+        let (out_bytes, ow, oh) = rotate_bgra_bytes(bytes, w, h, flip_h, norm_rot);
+        if let Some(img) = bgra_bytes_to_render_image(out_bytes, ow, oh) {
+            self.raw_video_sig = sig;
+            self.set_current_frame(Some(img), cx);
+        }
+    }
+
     fn poll_playback_frame(&mut self, cx: &mut Context<Self>) {
+        self.sync_rotated_texts(cx);
+        self.sync_rotated_overlays(cx);
         let audio_clips = self.state.active_audio_clips_at(self.state.playhead_secs);
         self.audio_player
             .sync_playing_clips(&audio_clips, self.state.playhead_secs);
@@ -528,6 +574,7 @@ impl EditorView {
 
         let Some(active) = active_video else {
             self.player.stop();
+            self.raw_video_frame = None;
             self.set_current_frame(None, cx);
             return;
         };
@@ -538,12 +585,10 @@ impl EditorView {
         };
 
         let ph = self.preview_quality.height();
-        let (cur_flip, cur_rot, cur_crop, cur_rev) = self.player.active_transform();
+        let (_, _, cur_crop, cur_rev) = self.player.active_transform();
         if self.player.active_clip_id() != Some(active.id)
             || self.player.active_ratio() != Some(self.state.aspect_ratio)
             || self.player.active_height() != Some(ph)
-            || cur_flip != active.flip_h
-            || (cur_rot - rot).abs() > 1.0
             || cur_crop != active.crop
             || cur_rev != active.reversed
         {
@@ -557,8 +602,8 @@ impl EditorView {
                 offset,
                 self.state.aspect_ratio,
                 ph,
-                active.flip_h,
-                rot,
+                false,
+                0.0,
                 active.crop,
                 active.reversed,
                 active.source_in_secs,
@@ -566,13 +611,16 @@ impl EditorView {
             );
         }
 
-        if let Some(frame) = self.player.take_latest_frame() {
-            self.set_current_frame(Some(frame), cx);
+        if let Some(raw) = self.player.take_latest_raw_frame() {
+            self.raw_video_frame = Some(raw);
+            self.raw_video_sig = u64::MAX;
         }
+        self.refresh_video_frame_transform(active.flip_h, rot, cx);
     }
 
     fn sync_preview_after_seek(&mut self, cx: &mut Context<Self>) {
         self.sync_rotated_texts(cx);
+        self.sync_rotated_overlays(cx);
         self.audio_player.stop();
         if self.state.is_playing {
             let audio_clips = self.state.active_audio_clips_at(self.state.playhead_secs);
@@ -589,6 +637,7 @@ impl EditorView {
 
         let Some(active) = active_video else {
             self.player.stop();
+            self.raw_video_frame = None;
             self.set_current_frame(None, cx);
             return;
         };
@@ -596,6 +645,7 @@ impl EditorView {
         let (_, _, _, rot, _) = active.evaluate_at(self.state.playhead_secs);
         let Some(path) = active.source_path else {
             self.player.stop();
+            self.raw_video_frame = None;
             self.set_current_frame(None, cx);
             return;
         };
@@ -627,8 +677,8 @@ impl EditorView {
                 offset,
                 self.state.aspect_ratio,
                 ph,
-                active.flip_h,
-                rot,
+                false,
+                0.0,
                 active.crop,
                 active.reversed,
                 active.source_in_secs,
@@ -636,6 +686,7 @@ impl EditorView {
             );
         } else {
             self.player.stop();
+            self.refresh_video_frame_transform(active.flip_h, rot, cx);
             self.request_single_frame(path, offset, active.flip_h, rot, active.crop, cx);
         }
     }
@@ -680,19 +731,23 @@ impl EditorView {
                 .ceil()
                 .max(26.0) as u32;
 
-            let mut hasher = DefaultHasher::new();
-            td.content.hash(&mut hasher);
-            td.font_family.hash(&mut hasher);
-            td.font_weight.hash(&mut hasher);
-            (font_sz.round() as i32).hash(&mut hasher);
-            td.color_hex.hash(&mut hasher);
-            td.bg_color_hex.hash(&mut hasher);
-            td.stroke_color_hex.hash(&mut hasher);
-            ((td.stroke_width * 10.0).round() as i32).hash(&mut hasher);
-            td.shadow_color_hex.hash(&mut hasher);
-            tclip.flip_h.hash(&mut hasher);
-            ((norm_rot * 2.0).round() as i32).hash(&mut hasher);
-            let sig = hasher.finish();
+            let mut base_hasher = DefaultHasher::new();
+            td.content.hash(&mut base_hasher);
+            td.font_family.hash(&mut base_hasher);
+            td.font_weight.hash(&mut base_hasher);
+            (font_sz.round() as i32).hash(&mut base_hasher);
+            td.color_hex.hash(&mut base_hasher);
+            td.bg_color_hex.hash(&mut base_hasher);
+            td.stroke_color_hex.hash(&mut base_hasher);
+            ((td.stroke_width * 10.0).round() as i32).hash(&mut base_hasher);
+            td.shadow_color_hex.hash(&mut base_hasher);
+            let base_sig = base_hasher.finish();
+
+            let mut rot_hasher = DefaultHasher::new();
+            base_sig.hash(&mut rot_hasher);
+            tclip.flip_h.hash(&mut rot_hasher);
+            ((norm_rot * 2.0).round() as i32).hash(&mut rot_hasher);
+            let sig = rot_hasher.finish();
 
             if self
                 .rotated_text_cache
@@ -700,6 +755,18 @@ impl EditorView {
                 .is_some_and(|(s, _, _, _)| *s == sig)
             {
                 continue;
+            }
+
+            if let Some((cached_base_sig, raw_arc)) = self.raw_text_cache.get(&tclip.id) {
+                if *cached_base_sig == base_sig {
+                    let (ref bytes, w, h) = **raw_arc;
+                    let (out_bytes, rw, rh) =
+                        rotate_bgra_bytes(bytes, w, h, tclip.flip_h, norm_rot);
+                    if let Some(r_img) = bgra_bytes_to_render_image(out_bytes, rw, rh) {
+                        self.rotated_text_cache.insert(tclip.id, (sig, r_img, rw, rh));
+                    }
+                    continue;
+                }
             }
 
             if self.rot_text_in_flight.get(&tclip.id).copied().unwrap_or(false) {
@@ -716,21 +783,21 @@ impl EditorView {
                 .or_insert(1);
             let seq_val = *seq;
             let cid = tclip.id;
-            let flip_h = tclip.flip_h;
 
             let task = cx.background_executor().spawn(async move {
-                render_rotated_text_frame(&td, font_sz, box_w, box_h, flip_h, norm_rot)
+                render_unrotated_text_bgra(&td, font_sz, box_w, box_h)
             });
 
             cx.spawn(async move |this, cx| {
                 let res = task.await;
                 let _ = this.update(cx, |view, cx| {
                     view.rot_text_in_flight.insert(cid, false);
-                    if let Some((r_img, rw, rh)) = res {
+                    if let Some(raw) = res {
                         let applied = view.rotated_text_applied_seq.get(&cid).copied().unwrap_or(0);
                         if seq_val > applied {
                             view.rotated_text_applied_seq.insert(cid, seq_val);
-                            view.rotated_text_cache.insert(cid, (sig, r_img, rw, rh));
+                            view.raw_text_cache.insert(cid, (base_sig, Arc::new(raw)));
+                            view.sync_rotated_texts(cx);
                             cx.notify();
                         }
                     }
@@ -739,6 +806,84 @@ impl EditorView {
                         view.sync_rotated_texts(cx);
                     }
                 });
+            })
+            .detach();
+        }
+    }
+
+    fn sync_rotated_overlays(&mut self, cx: &mut Context<Self>) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let overlays: Vec<_> = self
+            .state
+            .active_clips_at_playhead()
+            .into_iter()
+            .filter(|c| c.track == TrackKind::Overlay && c.source_path.is_some())
+            .cloned()
+            .collect();
+
+        for oclip in overlays {
+            let Some(path) = oclip.source_path.clone() else {
+                continue;
+            };
+            let (_, _, _, erot, _) = oclip.evaluate_at(self.state.playhead_secs);
+            let norm_rot = erot.rem_euclid(360.0);
+            let needs_rot = oclip.flip_h || (norm_rot > 0.5 && norm_rot < 359.5);
+            if !needs_rot {
+                self.rotated_overlay_cache.remove(&oclip.id);
+                continue;
+            }
+            self.ensure_media_dims_cached(path.clone(), cx);
+
+            let mut hasher = DefaultHasher::new();
+            path.hash(&mut hasher);
+            oclip.flip_h.hash(&mut hasher);
+            ((norm_rot * 2.0).round() as i32).hash(&mut hasher);
+            let sig = hasher.finish();
+
+            if self
+                .rotated_overlay_cache
+                .get(&oclip.id)
+                .is_some_and(|(s, _, _, _)| *s == sig)
+            {
+                continue;
+            }
+
+            if let Some(raw_arc) = self.raw_overlay_cache.get(&path) {
+                let (ref bytes, w, h) = **raw_arc;
+                let (out_bytes, rw, rh) =
+                    rotate_bgra_bytes(bytes, w, h, oclip.flip_h, norm_rot);
+                if let Some(r_img) = bgra_bytes_to_render_image(out_bytes, rw, rh) {
+                    self.rotated_overlay_cache
+                        .insert(oclip.id, (sig, r_img, rw, rh));
+                }
+                continue;
+            }
+
+            let seq = self
+                .rotated_overlay_seq
+                .entry(oclip.id)
+                .and_modify(|v| *v = v.wrapping_add(1))
+                .or_insert(1);
+            let seq_val = *seq;
+            let cid = oclip.id;
+            let path_clone = path.clone();
+
+            let task = cx
+                .background_executor()
+                .spawn(async move { load_overlay_bgra(&path_clone) });
+
+            cx.spawn(async move |this, cx| {
+                if let Some(raw) = task.await {
+                    let _ = this.update(cx, |view, cx| {
+                        view.raw_overlay_cache.insert(path, Arc::new(raw));
+                        if view.rotated_overlay_seq.get(&cid).copied() == Some(seq_val) {
+                            view.sync_rotated_overlays(cx);
+                            cx.notify();
+                        }
+                    });
+                }
             })
             .detach();
         }
@@ -807,16 +952,25 @@ impl EditorView {
         let ph = self.preview_quality.height();
 
         let task = cx.background_executor().spawn(async move {
-            decode_single_frame(&path, offset_secs, ratio, ph, flip_h, rotation_deg, crop)
+            decode_single_frame_raw(&path, offset_secs, ratio, ph, crop)
         });
 
         cx.spawn(async move |this, cx| {
-            let frame = task.await;
+            let raw_opt = task.await;
             let _ = this.update(cx, |view, cx| {
                 view.decode_in_flight = false;
                 if seq > view.decode_applied_seq && !view.state.is_playing {
                     view.decode_applied_seq = seq;
-                    view.set_current_frame(frame, cx);
+                    view.raw_video_frame = raw_opt;
+                    view.raw_video_sig = u64::MAX;
+                    let (cur_flip, cur_rot) = view
+                        .state
+                        .active_clips_at_playhead()
+                        .into_iter()
+                        .find(|c| c.track == TrackKind::Video)
+                        .map(|v| (v.flip_h, v.evaluate_at(view.state.playhead_secs).3))
+                        .unwrap_or((flip_h, rotation_deg));
+                    view.refresh_video_frame_transform(cur_flip, cur_rot, cx);
                     cx.notify();
                 }
                 if view.decode_dirty && !view.state.is_playing {
@@ -2843,16 +2997,27 @@ impl EditorView {
                             cx.notify();
                         }),
                     )
-                    .child(
+                    .child({
+                        let norm_rot = erot.rem_euclid(360.0);
+                        let (render_w, render_h) = if norm_rot > 0.5 && norm_rot < 359.5 {
+                            let rad = norm_rot.to_radians();
+                            let c = rad.cos().abs();
+                            let s = rad.sin().abs();
+                            let bw = preview_w * vscale;
+                            let bh = preview_h * vscale;
+                            (bw * c + bh * s, bw * s + bh * c)
+                        } else {
+                            (preview_w * vscale, preview_h * vscale)
+                        };
                         div()
                             .relative()
                             .left(px(vox))
                             .top(px(voy))
-                            .w(px(box_w))
-                            .h(px(box_h))
+                            .w(px(render_w))
+                            .h(px(render_h))
                             .opacity(valpha)
-                            .child(img(frame).size_full().object_fit(ObjectFit::Contain)),
-                    )
+                            .child(img(frame).size_full().object_fit(ObjectFit::Contain))
+                    })
                     .into_any_element()
             } else {
                 self.render_empty_preview(
@@ -2914,6 +3079,24 @@ impl EditorView {
                     );
                 }
 
+                let norm_rot = erot.rem_euclid(360.0);
+                let use_rot_ovl = oclip.flip_h || (norm_rot > 0.5 && norm_rot < 359.5);
+                let cached_ovl = if use_rot_ovl {
+                    self.rotated_overlay_cache
+                        .get(&oid)
+                        .map(|(_, im, _, _)| im.clone())
+                } else {
+                    None
+                };
+                let rad = norm_rot.to_radians();
+                let (render_w, render_h) = if cached_ovl.is_some() {
+                    let c = rad.cos().abs();
+                    let s = rad.sin().abs();
+                    (box_w * c + box_h * s, box_w * s + box_h * c)
+                } else {
+                    (box_w, box_h)
+                };
+
                 Some(
                     div()
                         .absolute()
@@ -2927,8 +3110,8 @@ impl EditorView {
                                 .relative()
                                 .left(px(ox))
                                 .top(px(oy))
-                                .w(px(box_w))
-                                .h(px(box_h))
+                                .w(px(render_w))
+                                .h(px(render_h))
                                 .opacity(oalpha)
                                 .cursor(gpui::CursorStyle::OpenHand)
                                 .on_mouse_down(
@@ -2956,7 +3139,11 @@ impl EditorView {
                                         cx.notify();
                                     }),
                                 )
-                                .child(img(path).size_full().object_fit(ObjectFit::Contain)),
+                                .child(if let Some(r_img) = cached_ovl {
+                                    img(r_img).size_full().object_fit(ObjectFit::Contain)
+                                } else {
+                                    img(path).size_full().object_fit(ObjectFit::Contain)
+                                }),
                         ),
                 )
             })
@@ -3951,12 +4138,22 @@ impl EditorView {
                                                     let (hw, hh) =
                                                         this.clip_canvas_half_extents(sel_id);
                                                     this.state.push_undo();
+                                                    let playhead = this.state.playhead_secs;
                                                     if let Some(c) = this
                                                         .state
                                                         .clips
                                                         .iter_mut()
                                                         .find(|c| c.id == sel_id)
                                                     {
+                                                        if !c.keyframes.is_empty() {
+                                                            let (epx, epy, esc, erot, eop) =
+                                                                c.evaluate_at(playhead);
+                                                            c.pos_x = epx;
+                                                            c.pos_y = epy;
+                                                            c.scale = esc;
+                                                            c.rotation_deg = erot;
+                                                            c.opacity = eop;
+                                                        }
                                                         match mode {
                                                             0 => c.pos_x = -(cw * 0.5 - hw),
                                                             1 => c.pos_x = 0.0,
@@ -3969,6 +4166,7 @@ impl EditorView {
                                                                 c.pos_y = 0.0;
                                                             }
                                                         }
+                                                        c.sync_keyframe_if_animated(playhead);
                                                     }
                                                     this.state.status_message = tip.to_string();
                                                     cx.notify();
@@ -3987,85 +4185,33 @@ impl EditorView {
                             cx,
                         ))
                     })
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_1p5()
-                            .when(clip.track.is_visual(), |el| {
-                                el.child(
-                                    div()
-                                        .id("ins-mirror-btn")
-                                        .flex_1()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .bg(if clip.flip_h {
-                                            Theme::accent()
-                                        } else {
-                                            Theme::bg_surface()
-                                        })
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .text_xs()
-                                        .text_center()
-                                        .text_color(Theme::text_primary())
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if this.state.toggle_mirror_selected() {
-                                                this.sync_preview_after_seek(cx);
-                                            }
-                                            cx.notify();
-                                        }))
-                                        .child("⇄ Mirror"),
-                                )
-                            })
-                            .when(clip.track == TrackKind::Video, |el| {
-                                el.child(
-                                    div()
-                                        .id("ins-rev-btn")
-                                        .flex_1()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .bg(if clip.reversed {
-                                            Theme::accent()
-                                        } else {
-                                            Theme::bg_surface()
-                                        })
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .text_xs()
-                                        .text_center()
-                                        .text_color(Theme::text_primary())
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if this.state.toggle_reverse_selected() {
-                                                this.sync_preview_after_seek(cx);
-                                            }
-                                            cx.notify();
-                                        }))
-                                        .child("⟲ Reverse"),
-                                )
-                            })
-                            .child(
-                                div()
-                                    .id("ins-kf-btn")
-                                    .flex_1()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .bg(Theme::bg_surface())
-                                    .border_1()
-                                    .border_color(rgb(0xf59e0b))
-                                    .text_xs()
-                                    .text_center()
-                                    .text_color(rgb(0xf59e0b))
-                                    .cursor_pointer()
-                                    .on_click(cx.listener(|this, _, _, cx| {
-                                        this.state.toggle_keyframe_at_playhead();
-                                        cx.notify();
-                                    }))
-                                    .child(format!("◆ KF ({})", clip.keyframes.len())),
-                            ),
-                    )
+                    .when(clip.track == TrackKind::Video, |el| {
+                        el.child(
+                            div()
+                                .id("ins-rev-btn")
+                                .w_full()
+                                .py_1()
+                                .rounded_sm()
+                                .bg(if clip.reversed {
+                                    Theme::accent()
+                                } else {
+                                    Theme::bg_surface()
+                                })
+                                .border_1()
+                                .border_color(Theme::border())
+                                .text_xs()
+                                .text_center()
+                                .text_color(Theme::text_primary())
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.state.toggle_reverse_selected() {
+                                        this.sync_preview_after_seek(cx);
+                                    }
+                                    cx.notify();
+                                }))
+                                .child("⟲ Reverse"),
+                        )
+                    })
                     .when(clip.track.is_audible(), |el| {
                         let max_fade = (clip.duration_secs * 0.5).clamp(0.1, 5.0);
                         el.child(self.inspector_slider(
@@ -5129,7 +5275,7 @@ impl EditorView {
                                 self.icon_button(
                                     "tl-rot90",
                                     "↻",
-                                    "Rotate 90°",
+                                    "Rotate (0° / 90° / 180° / 270°)",
                                     false,
                                     selected_clip_id.is_some(),
                                 )
@@ -5827,17 +5973,20 @@ impl Render for EditorView {
                             | SliderField::ShadowOffset
                             | SliderField::BgPadding
                     ) {
-                        let now = Instant::now();
-                        let due = this
-                            .last_rotate_sync
-                            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(35));
-                        if due {
-                            this.last_rotate_sync = Some(now);
-                            if field == SliderField::Rotation {
-                                this.sync_preview_after_seek(cx);
-                            } else {
-                                this.sync_rotated_texts(cx);
+                        if field == SliderField::Rotation {
+                            this.sync_rotated_texts(cx);
+                            this.sync_rotated_overlays(cx);
+                            if let Some((flip_h, rot)) = this
+                                .state
+                                .active_clips_at_playhead()
+                                .into_iter()
+                                .find(|c| c.track == TrackKind::Video)
+                                .map(|v| (v.flip_h, v.evaluate_at(this.state.playhead_secs).3))
+                            {
+                                this.refresh_video_frame_transform(flip_h, rot, cx);
                             }
+                        } else {
+                            this.sync_rotated_texts(cx);
                         }
                     }
                     cx.notify();
@@ -5970,21 +6119,23 @@ impl Render for EditorView {
                                 } else {
                                     format!("Rotate: {:.0}°", c.rotation_deg)
                                 };
-                                rotate_sync_needed =
-                                    c.track == TrackKind::Video || c.track == TrackKind::Text;
+                                rotate_sync_needed = c.track.is_visual();
                             }
                         }
                         c.sync_keyframe_if_animated(playhead);
                     }
                     this.active_snap_guides = next_guides;
                     if rotate_sync_needed {
-                        let now = Instant::now();
-                        let due = this
-                            .last_rotate_sync
-                            .is_none_or(|t| now.duration_since(t) >= Duration::from_millis(35));
-                        if due {
-                            this.last_rotate_sync = Some(now);
-                            this.sync_preview_after_seek(cx);
+                        this.sync_rotated_texts(cx);
+                        this.sync_rotated_overlays(cx);
+                        if let Some((flip_h, rot)) = this
+                            .state
+                            .active_clips_at_playhead()
+                            .into_iter()
+                            .find(|c| c.track == TrackKind::Video)
+                            .map(|v| (v.flip_h, v.evaluate_at(this.state.playhead_secs).3))
+                        {
+                            this.refresh_video_frame_transform(flip_h, rot, cx);
                         }
                     }
                     cx.notify();
