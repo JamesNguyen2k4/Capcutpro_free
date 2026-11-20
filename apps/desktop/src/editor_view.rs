@@ -4621,21 +4621,34 @@ impl EditorView {
         let tc = rot_pt(0.0, -hh);
         let rh = rot_pt(0.0, -(hh + 24.0));
 
+        let resize_cursor_for_angle = |base_deg: f32| -> gpui::CursorStyle {
+            let deg = (base_deg + init_rot).rem_euclid(180.0);
+            if !(22.5..157.5).contains(&deg) {
+                gpui::CursorStyle::ResizeLeftRight
+            } else if deg < 67.5 {
+                gpui::CursorStyle::ResizeUpRightDownLeft
+            } else if deg < 112.5 {
+                gpui::CursorStyle::ResizeUpDown
+            } else {
+                gpui::CursorStyle::ResizeUpLeftDownRight
+            }
+        };
+
         let corners = [
-            ("tl", tl.0, tl.1, gpui::CursorStyle::ResizeUpRightDownLeft),
-            ("tr", tr.0, tr.1, gpui::CursorStyle::ResizeUpLeftDownRight),
-            ("bl", bl.0, bl.1, gpui::CursorStyle::ResizeUpLeftDownRight),
-            ("br", br.0, br.1, gpui::CursorStyle::ResizeUpRightDownLeft),
+            ("tl", tl.0, tl.1, resize_cursor_for_angle(45.0)),
+            ("tr", tr.0, tr.1, resize_cursor_for_angle(135.0)),
+            ("bl", bl.0, bl.1, resize_cursor_for_angle(135.0)),
+            ("br", br.0, br.1, resize_cursor_for_angle(45.0)),
         ];
         let em_t = rot_pt(0.0, -hh);
         let em_b = rot_pt(0.0, hh);
         let em_l = rot_pt(-hw, 0.0);
         let em_r = rot_pt(hw, 0.0);
         let edges = [
-            ("top", em_t.0, em_t.1, gpui::CursorStyle::ResizeUpDown),
-            ("bottom", em_b.0, em_b.1, gpui::CursorStyle::ResizeUpDown),
-            ("left", em_l.0, em_l.1, gpui::CursorStyle::ResizeLeftRight),
-            ("right", em_r.0, em_r.1, gpui::CursorStyle::ResizeLeftRight),
+            ("top", em_t.0, em_t.1, resize_cursor_for_angle(90.0)),
+            ("bottom", em_b.0, em_b.1, resize_cursor_for_angle(90.0)),
+            ("left", em_l.0, em_l.1, resize_cursor_for_angle(0.0)),
+            ("right", em_r.0, em_r.1, resize_cursor_for_angle(0.0)),
         ];
 
         let is_rotating_now = self.preview_text_drag.as_ref().is_some_and(|d| {
@@ -4939,59 +4952,67 @@ impl EditorView {
                     );
                 }
 
+                let is_moving_vid = self.preview_text_drag.as_ref().is_some_and(|d| {
+                    d.clip_id == vid && matches!(d.kind, PreviewTransformKind::Move)
+                });
+                let norm_rot = erot.rem_euclid(360.0);
+                let (render_w, render_h) = if norm_rot > 0.5 && norm_rot < 359.5 {
+                    let rad = norm_rot.to_radians();
+                    let c = rad.cos().abs();
+                    let s = rad.sin().abs();
+                    let bw = preview_w * vscale;
+                    let bh = preview_h * vscale;
+                    (bw * c + bh * s, bw * s + bh * c)
+                } else {
+                    (preview_w * vscale, preview_h * vscale)
+                };
+
                 div()
-                    .id(SharedString::from(format!("pv-vid-{}", vid)))
                     .size_full()
                     .flex()
                     .items_center()
                     .justify_center()
-                    .cursor(gpui::CursorStyle::OpenHand)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, event: &MouseDownEvent, _, cx| {
-                            cx.stop_propagation();
-                            this.state.selected_clip_id = Some(vid);
-                            this.editing_text_clip_id = None;
-                            this.state.push_undo();
-                            this.preview_text_drag = Some(PreviewTextDragState {
-                                clip_id: vid,
-                                kind: PreviewTransformKind::Move,
-                                start_mouse_x: f32::from(event.position.x),
-                                start_mouse_y: f32::from(event.position.y),
-                                initial_pos_x: epx,
-                                initial_pos_y: epy,
-                                initial_scale: esc,
-                                initial_font_size: 48.0,
-                                initial_rot: erot,
-                                center_x: obj_cx,
-                                center_y: obj_cy,
-                                preview_scale,
-                                moved: false,
-                            });
-                            cx.notify();
-                        }),
-                    )
-                    .child({
-                        let norm_rot = erot.rem_euclid(360.0);
-                        let (render_w, render_h) = if norm_rot > 0.5 && norm_rot < 359.5 {
-                            let rad = norm_rot.to_radians();
-                            let c = rad.cos().abs();
-                            let s = rad.sin().abs();
-                            let bw = preview_w * vscale;
-                            let bh = preview_h * vscale;
-                            (bw * c + bh * s, bw * s + bh * c)
-                        } else {
-                            (preview_w * vscale, preview_h * vscale)
-                        };
+                    .child(
                         div()
+                            .id(SharedString::from(format!("pv-vid-{}", vid)))
                             .relative()
                             .left(px(vox))
                             .top(px(voy))
                             .w(px(render_w))
                             .h(px(render_h))
                             .opacity(valpha)
-                            .child(img(frame).size_full().object_fit(ObjectFit::Contain))
-                    })
+                            .cursor(if is_moving_vid {
+                                gpui::CursorStyle::ClosedHand
+                            } else {
+                                gpui::CursorStyle::OpenHand
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.state.selected_clip_id = Some(vid);
+                                    this.editing_text_clip_id = None;
+                                    this.state.push_undo();
+                                    this.preview_text_drag = Some(PreviewTextDragState {
+                                        clip_id: vid,
+                                        kind: PreviewTransformKind::Move,
+                                        start_mouse_x: f32::from(event.position.x),
+                                        start_mouse_y: f32::from(event.position.y),
+                                        initial_pos_x: epx,
+                                        initial_pos_y: epy,
+                                        initial_scale: esc,
+                                        initial_font_size: 48.0,
+                                        initial_rot: erot,
+                                        center_x: obj_cx,
+                                        center_y: obj_cy,
+                                        preview_scale,
+                                        moved: false,
+                                    });
+                                    cx.notify();
+                                }),
+                            )
+                            .child(img(frame).size_full().object_fit(ObjectFit::Contain)),
+                    )
                     .into_any_element()
             } else {
                 self.render_empty_preview(
@@ -5420,6 +5441,26 @@ impl EditorView {
                     .flex()
                     .items_center()
                     .justify_center()
+                    .when_some(self.preview_text_drag.as_ref(), |el, pdrag| {
+                        let drag_cursor = match pdrag.kind {
+                            PreviewTransformKind::Move => gpui::CursorStyle::ClosedHand,
+                            PreviewTransformKind::Rotate => gpui::CursorStyle::PointingHand,
+                            PreviewTransformKind::ResizeCorner => gpui::CursorStyle::Crosshair,
+                        };
+                        el.cursor(drag_cursor)
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, _, cx| {
+                            if this.state.selected_clip_id.is_some()
+                                || this.editing_text_clip_id.is_some()
+                            {
+                                this.state.selected_clip_id = None;
+                                this.editing_text_clip_id = None;
+                                cx.notify();
+                            }
+                        }),
+                    )
                     .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _, cx| {
                         if !event.modifiers.control {
                             return;

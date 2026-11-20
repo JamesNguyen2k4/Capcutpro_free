@@ -247,6 +247,26 @@ pub fn rotate_bgra_bytes_fast(
     flip_h: bool,
     rot_deg: f32,
 ) -> (Vec<u8>, u32, u32) {
+    const FAST_MAX_DIM: u32 = 540;
+    if w.max(h) > FAST_MAX_DIM && w > 0 && h > 0 && src.len() >= (w * h * 4) as usize {
+        // Decimate the source (nearest) so interactive drags touch ~10x fewer pixels.
+        let step_num = w.max(h) as f32 / FAST_MAX_DIM as f32;
+        let nw = ((w as f32 / step_num) as u32).max(1);
+        let nh = ((h as f32 / step_num) as u32).max(1);
+        let mut small = vec![0u8; (nw * nh * 4) as usize];
+        for y in 0..nh {
+            let sy = ((y as u64 * h as u64) / nh as u64) as usize;
+            let src_row = sy * w as usize * 4;
+            let dst_row = y as usize * nw as usize * 4;
+            for x in 0..nw {
+                let sx = ((x as u64 * w as u64) / nw as u64) as usize;
+                let s = src_row + sx * 4;
+                let d = dst_row + x as usize * 4;
+                small[d..d + 4].copy_from_slice(&src[s..s + 4]);
+            }
+        }
+        return rotate_bgra_bytes_fast(&small, nw, nh, flip_h, rot_deg);
+    }
     let norm_rot = rot_deg.rem_euclid(360.0);
     if (!flip_h && (norm_rot <= 0.5 || norm_rot >= 359.5))
         || (norm_rot - 90.0).abs() <= 0.5
