@@ -1,4 +1,4 @@
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,7 +10,7 @@ use smallvec::smallvec;
 
 use opencut_core::{
     AspectRatio, ClipCrop, ClipKeyframe, TextAnimation, TextClipData, TimelineClip, Track,
-    TrackFlags, TrackKind,
+    TrackFlags, TrackKind, TransitionKind, VideoEffect,
 };
 
 pub fn preview_dimensions(aspect_ratio: AspectRatio, preview_height: u32) -> (u32, u32) {
@@ -303,6 +303,692 @@ fn append_color_filter(
         let rs = (temperature * 0.25).clamp(-0.4, 0.4);
         let bs = (-temperature * 0.25).clamp(-0.4, 0.4);
         parts.push(format!("colorbalance=rs={rs:.3}:bs={bs:.3}"));
+    }
+}
+
+pub fn apply_effect_bgra(
+    bytes: &mut [u8],
+    w: u32,
+    h: u32,
+    effect: VideoEffect,
+    intensity: f32,
+) {
+    apply_effect_bgra_at(bytes, w, h, effect, 0.0, intensity, 1.0, 1.0, 0.5, 0xfacc15);
+}
+
+pub fn apply_effect_bgra_at(
+    bytes: &mut [u8],
+    w: u32,
+    h: u32,
+    effect: VideoEffect,
+    time_secs: f32,
+    intensity: f32,
+    speed: f32,
+    size: f32,
+    distance: f32,
+    color_hex: u32,
+) {
+    let amt = intensity.clamp(0.0, 1.0);
+    if effect == VideoEffect::None || amt < 0.01 || w < 4 || h < 4 {
+        return;
+    }
+    let sw = w as usize;
+    let sh = h as usize;
+    if bytes.len() < sw * sh * 4 {
+        return;
+    }
+    let spd = speed.clamp(0.1, 4.0);
+    let sz = size.clamp(0.1, 2.5);
+    let dist = distance.clamp(0.0, 1.5);
+    let er = ((color_hex >> 16) & 0xff) as f32;
+    let eg = ((color_hex >> 8) & 0xff) as f32;
+    let eb = (color_hex & 0xff) as f32;
+    let t = time_secs * spd;
+
+    match effect {
+        VideoEffect::None => {}
+        VideoEffect::Sepia | VideoEffect::OldCam => {
+            let t_tick = (t * 24.0) as u32;
+            for (idx, px) in bytes.chunks_exact_mut(4).enumerate() {
+                if px[3] == 0 {
+                    continue;
+                }
+                let b = px[0] as f32;
+                let g = px[1] as f32;
+                let r = px[2] as f32;
+                let sr = (0.393 * r + 0.769 * g + 0.189 * b).min(255.0);
+                let sg = (0.349 * r + 0.686 * g + 0.168 * b).min(255.0);
+                let sb = (0.272 * r + 0.534 * g + 0.131 * b).min(255.0);
+                let mut nr = r + (sr - r) * amt;
+                let mut ng = g + (sg - g) * amt;
+                let mut nb = b + (sb - b) * amt;
+                if effect == VideoEffect::OldCam {
+                    let y = idx / sw;
+                    let n = ((idx as u32).wrapping_mul(747796405).wrapping_add(t_tick * 2891336453) >> 24) as f32 - 128.0;
+                    let grain = n * amt * 0.25;
+                    let scan = if y % 3 == 0 { 0.88 } else { 1.0 };
+                    nr = (nr * scan + grain).clamp(0.0, 255.0);
+                    ng = (ng * scan + grain).clamp(0.0, 255.0);
+                    nb = (nb * scan + grain).clamp(0.0, 255.0);
+                }
+                px[2] = nr.clamp(0.0, 255.0) as u8;
+                px[1] = ng.clamp(0.0, 255.0) as u8;
+                px[0] = nb.clamp(0.0, 255.0) as u8;
+            }
+        }
+        VideoEffect::Grain => {
+            let t_tick = (t * 30.0) as u32;
+            let amp = amt * 48.0;
+            for (idx, px) in bytes.chunks_exact_mut(4).enumerate() {
+                if px[3] == 0 {
+                    continue;
+                }
+                let hash = ((idx as u32).wrapping_mul(1664525).wrapping_add(1013904223 ^ t_tick.wrapping_mul(2654435761)) >> 24) as f32 / 255.0 - 0.5;
+                let d = hash * amp;
+                px[0] = (px[0] as f32 + d).clamp(0.0, 255.0) as u8;
+                px[1] = (px[1] as f32 + d).clamp(0.0, 255.0) as u8;
+                px[2] = (px[2] as f32 + d).clamp(0.0, 255.0) as u8;
+            }
+        }
+        VideoEffect::Vignette => {
+            let cx = sw as f32 * 0.5;
+            let cy = sh as f32 * 0.5;
+            let inv_rx2 = 1.0 / ((cx * cx) * sz.max(0.25)).max(1.0);
+            let inv_ry2 = 1.0 / ((cy * cy) * sz.max(0.25)).max(1.0);
+            let strength = amt * 0.9;
+            for y in 0..sh {
+                let dy = y as f32 - cy;
+                let dy2 = dy * dy * inv_ry2;
+                let row = y * sw * 4;
+                for x in 0..sw {
+                    let dx = x as f32 - cx;
+                    let d2 = ((dx * dx * inv_rx2 + dy2) * 0.5).min(1.5);
+                    let fac = (1.0 - d2 * strength).clamp(0.1, 1.0);
+                    let i = row + x * 4;
+                    bytes[i] = (bytes[i] as f32 * fac) as u8;
+                    bytes[i + 1] = (bytes[i + 1] as f32 * fac) as u8;
+                    bytes[i + 2] = (bytes[i + 2] as f32 * fac) as u8;
+                }
+            }
+        }
+        VideoEffect::Blur => {
+            let r = ((amt * sz * 6.0).round() as usize).clamp(1, 10);
+            let mut tmp = bytes.to_vec();
+            for y in 0..sh {
+                let row = y * sw * 4;
+                for x in 0..sw {
+                    let x0 = x.saturating_sub(r);
+                    let x1 = (x + r).min(sw - 1);
+                    let cnt = (x1 - x0 + 1) as f32;
+                    let (mut sb, mut sg, mut sr) = (0u32, 0u32, 0u32);
+                    for xx in x0..=x1 {
+                        let idx = row + xx * 4;
+                        sb += bytes[idx] as u32;
+                        sg += bytes[idx + 1] as u32;
+                        sr += bytes[idx + 2] as u32;
+                    }
+                    let di = row + x * 4;
+                    tmp[di] = (sb as f32 / cnt) as u8;
+                    tmp[di + 1] = (sg as f32 / cnt) as u8;
+                    tmp[di + 2] = (sr as f32 / cnt) as u8;
+                }
+            }
+            for y in 0..sh {
+                let y0 = y.saturating_sub(r);
+                let y1 = (y + r).min(sh - 1);
+                let cnt = (y1 - y0 + 1) as f32;
+                let row = y * sw * 4;
+                for x in 0..sw {
+                    let (mut sb, mut sg, mut sr) = (0u32, 0u32, 0u32);
+                    for yy in y0..=y1 {
+                        let idx = (yy * sw + x) * 4;
+                        sb += tmp[idx] as u32;
+                        sg += tmp[idx + 1] as u32;
+                        sr += tmp[idx + 2] as u32;
+                    }
+                    let di = row + x * 4;
+                    bytes[di] = (sb as f32 / cnt) as u8;
+                    bytes[di + 1] = (sg as f32 / cnt) as u8;
+                    bytes[di + 2] = (sr as f32 / cnt) as u8;
+                }
+            }
+        }
+        VideoEffect::Sharpen => {
+            let src = bytes.to_vec();
+            let k = amt * 1.6;
+            for y in 1..(sh - 1) {
+                for x in 1..(sw - 1) {
+                    let i = (y * sw + x) * 4;
+                    for c in 0..3 {
+                        let center = src[i + c] as f32;
+                        let avg = (src[i - 4 + c] as f32
+                            + src[i + 4 + c] as f32
+                            + src[i - sw * 4 + c] as f32
+                            + src[i + sw * 4 + c] as f32)
+                            * 0.25;
+                        bytes[i + c] = (center + (center - avg) * k).clamp(0.0, 255.0) as u8;
+                    }
+                }
+            }
+        }
+        VideoEffect::Magnify | VideoEffect::PulseZoom => {
+            let src = bytes.to_vec();
+            let zoom = if effect == VideoEffect::PulseZoom {
+                let pulse = (t * 6.0).sin().abs();
+                1.0 + amt * sz * 0.35 * pulse
+            } else {
+                1.0 + amt * sz * 0.45
+            };
+            let cx = sw as f32 * 0.5;
+            let cy = sh as f32 * 0.5;
+            let inv_z = 1.0 / zoom.max(1.0);
+            for y in 0..sh {
+                let sy = ((y as f32 - cy) * inv_z + cy).clamp(0.0, (sh - 1) as f32) as usize;
+                let row = y * sw * 4;
+                let srow = sy * sw * 4;
+                for x in 0..sw {
+                    let sx = ((x as f32 - cx) * inv_z + cx).clamp(0.0, (sw - 1) as f32) as usize;
+                    let di = row + x * 4;
+                    let si = srow + sx * 4;
+                    bytes[di..di + 4].copy_from_slice(&src[si..si + 4]);
+                }
+            }
+        }
+        VideoEffect::RgbSplit => {
+            let src = bytes.to_vec();
+            let shift = ((amt * dist * 24.0).round() as isize).max(1);
+            for y in 0..sh {
+                let row = y * sw * 4;
+                for x in 0..sw {
+                    let xr = (x as isize + shift).clamp(0, sw as isize - 1) as usize;
+                    let xb = (x as isize - shift).clamp(0, sw as isize - 1) as usize;
+                    bytes[row + x * 4 + 2] = src[row + xr * 4 + 2];
+                    bytes[row + x * 4] = src[row + xb * 4];
+                }
+            }
+        }
+        VideoEffect::Vhs | VideoEffect::Glitch => {
+            let src = bytes.to_vec();
+            let tick = (t * 15.0) as u32;
+            let max_shift = (amt * dist * 28.0).max(2.0);
+            for y in 0..sh {
+                let row = y * sw * 4;
+                let band = (y / 8) as u32;
+                let hval = band.wrapping_mul(1103515245).wrapping_add(tick * 12345);
+                let jitter = if (hval % 7) == 0 {
+                    (((hval >> 8) % 21) as f32 - 10.0) * (max_shift / 10.0)
+                } else if effect == VideoEffect::Vhs {
+                    ((y as f32 * 0.12 + t * 8.0).sin()) * amt * 3.0
+                } else {
+                    0.0
+                } as isize;
+                let scan = if effect == VideoEffect::Vhs && y % 2 == 0 {
+                    0.85
+                } else {
+                    1.0
+                };
+                for x in 0..sw {
+                    let sx = (x as isize + jitter).clamp(0, sw as isize - 1) as usize;
+                    let xr = (sx as isize + 3).clamp(0, sw as isize - 1) as usize;
+                    let di = row + x * 4;
+                    let si = row + sx * 4;
+                    bytes[di] = (src[si] as f32 * scan) as u8;
+                    bytes[di + 1] = (src[si + 1] as f32 * scan) as u8;
+                    bytes[di + 2] = (src[row + xr * 4 + 2] as f32 * scan) as u8;
+                }
+            }
+        }
+        VideoEffect::Shake | VideoEffect::Swing => {
+            let src = bytes.to_vec();
+            let (ox, oy) = if effect == VideoEffect::Shake {
+                (
+                    ((t * 28.0).sin() * amt * dist * 22.0) as isize,
+                    ((t * 35.0).cos() * amt * dist * 16.0) as isize,
+                )
+            } else {
+                (((t * 4.0).sin() * amt * dist * 32.0) as isize, 0)
+            };
+            for y in 0..sh {
+                let sy = (y as isize + oy).clamp(0, sh as isize - 1) as usize;
+                let row = y * sw * 4;
+                let srow = sy * sw * 4;
+                for x in 0..sw {
+                    let sx = (x as isize + ox).clamp(0, sw as isize - 1) as usize;
+                    let di = row + x * 4;
+                    let si = srow + sx * 4;
+                    bytes[di..di + 4].copy_from_slice(&src[si..si + 4]);
+                }
+            }
+        }
+        VideoEffect::LensFlare | VideoEffect::LightLeak | VideoEffect::Rays => {
+            let lx = sw as f32 * (0.2 + dist * 0.6).clamp(0.1, 0.9);
+            let ly = sh as f32 * 0.25;
+            let rad = (sw.min(sh) as f32 * 0.45 * sz).max(20.0);
+            let inv_r2 = 1.0 / (rad * rad);
+            for y in 0..sh {
+                let dy = y as f32 - ly;
+                let row = y * sw * 4;
+                for x in 0..sw {
+                    let dx = x as f32 - lx;
+                    let d2 = (dx * dx + dy * dy) * inv_r2;
+                    let mut glow = (1.0 - d2).max(0.0).powi(2) * amt * 0.75;
+                    if effect == VideoEffect::Rays {
+                        let ang = dy.atan2(dx);
+                        glow *= 0.5 + 0.5 * (ang * 8.0 + t).sin().abs();
+                    } else if effect == VideoEffect::LightLeak {
+                        let edge = ((sw as f32 - x as f32) / sw as f32).powi(2);
+                        glow = (glow + edge * amt * 0.45).min(0.85);
+                    }
+                    if glow > 0.01 {
+                        let i = row + x * 4;
+                        bytes[i] = (bytes[i] as f32 + eb * glow).min(255.0) as u8;
+                        bytes[i + 1] = (bytes[i + 1] as f32 + eg * glow).min(255.0) as u8;
+                        bytes[i + 2] = (bytes[i + 2] as f32 + er * glow).min(255.0) as u8;
+                    }
+                }
+            }
+        }
+        VideoEffect::Flash => {
+            let pulse = ((t * 8.0).sin() * 0.5 + 0.5).powi(3) * amt * 0.85;
+            if pulse > 0.02 {
+                for px in bytes.chunks_exact_mut(4) {
+                    if px[3] == 0 {
+                        continue;
+                    }
+                    px[0] = (px[0] as f32 + eb * pulse).min(255.0) as u8;
+                    px[1] = (px[1] as f32 + eg * pulse).min(255.0) as u8;
+                    px[2] = (px[2] as f32 + er * pulse).min(255.0) as u8;
+                }
+            }
+        }
+        VideoEffect::Rain | VideoEffect::Snow | VideoEffect::Dust | VideoEffect::Sparkle | VideoEffect::Bokeh => {
+            let count = (28.0 + amt * 60.0) as usize;
+            let p_rad = (2.0 * sz).max(1.0) as isize;
+            for idx in 0..count {
+                let seed = (idx as u32).wrapping_mul(2654435761);
+                let x_norm = ((seed & 0xffff) as f32) / 65535.0;
+                let y_norm = (((seed >> 16) & 0xffff) as f32) / 65535.0;
+                let y_pos = match effect {
+                    VideoEffect::Rain => ((y_norm + t * 1.6) % 1.0) * sh as f32,
+                    VideoEffect::Snow => ((y_norm + t * 0.35) % 1.0) * sh as f32,
+                    _ => y_norm * sh as f32,
+                };
+                let x_pos = match effect {
+                    VideoEffect::Snow => ((x_norm + (t * 1.5 + idx as f32).sin() * 0.03).rem_euclid(1.0)) * sw as f32,
+                    _ => x_norm * sw as f32,
+                };
+                let alpha = match effect {
+                    VideoEffect::Sparkle => ((t * 6.0 + idx as f32).sin() * 0.5 + 0.5) * amt,
+                    VideoEffect::Bokeh => amt * 0.35,
+                    _ => amt * 0.75,
+                };
+                if alpha < 0.05 {
+                    continue;
+                }
+                let cx = x_pos as isize;
+                let cy = y_pos as isize;
+                let (rx, ry) = match effect {
+                    VideoEffect::Rain => (0isize, (6.0 * sz) as isize),
+                    VideoEffect::Bokeh => ((p_rad * 4).max(4), (p_rad * 4).max(4)),
+                    _ => (p_rad, p_rad),
+                };
+                for dy in -ry..=ry {
+                    let py = cy + dy;
+                    if py < 0 || py >= sh as isize {
+                        continue;
+                    }
+                    for dx in -rx..=rx {
+                        let px_x = cx + dx;
+                        if px_x < 0 || px_x >= sw as isize {
+                            continue;
+                        }
+                        if rx > 1 && ry > 1 && dx * dx + dy * dy > rx * rx {
+                            continue;
+                        }
+                        let i = (py as usize * sw + px_x as usize) * 4;
+                        let (cr, cg, cb) = if matches!(effect, VideoEffect::Rain | VideoEffect::Snow) {
+                            (235.0, 245.0, 255.0)
+                        } else {
+                            (er, eg, eb)
+                        };
+                        bytes[i] = (bytes[i] as f32 * (1.0 - alpha) + cb * alpha).min(255.0) as u8;
+                        bytes[i + 1] = (bytes[i + 1] as f32 * (1.0 - alpha) + cg * alpha).min(255.0) as u8;
+                        bytes[i + 2] = (bytes[i + 2] as f32 * (1.0 - alpha) + cr * alpha).min(255.0) as u8;
+                    }
+                }
+            }
+        }
+        VideoEffect::FilmBorder | VideoEffect::CamFrame | VideoEffect::RecHud => {
+            let border_h = ((sh as f32 * 0.11 * sz * amt) as usize).clamp(4, sh / 3);
+            if effect == VideoEffect::FilmBorder {
+                for y in 0..sh {
+                    if y < border_h || y >= sh - border_h {
+                        let row = y * sw * 4;
+                        for x in 0..sw {
+                            let i = row + x * 4;
+                            bytes[i] = 10;
+                            bytes[i + 1] = 10;
+                            bytes[i + 2] = 12;
+                        }
+                    }
+                }
+            } else {
+                let pad = (sw.min(sh) / 16).max(6);
+                let len = (sw.min(sh) / 7).max(12);
+                let thick = (2.0 * sz).max(2.0) as usize;
+                let draw_px = |buf: &mut [u8], x: usize, y: usize, b: u8, g: u8, r: u8| {
+                    if x < sw && y < sh {
+                        let i = (y * sw + x) * 4;
+                        buf[i] = b;
+                        buf[i + 1] = g;
+                        buf[i + 2] = r;
+                    }
+                };
+                for t_off in 0..thick {
+                    for d in 0..len {
+                        // 4 corner L-brackets
+                        draw_px(bytes, pad + d, pad + t_off, eb as u8, eg as u8, er as u8);
+                        draw_px(bytes, pad + t_off, pad + d, eb as u8, eg as u8, er as u8);
+                        draw_px(bytes, sw - 1 - pad - d, pad + t_off, eb as u8, eg as u8, er as u8);
+                        draw_px(bytes, sw - 1 - pad - t_off, pad + d, eb as u8, eg as u8, er as u8);
+                        draw_px(bytes, pad + d, sh - 1 - pad - t_off, eb as u8, eg as u8, er as u8);
+                        draw_px(bytes, pad + t_off, sh - 1 - pad - d, eb as u8, eg as u8, er as u8);
+                        draw_px(bytes, sw - 1 - pad - d, sh - 1 - pad - t_off, eb as u8, eg as u8, er as u8);
+                        draw_px(bytes, sw - 1 - pad - t_off, sh - 1 - pad - d, eb as u8, eg as u8, er as u8);
+                    }
+                }
+                if effect == VideoEffect::RecHud && ((t * 2.0) as u32 % 2 == 0) {
+                    // Blinking red REC dot
+                    let r_cx = pad + 16;
+                    let r_cy = pad + 16;
+                    for dy in -6isize..=6 {
+                        for dx in -6isize..=6 {
+                            if dx * dx + dy * dy <= 36 {
+                                draw_px(bytes, (r_cx as isize + dx) as usize, (r_cy as isize + dy) as usize, 40, 40, 239);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn append_effect_filter(parts: &mut Vec<String>, effect: VideoEffect, intensity: f32) {
+    let amt = intensity.clamp(0.0, 1.0);
+    if effect == VideoEffect::None || amt < 0.01 {
+        return;
+    }
+    match effect {
+        VideoEffect::None => {}
+        VideoEffect::Blur => {
+            let luma_r = (amt * 12.0).clamp(1.0, 14.0);
+            parts.push(format!("boxblur={luma_r:.1}:1"));
+        }
+        VideoEffect::Grain | VideoEffect::OldCam => {
+            let strength = (amt * 28.0).clamp(4.0, 35.0);
+            parts.push(format!("noise=alls={strength:.0}:allf=t+u"));
+        }
+        VideoEffect::Vignette => {
+            let angle = (0.25 + amt * 0.65).clamp(0.2, 1.0);
+            parts.push(format!("vignette=angle=PI/{:.2}", 1.0 / angle));
+        }
+        VideoEffect::Sharpen => {
+            let la = (0.3 + amt * 1.7).clamp(0.3, 2.0);
+            parts.push(format!("unsharp=5:5:{la:.2}:5:5:0.0"));
+        }
+        VideoEffect::Sepia => {
+            let m = amt;
+            let inv = 1.0 - m;
+            parts.push(format!(
+                "colorchannelmixer=rr={:.3}:rg={:.3}:rb={:.3}:gr={:.3}:gg={:.3}:gb={:.3}:br={:.3}:bg={:.3}:bb={:.3}",
+                inv + 0.393 * m,
+                0.769 * m,
+                0.189 * m,
+                0.349 * m,
+                inv + 0.686 * m,
+                0.168 * m,
+                0.272 * m,
+                0.534 * m,
+                inv + 0.131 * m
+            ));
+        }
+        VideoEffect::RgbSplit | VideoEffect::Vhs | VideoEffect::Glitch => {
+            let shift = (amt * 12.0).round().max(2.0);
+            parts.push(format!("rgbashift=rh={shift:.0}:bh=-{shift:.0}"));
+        }
+        VideoEffect::Magnify | VideoEffect::PulseZoom => {
+            let z = 1.0 + amt * 0.25;
+            parts.push(format!("crop=iw/{z:.3}:ih/{z:.3},scale=iw*{z:.3}:ih*{z:.3}"));
+        }
+        VideoEffect::FilmBorder => {
+            let bh = (amt * 0.12).clamp(0.02, 0.18);
+            parts.push(format!(
+                "drawbox=x=0:y=0:w=iw:h=ih*{bh:.3}:color=black:t=fill,drawbox=x=0:y=ih*(1-{bh:.3}):w=iw:h=ih*{bh:.3}:color=black:t=fill"
+            ));
+        }
+        VideoEffect::LensFlare
+        | VideoEffect::LightLeak
+        | VideoEffect::Rays
+        | VideoEffect::Flash => {
+            let b = (amt * 0.18).clamp(0.02, 0.25);
+            parts.push(format!("eq=brightness={b:.3}"));
+        }
+        VideoEffect::Shake
+        | VideoEffect::Swing
+        | VideoEffect::Rain
+        | VideoEffect::Snow
+        | VideoEffect::Dust
+        | VideoEffect::Sparkle
+        | VideoEffect::Bokeh
+        | VideoEffect::CamFrame
+        | VideoEffect::RecHud => {
+            // Subtle contrast/sharpen accent on export for overlay-style effects
+            let c = (1.0 + amt * 0.12).clamp(1.0, 1.2);
+            parts.push(format!("eq=contrast={c:.3}"));
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct CubeLut {
+    pub size: usize,
+    pub table: Vec<[f32; 3]>,
+}
+
+pub fn parse_cube_lut(path: &Path) -> Option<CubeLut> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut size: usize = 0;
+    let mut table: Vec<[f32; 3]> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix("LUT_3D_SIZE") {
+            size = rest.trim().parse::<usize>().ok()?;
+            table.reserve(size * size * size);
+            continue;
+        }
+        if trimmed.starts_with("TITLE")
+            || trimmed.starts_with("DOMAIN_MIN")
+            || trimmed.starts_with("DOMAIN_MAX")
+            || trimmed.starts_with("LUT_1D_SIZE")
+        {
+            continue;
+        }
+        let mut nums = trimmed.split_whitespace();
+        let (Some(r), Some(g), Some(b)) = (nums.next(), nums.next(), nums.next()) else {
+            continue;
+        };
+        if let (Ok(rv), Ok(gv), Ok(bv)) = (r.parse::<f32>(), g.parse::<f32>(), b.parse::<f32>()) {
+            table.push([rv.clamp(0.0, 1.0), gv.clamp(0.0, 1.0), bv.clamp(0.0, 1.0)]);
+        }
+    }
+    if size >= 2 && table.len() >= size * size * size {
+        table.truncate(size * size * size);
+        Some(CubeLut { size, table })
+    } else {
+        None
+    }
+}
+
+pub fn apply_cube_lut_bgra(bytes: &mut [u8], lut: &CubeLut) {
+    let n = lut.size;
+    if n < 2 || lut.table.len() < n * n * n {
+        return;
+    }
+    let max_idx = (n - 1) as f32;
+    let n2 = n * n;
+    for px in bytes.chunks_exact_mut(4) {
+        if px[3] == 0 {
+            continue;
+        }
+        let rf = (px[2] as f32 / 255.0) * max_idx;
+        let gf = (px[1] as f32 / 255.0) * max_idx;
+        let bf = (px[0] as f32 / 255.0) * max_idx;
+
+        let r0 = (rf as usize).min(n - 2);
+        let g0 = (gf as usize).min(n - 2);
+        let b0 = (bf as usize).min(n - 2);
+        let r1 = r0 + 1;
+        let g1 = g0 + 1;
+        let b1 = b0 + 1;
+        let dr = rf - r0 as f32;
+        let dg = gf - g0 as f32;
+        let db = bf - b0 as f32;
+
+        let idx = |r: usize, g: usize, b: usize| b * n2 + g * n + r;
+        let c000 = lut.table[idx(r0, g0, b0)];
+        let c100 = lut.table[idx(r1, g0, b0)];
+        let c010 = lut.table[idx(r0, g1, b0)];
+        let c110 = lut.table[idx(r1, g1, b0)];
+        let c001 = lut.table[idx(r0, g0, b1)];
+        let c101 = lut.table[idx(r1, g0, b1)];
+        let c011 = lut.table[idx(r0, g1, b1)];
+        let c111 = lut.table[idx(r1, g1, b1)];
+
+        for ch in 0..3 {
+            let c00 = c000[ch] + (c100[ch] - c000[ch]) * dr;
+            let c10 = c010[ch] + (c110[ch] - c010[ch]) * dr;
+            let c01 = c001[ch] + (c101[ch] - c001[ch]) * dr;
+            let c11 = c011[ch] + (c111[ch] - c011[ch]) * dr;
+            let c0 = c00 + (c10 - c00) * dg;
+            let c1 = c01 + (c11 - c01) * dg;
+            let val = c0 + (c1 - c0) * db;
+            let byte = (val.clamp(0.0, 1.0) * 255.0).round() as u8;
+            match ch {
+                0 => px[2] = byte,
+                1 => px[1] = byte,
+                _ => px[0] = byte,
+            }
+        }
+    }
+}
+
+fn append_lut_filter(parts: &mut Vec<String>, lut_path: Option<&PathBuf>) {
+    if let Some(p) = lut_path {
+        let esc = p.to_string_lossy().replace('\\', "/").replace(':', "\\:");
+        parts.push(format!("lut3d='{}'", esc));
+    }
+}
+
+pub struct VoiceoverRecorder {
+    child: Child,
+    pub output_path: PathBuf,
+    started_at: std::time::Instant,
+}
+
+fn find_dshow_audio_device() -> Option<String> {
+    let mut cmd = Command::new("ffmpeg");
+    apply_no_window(&mut cmd);
+    cmd.args(["-list_devices", "true", "-f", "dshow", "-i", "dummy"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let output = cmd.output().ok()?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for line in stderr.lines() {
+        if line.contains("(audio)") {
+            if let Some(q1) = line.find('"') {
+                if let Some(q2) = line[q1 + 1..].find('"') {
+                    return Some(line[q1 + 1..q1 + 1 + q2].to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+impl VoiceoverRecorder {
+    pub fn start() -> Result<Self, String> {
+        let device = find_dshow_audio_device()
+            .ok_or_else(|| "No microphone (DirectShow audio device) found".to_string())?;
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let out_dir = std::env::temp_dir().join("opencut_voiceover");
+        let _ = std::fs::create_dir_all(&out_dir);
+        let output_path = out_dir.join(format!("voiceover_{}.wav", ts));
+
+        let mut cmd = Command::new("ffmpeg");
+        apply_no_window(&mut cmd);
+        cmd.args([
+            "-y",
+            "-f",
+            "dshow",
+            "-i",
+            &format!("audio={}", device),
+            "-acodec",
+            "pcm_s16le",
+            "-ar",
+            "44100",
+            "-ac",
+            "2",
+        ])
+        .arg(&output_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+        let child = cmd
+            .spawn()
+            .map_err(|e| format!("Failed to start microphone recorder: {}", e))?;
+        Ok(Self {
+            child,
+            output_path,
+            started_at: std::time::Instant::now(),
+        })
+    }
+
+    pub fn elapsed_secs(&self) -> f32 {
+        self.started_at.elapsed().as_secs_f32()
+    }
+
+    pub fn stop(mut self) -> Option<(PathBuf, f32)> {
+        if let Some(mut stdin) = self.child.stdin.take() {
+            let _ = stdin.write_all(b"q\n");
+            let _ = stdin.flush();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            if let Ok(Some(_)) = self.child.try_wait() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = self.child.kill();
+                let _ = self.child.wait();
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(40));
+        }
+        let dur = probe_duration_secs(&self.output_path)
+            .unwrap_or_else(|| self.started_at.elapsed().as_secs_f32().max(0.5));
+        if self.output_path.exists() {
+            Some((self.output_path, dur))
+        } else {
+            None
+        }
     }
 }
 
@@ -1091,6 +1777,9 @@ fn build_audio_filter_chain(clip: &TimelineClip) -> String {
         af_parts.push(format!("atempo={:.3}", rem));
     }
     af_parts.push(format!("volume={:.2}", vol));
+    if clip.audio_normalized {
+        af_parts.push("loudnorm=I=-16:TP=-1.5:LRA=11".to_string());
+    }
     if clip.fade_in_secs > 0.05 {
         let d = clip.fade_in_secs.min(clip.duration_secs);
         af_parts.push(format!("afade=t=in:st=0:d={d:.3}"));
@@ -1132,6 +1821,8 @@ fn append_visual_clip_filters(
     append_crop_filter(&mut vf_parts, clip.crop);
     let (cb, cc, cs, ct) = clip.effective_color();
     append_color_filter(&mut vf_parts, cb, cc, cs, ct);
+    append_effect_filter(&mut vf_parts, clip.effect, clip.effect_intensity);
+    append_lut_filter(&mut vf_parts, clip.lut_path.as_ref());
     if clip.flip_h {
         vf_parts.push("hflip".into());
     }
@@ -1229,6 +1920,17 @@ fn append_visual_clip_filters(
             td = td
         ));
     }
+    if matches!(
+        clip.transition_out,
+        TransitionKind::Dissolve | TransitionKind::ZoomIn
+    ) {
+        let out_st = (clip.end_secs() - td).max(clip.start_secs);
+        vf_parts.push(format!(
+            "format=rgba,fade=t=out:st={out_st:.3}:d={td:.3}:alpha=1",
+            out_st = out_st,
+            td = td
+        ));
+    }
 
     let ox_raw = build_keyframe_expr(
         &clip.keyframes,
@@ -1247,7 +1949,7 @@ fn append_visual_clip_filters(
     } else {
         ox_raw
     };
-    let ox_expr = match clip.transition_in {
+    let ox_in = match clip.transition_in {
         TransitionKind::SlideLeft => format!(
             "if(lt(t-{st:.3},{td:.3}),({ox_base})+({ow:.0}*(1-(t-{st:.3})/{td:.3})),{ox_base})",
             st = clip.start_secs,
@@ -1261,6 +1963,22 @@ fn append_visual_clip_filters(
             ow = out_w as f32
         ),
         _ => ox_base,
+    };
+    let out_st = (clip.end_secs() - td).max(clip.start_secs);
+    let ox_expr = match clip.transition_out {
+        TransitionKind::SlideLeft => format!(
+            "if(gt(t,{out_st:.3}),({ox_in})-({ow:.0}*((t-{out_st:.3})/{td:.3})),{ox_in})",
+            out_st = out_st,
+            td = td,
+            ow = out_w as f32
+        ),
+        TransitionKind::SlideRight => format!(
+            "if(gt(t,{out_st:.3}),({ox_in})+({ow:.0}*((t-{out_st:.3})/{td:.3})),{ox_in})",
+            out_st = out_st,
+            td = td,
+            ow = out_w as f32
+        ),
+        _ => ox_in,
     };
     let oy_expr = if (res_scale - 1.0).abs() > 0.001 {
         format!("({oy_raw})*{res_scale:.4}")
@@ -1320,7 +2038,9 @@ pub fn start_export_timeline(
                 let flags = resolve_flags(c);
                 let visible = c.track == TrackKind::Audio || !flags.hidden;
                 let audible = c.track != TrackKind::Audio || !flags.muted;
-                let has_media = c.source_path.is_some() || (c.track == TrackKind::Text && c.text.is_some());
+                let has_media = c.source_path.is_some()
+                    || (c.track == TrackKind::Text && c.text.is_some())
+                    || c.track == TrackKind::Adjustment;
                 has_media && c.duration_secs > 0.05 && (visible || audible)
             })
             .collect();
@@ -1589,6 +2309,38 @@ pub fn start_export_timeline(
                 continue;
             }
 
+            if clip.track == TrackKind::Adjustment {
+                if !audio_only && !flags.hidden {
+                    let mut adj_parts = Vec::new();
+                    let (cb, cc, cs, ct) = clip.effective_color();
+                    append_color_filter(&mut adj_parts, cb, cc, cs, ct);
+                    append_effect_filter(&mut adj_parts, clip.effect, clip.effect_intensity);
+                    append_lut_filter(&mut adj_parts, clip.lut_path.as_ref());
+                    if !adj_parts.is_empty() {
+                        let a_base = format!("adj_a{}", video_step);
+                        let a_copy = format!("adj_b{}", video_step);
+                        let a_filt = format!("adj_f{}", video_step);
+                        let v_out = format!("vout{}", video_step);
+                        video_step += 1;
+                        let st = clip.start_secs;
+                        let en = clip.end_secs();
+                        filter_parts.push(format!(
+                            "{prev}split[{ab}][{ac}];[{ac}]{chain}[{af}];[{ab}][{af}]overlay=enable='between(t,{st:.3},{en:.3})'[{vo}]",
+                            prev = last_video_label,
+                            ab = a_base,
+                            ac = a_copy,
+                            chain = adj_parts.join(","),
+                            af = a_filt,
+                            st = st,
+                            en = en,
+                            vo = v_out,
+                        ));
+                        last_video_label = format!("[{}]", v_out);
+                    }
+                }
+                continue;
+            }
+
             let Some(path) = &clip.source_path else {
                 continue;
             };
@@ -1621,7 +2373,7 @@ pub fn start_export_timeline(
                         );
                     }
 
-                    if !flags.muted && clip.volume > 0 && has_audio_stream(path) {
+                    if !clip.audio_detached && !flags.muted && clip.volume > 0 && has_audio_stream(path) {
                         let a_label = format!("a{}", audio_step);
                         audio_step += 1;
                         let af = build_audio_filter_chain(clip);

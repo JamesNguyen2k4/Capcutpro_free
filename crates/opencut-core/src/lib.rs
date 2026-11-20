@@ -486,6 +486,7 @@ impl EditorCore {
             .iter()
             .filter(|c| {
                 c.track.is_audible()
+                    && !(c.track == TrackKind::Video && c.audio_detached)
                     && !self.is_clip_track_muted(c)
                     && c.volume > 0
                     && c.contains(time_secs)
@@ -665,7 +666,15 @@ impl EditorCore {
             fade_out_secs: 0.0,
             color: ColorAdjustment::default(),
             filter_preset: ColorFilterPreset::None,
+            lut_path: None,
+            audio_normalized: false,
+            audio_detached: false,
+            effect: VideoEffect::None,
+            effect_intensity: 0.5,
+            effect_params: EffectParams::default(),
             transition_in: TransitionKind::None,
+            transition_out: TransitionKind::None,
+            combo_anim: ComboAnimation::None,
             transition_dur_secs: 0.5,
             text: None,
             linked_clip_id: None,
@@ -1255,6 +1264,7 @@ impl EditorCore {
         }
 
         let (px, py, sc, rot, op) = self.clips[pos].evaluate_at(playhead);
+        let (ei, esp, esz, eds, _) = self.clips[pos].evaluate_effect_at(playhead);
         self.clips[pos].keyframes.push(ClipKeyframe {
             time_offset_secs: local_t,
             pos_x: px,
@@ -1262,6 +1272,10 @@ impl EditorCore {
             scale: sc,
             rotation_deg: rot,
             opacity: op,
+            effect_intensity: ei,
+            effect_speed: esp,
+            effect_size: esz,
+            effect_distance: eds,
         });
         self.clips[pos].keyframes.sort_by(|a, b| {
             a.time_offset_secs
@@ -1304,6 +1318,309 @@ impl EditorCore {
         self.status_message = format!("Inserted freeze frame at {:.1}s", playhead);
         true
     }
+
+    pub fn detach_audio_selected(&mut self) -> bool {
+        let Some(sel_id) = self.selected_clip_id else {
+            self.status_message = "Select a video clip to detach audio".into();
+            return false;
+        };
+        let Some(pos) = self.clips.iter().position(|c| c.id == sel_id) else {
+            return false;
+        };
+        if self.clips[pos].track != TrackKind::Video {
+            self.status_message = "Detach Audio only works on Video clips".into();
+            return false;
+        }
+        if self.clips[pos].audio_detached {
+            self.status_message = "Audio is already detached from this clip".into();
+            return false;
+        }
+        let Some(src_path) = self.clips[pos].source_path.clone() else {
+            return false;
+        };
+        let audio_track_id = self.default_track_id(TrackKind::Audio);
+        if self.track_flags_by_id(audio_track_id).locked {
+            self.status_message = "Audio track is locked".into();
+            return false;
+        }
+
+        self.push_undo();
+        let vclip = &mut self.clips[pos];
+        vclip.audio_detached = true;
+        vclip.linked_clip_id = None;
+        let name = format!("{} (Audio)", vclip.name);
+        let asset_id = vclip.asset_id;
+        let start_secs = vclip.start_secs;
+        let source_in_secs = vclip.source_in_secs;
+        let duration_secs = vclip.duration_secs;
+        let max_dur = vclip.max_source_duration_secs;
+        let speed = vclip.speed;
+        let volume = vclip.volume.max(1);
+        let fade_in = vclip.fade_in_secs;
+        let fade_out = vclip.fade_out_secs;
+        vclip.volume = 0;
+
+        let new_id = self.next_id;
+        self.next_id += 1;
+        let mut aclip = Self::build_clip_base(
+            new_id,
+            asset_id,
+            name,
+            Some(src_path),
+            TrackKind::Audio,
+            audio_track_id,
+            start_secs,
+            duration_secs,
+            max_dur,
+        );
+        aclip.source_in_secs = source_in_secs;
+        aclip.speed = speed;
+        aclip.volume = volume;
+        aclip.fade_in_secs = fade_in;
+        aclip.fade_out_secs = fade_out;
+        self.clips.push(aclip);
+        self.selected_clip_id = Some(new_id);
+        self.status_message = "Detached audio to Audio track (unlinked)".into();
+        true
+    }
+
+    pub fn ensure_track(&mut self, kind: TrackKind) -> usize {
+        if let Some(t) = self.tracks.iter().find(|t| t.kind == kind) {
+            t.id
+        } else {
+            self.add_track(kind)
+        }
+    }
+
+    pub fn add_adjustment_clip(&mut self, duration_secs: f32) -> Option<usize> {
+        let adj_track_id = self.ensure_track(TrackKind::Adjustment);
+        if self.track_flags_by_id(adj_track_id).locked {
+            self.status_message = "Adjustment track is locked".into();
+            return None;
+        }
+        self.push_undo();
+        let dur = duration_secs.clamp(0.5, 30.0);
+        let start = self.playhead_secs.max(0.0);
+        if start + dur > self.total_duration_secs {
+            self.total_duration_secs = (start + dur + 5.0).ceil();
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut clip = Self::build_clip_base(
+            id,
+            0,
+            format!("Adjustment {:.1}s", dur),
+            None,
+            TrackKind::Adjustment,
+            adj_track_id,
+            start,
+            dur,
+            3600.0,
+        );
+        clip.volume = 0;
+        self.clips.push(clip);
+        self.selected_clip_id = Some(id);
+        self.status_message = "Added Adjustment Layer at playhead".into();
+        Some(id)
+    }
+
+    pub fn add_effect_clip(&mut self, effect: VideoEffect, duration_secs: f32) -> Option<usize> {
+        let adj_track_id = self.ensure_track(TrackKind::Adjustment);
+        if self.track_flags_by_id(adj_track_id).locked {
+            self.status_message = "Effect/Adjustment track is locked".into();
+            return None;
+        }
+        self.push_undo();
+        let dur = duration_secs.clamp(0.5, 30.0);
+        let start = self.playhead_secs.max(0.0);
+        if start + dur > self.total_duration_secs {
+            self.total_duration_secs = (start + dur + 5.0).ceil();
+        }
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut clip = Self::build_clip_base(
+            id,
+            0,
+            format!("FX: {}", effect.label()),
+            None,
+            TrackKind::Adjustment,
+            adj_track_id,
+            start,
+            dur,
+            3600.0,
+        );
+        clip.volume = 0;
+        clip.effect = effect;
+        clip.effect_intensity = 0.65;
+        self.clips.push(clip);
+        self.selected_clip_id = Some(id);
+        self.status_message = format!("Added effect '{}' at {:.1}s", effect.label(), start);
+        Some(id)
+    }
+
+    pub fn add_recorded_audio_clip(&mut self, path: PathBuf, duration_secs: f32) -> Option<usize> {
+        let dur = duration_secs.max(0.2);
+        let audio_track_id = self.default_track_id(TrackKind::Audio);
+        if self.track_flags_by_id(audio_track_id).locked {
+            self.status_message = "Audio track is locked".into();
+            return None;
+        }
+        self.push_undo();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("Voiceover.wav")
+            .to_string();
+        let asset_id = self.next_id;
+        self.next_id += 1;
+        self.assets.push(MediaAsset {
+            id: asset_id,
+            name: name.clone(),
+            path: Some(path.clone()),
+            size_label: "WAV".into(),
+            kind: TrackKind::Audio,
+            duration_secs: dur,
+        });
+        let start = (self.playhead_secs - dur).max(0.0);
+        if start + dur > self.total_duration_secs {
+            self.total_duration_secs = (start + dur + 5.0).ceil();
+        }
+        let clip_id = self.next_id;
+        self.next_id += 1;
+        let clip = Self::build_clip_base(
+            clip_id,
+            asset_id,
+            name,
+            Some(path),
+            TrackKind::Audio,
+            audio_track_id,
+            start,
+            dur,
+            dur,
+        );
+        self.clips.push(clip);
+        self.selected_clip_id = Some(clip_id);
+        self.status_message = format!("Recorded voiceover ({:.1}s)", dur);
+        Some(clip_id)
+    }
+
+    pub fn import_srt_subtitles(&mut self, content: &str) -> usize {
+        let entries = parse_srt(content);
+        if entries.is_empty() {
+            self.status_message = "No valid SRT subtitle entries found".into();
+            return 0;
+        }
+        let text_track_id = self.default_track_id(TrackKind::Text);
+        if self.track_flags_by_id(text_track_id).locked {
+            self.status_message = "Text track is locked".into();
+            return 0;
+        }
+        self.push_undo();
+        let mut count = 0usize;
+        for (start, end, txt) in entries {
+            let dur = (end - start).max(0.2);
+            if start + dur > self.total_duration_secs {
+                self.total_duration_secs = (start + dur + 5.0).ceil();
+            }
+            let id = self.next_id;
+            self.next_id += 1;
+            let mut td = TextClipData::default();
+            td.content = txt.clone();
+            let mut clip = Self::build_clip_base(
+                id,
+                0,
+                txt.lines().next().unwrap_or("Subtitle").to_string(),
+                None,
+                TrackKind::Text,
+                text_track_id,
+                start,
+                dur,
+                3600.0,
+            );
+            clip.volume = 0;
+            clip.pos_y = 260.0;
+            clip.text = Some(td);
+            self.clips.push(clip);
+            self.selected_clip_id = Some(id);
+            count += 1;
+        }
+        self.status_message = format!("Imported {} SRT subtitles", count);
+        count
+    }
+
+    pub fn export_srt_subtitles(&self) -> String {
+        let mut texts: Vec<&TimelineClip> = self
+            .clips
+            .iter()
+            .filter(|c| c.track == TrackKind::Text && c.text.is_some())
+            .collect();
+        texts.sort_by(|a, b| {
+            a.start_secs
+                .partial_cmp(&b.start_secs)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let mut out = String::new();
+        for (idx, c) in texts.iter().enumerate() {
+            let content = c
+                .text
+                .as_ref()
+                .map(|t| t.content.as_str())
+                .unwrap_or("");
+            out.push_str(&format!(
+                "{}\n{} --> {}\n{}\n\n",
+                idx + 1,
+                format_srt_timestamp(c.start_secs),
+                format_srt_timestamp(c.end_secs()),
+                content
+            ));
+        }
+        out
+    }
+}
+
+fn parse_srt_timestamp(raw: &str) -> Option<f32> {
+    let clean = raw.trim().replace(',', ".");
+    let mut parts = clean.split(':');
+    let h: f32 = parts.next()?.trim().parse().ok()?;
+    let m: f32 = parts.next()?.trim().parse().ok()?;
+    let s: f32 = parts.next()?.trim().parse().ok()?;
+    Some((h * 3600.0 + m * 60.0 + s).max(0.0))
+}
+
+fn format_srt_timestamp(secs: f32) -> String {
+    let total_ms = (secs.max(0.0) * 1000.0).round() as u64;
+    let ms = total_ms % 1000;
+    let total_s = total_ms / 1000;
+    let s = total_s % 60;
+    let total_m = total_s / 60;
+    let m = total_m % 60;
+    let h = total_m / 60;
+    format!("{:02}:{:02}:{:02},{:03}", h, m, s, ms)
+}
+
+pub fn parse_srt(content: &str) -> Vec<(f32, f32, String)> {
+    let normalized = content.replace("\r\n", "\n");
+    let mut result = Vec::new();
+    for block in normalized.split("\n\n") {
+        let lines: Vec<&str> = block.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+        if lines.is_empty() {
+            continue;
+        }
+        let Some(arrow_idx) = lines.iter().position(|l| l.contains("-->")) else {
+            continue;
+        };
+        let mut times = lines[arrow_idx].split("-->");
+        let Some(st_str) = times.next() else { continue };
+        let Some(en_str) = times.next() else { continue };
+        let (Some(st), Some(en)) = (parse_srt_timestamp(st_str), parse_srt_timestamp(en_str)) else {
+            continue;
+        };
+        let body = lines[arrow_idx + 1..].join("\n");
+        if !body.is_empty() && en > st {
+            result.push((st, en, body));
+        }
+    }
+    result
 }
 
 pub fn classify_media_path(path: &Path) -> Option<TrackKind> {
@@ -1603,12 +1920,43 @@ mod tests {
         assert!((s + 1.0).abs() < 0.01);
 
         clip.transition_in = TransitionKind::Dissolve;
+        clip.transition_out = TransitionKind::Dissolve;
         clip.transition_dur_secs = 1.0;
         let (a0, _, _) = clip.evaluate_transition(2.0);
         let (a_mid, _, _) = clip.evaluate_transition(2.5);
         let (a_end, _, _) = clip.evaluate_transition(3.0);
+        let (a_out, _, _) = clip.evaluate_transition(5.5);
         assert!(a0 < 0.01);
         assert!((a_mid - 0.75).abs() < 0.01);
         assert!((a_end - 1.0).abs() < 0.01);
+        assert!((a_out - 0.75).abs() < 0.01);
+    }
+
+    #[test]
+    fn srt_import_export_and_detach_audio_and_adjustment() {
+        let mut core = EditorCore::new();
+        let srt = "1\n00:00:01,000 --> 00:00:03,500\nXin chào\n\n2\n00:00:04,000 --> 00:00:06,000\nOpenCut\n";
+        assert_eq!(core.import_srt_subtitles(srt), 2);
+        let exported = core.export_srt_subtitles();
+        assert!(exported.contains("00:00:01,000 --> 00:00:03,500"));
+        assert!(exported.contains("Xin chào"));
+
+        let mut vclip = sample_clip(999, 0.0, 5.0);
+        vclip.source_path = Some(PathBuf::from("video.mp4"));
+        core.clips.push(vclip);
+        core.selected_clip_id = Some(999);
+        assert!(core.detach_audio_selected());
+        let orig = core.clips.iter().find(|c| c.id == 999).unwrap();
+        assert!(orig.audio_detached);
+        assert_eq!(orig.volume, 0);
+        assert!(core.clips.iter().any(|c| c.track == TrackKind::Audio));
+
+        assert!(core.add_adjustment_clip(3.0).is_some());
+        assert!(core.clips.iter().any(|c| c.track == TrackKind::Adjustment));
+
+        let fx_id = core.add_effect_clip(VideoEffect::Blur, 3.0).unwrap();
+        let fx_clip = core.clips.iter().find(|c| c.id == fx_id).unwrap();
+        assert_ne!(fx_clip.track_id, 0);
+        assert!(core.tracks.iter().any(|t| t.id == fx_clip.track_id && t.kind == TrackKind::Adjustment));
     }
 }

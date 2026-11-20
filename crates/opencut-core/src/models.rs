@@ -254,6 +254,340 @@ impl TransitionKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EffectCategory {
+    Basic,
+    Glitch,
+    Light,
+    Motion,
+    Particles,
+    Frames,
+}
+
+impl EffectCategory {
+    pub const fn all() -> &'static [EffectCategory] {
+        &[
+            EffectCategory::Basic,
+            EffectCategory::Glitch,
+            EffectCategory::Light,
+            EffectCategory::Motion,
+            EffectCategory::Particles,
+            EffectCategory::Frames,
+        ]
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            EffectCategory::Basic => "Cơ bản",
+            EffectCategory::Glitch => "Glitch/Retro",
+            EffectCategory::Light => "Ánh sáng",
+            EffectCategory::Motion => "Chuyển động",
+            EffectCategory::Particles => "Hạt",
+            EffectCategory::Frames => "Khung",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VideoEffect {
+    #[default]
+    None,
+    // Cơ bản
+    Blur,
+    Grain,
+    Vignette,
+    Magnify,
+    Sharpen,
+    Sepia,
+    // Glitch / Retro
+    Vhs,
+    Glitch,
+    RgbSplit,
+    OldCam,
+    // Ánh sáng
+    LensFlare,
+    LightLeak,
+    Rays,
+    Flash,
+    // Chuyển động
+    Shake,
+    PulseZoom,
+    Swing,
+    // Hạt / Môi trường
+    Rain,
+    Snow,
+    Dust,
+    Sparkle,
+    Bokeh,
+    // Khung / Overlay
+    FilmBorder,
+    CamFrame,
+    RecHud,
+}
+
+pub struct EffectParamSpec {
+    pub has_speed: bool,
+    pub has_size: bool,
+    pub has_distance: bool,
+    pub has_color: bool,
+}
+
+impl VideoEffect {
+    pub const fn all() -> &'static [VideoEffect] {
+        &[
+            VideoEffect::None,
+            VideoEffect::Blur,
+            VideoEffect::Grain,
+            VideoEffect::Vignette,
+            VideoEffect::Magnify,
+            VideoEffect::Sharpen,
+            VideoEffect::Sepia,
+            VideoEffect::Vhs,
+            VideoEffect::Glitch,
+            VideoEffect::RgbSplit,
+            VideoEffect::OldCam,
+            VideoEffect::LensFlare,
+            VideoEffect::LightLeak,
+            VideoEffect::Rays,
+            VideoEffect::Flash,
+            VideoEffect::Shake,
+            VideoEffect::PulseZoom,
+            VideoEffect::Swing,
+            VideoEffect::Rain,
+            VideoEffect::Snow,
+            VideoEffect::Dust,
+            VideoEffect::Sparkle,
+            VideoEffect::Bokeh,
+            VideoEffect::FilmBorder,
+            VideoEffect::CamFrame,
+            VideoEffect::RecHud,
+        ]
+    }
+
+    pub fn by_category(cat: EffectCategory) -> &'static [VideoEffect] {
+        match cat {
+            EffectCategory::Basic => &[
+                VideoEffect::Blur,
+                VideoEffect::Grain,
+                VideoEffect::Vignette,
+                VideoEffect::Magnify,
+                VideoEffect::Sharpen,
+                VideoEffect::Sepia,
+            ],
+            EffectCategory::Glitch => &[
+                VideoEffect::Vhs,
+                VideoEffect::Glitch,
+                VideoEffect::RgbSplit,
+                VideoEffect::OldCam,
+            ],
+            EffectCategory::Light => &[
+                VideoEffect::LensFlare,
+                VideoEffect::LightLeak,
+                VideoEffect::Rays,
+                VideoEffect::Flash,
+            ],
+            EffectCategory::Motion => &[
+                VideoEffect::Shake,
+                VideoEffect::PulseZoom,
+                VideoEffect::Swing,
+            ],
+            EffectCategory::Particles => &[
+                VideoEffect::Rain,
+                VideoEffect::Snow,
+                VideoEffect::Dust,
+                VideoEffect::Sparkle,
+                VideoEffect::Bokeh,
+            ],
+            EffectCategory::Frames => &[
+                VideoEffect::FilmBorder,
+                VideoEffect::CamFrame,
+                VideoEffect::RecHud,
+            ],
+        }
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            VideoEffect::None => "None",
+            VideoEffect::Blur => "Blur",
+            VideoEffect::Grain => "Grain",
+            VideoEffect::Vignette => "Vignette",
+            VideoEffect::Magnify => "Magnify",
+            VideoEffect::Sharpen => "Sharpen",
+            VideoEffect::Sepia => "Sepia",
+            VideoEffect::Vhs => "VHS",
+            VideoEffect::Glitch => "Glitch",
+            VideoEffect::RgbSplit => "RGB Split",
+            VideoEffect::OldCam => "Old Cam",
+            VideoEffect::LensFlare => "Lens Flare",
+            VideoEffect::LightLeak => "Light Leak",
+            VideoEffect::Rays => "Light Rays",
+            VideoEffect::Flash => "Flash",
+            VideoEffect::Shake => "Shake",
+            VideoEffect::PulseZoom => "Pulse Zoom",
+            VideoEffect::Swing => "Swing",
+            VideoEffect::Rain => "Rain",
+            VideoEffect::Snow => "Snow",
+            VideoEffect::Dust => "Dust",
+            VideoEffect::Sparkle => "Sparkle",
+            VideoEffect::Bokeh => "Bokeh",
+            VideoEffect::FilmBorder => "Film Border",
+            VideoEffect::CamFrame => "Cam Frame",
+            VideoEffect::RecHud => "REC HUD",
+        }
+    }
+
+    pub const fn is_time_animated(&self) -> bool {
+        matches!(
+            self,
+            VideoEffect::Vhs
+                | VideoEffect::Glitch
+                | VideoEffect::Flash
+                | VideoEffect::Shake
+                | VideoEffect::PulseZoom
+                | VideoEffect::Swing
+                | VideoEffect::Rain
+                | VideoEffect::Snow
+                | VideoEffect::Dust
+                | VideoEffect::Sparkle
+                | VideoEffect::RecHud
+                | VideoEffect::Grain
+        )
+    }
+
+    pub const fn param_spec(&self) -> EffectParamSpec {
+        match self {
+            VideoEffect::None => EffectParamSpec {
+                has_speed: false,
+                has_size: false,
+                has_distance: false,
+                has_color: false,
+            },
+            VideoEffect::Blur | VideoEffect::Magnify => EffectParamSpec {
+                has_speed: false,
+                has_size: true,
+                has_distance: false,
+                has_color: false,
+            },
+            VideoEffect::Vignette | VideoEffect::FilmBorder => EffectParamSpec {
+                has_speed: false,
+                has_size: true,
+                has_distance: false,
+                has_color: true,
+            },
+            VideoEffect::Grain | VideoEffect::Sharpen | VideoEffect::Sepia | VideoEffect::OldCam => {
+                EffectParamSpec {
+                    has_speed: false,
+                    has_size: false,
+                    has_distance: false,
+                    has_color: false,
+                }
+            }
+            VideoEffect::RgbSplit => EffectParamSpec {
+                has_speed: false,
+                has_size: false,
+                has_distance: true,
+                has_color: false,
+            },
+            VideoEffect::Vhs | VideoEffect::Glitch | VideoEffect::Shake | VideoEffect::Swing => {
+                EffectParamSpec {
+                    has_speed: true,
+                    has_size: false,
+                    has_distance: true,
+                    has_color: false,
+                }
+            }
+            VideoEffect::PulseZoom => EffectParamSpec {
+                has_speed: true,
+                has_size: true,
+                has_distance: false,
+                has_color: false,
+            },
+            VideoEffect::LensFlare | VideoEffect::LightLeak | VideoEffect::Rays => {
+                EffectParamSpec {
+                    has_speed: false,
+                    has_size: true,
+                    has_distance: true,
+                    has_color: true,
+                }
+            }
+            VideoEffect::Flash => EffectParamSpec {
+                has_speed: true,
+                has_size: false,
+                has_distance: false,
+                has_color: true,
+            },
+            VideoEffect::Rain
+            | VideoEffect::Snow
+            | VideoEffect::Dust
+            | VideoEffect::Sparkle
+            | VideoEffect::Bokeh => EffectParamSpec {
+                has_speed: true,
+                has_size: true,
+                has_distance: false,
+                has_color: true,
+            },
+            VideoEffect::CamFrame | VideoEffect::RecHud => EffectParamSpec {
+                has_speed: true,
+                has_size: true,
+                has_distance: false,
+                has_color: true,
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct EffectParams {
+    pub speed: f32,
+    pub size: f32,
+    pub distance: f32,
+    pub color_hex: u32,
+}
+
+impl Default for EffectParams {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            size: 1.0,
+            distance: 0.5,
+            color_hex: 0xfacc15,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ComboAnimation {
+    #[default]
+    None,
+    FadeInOut,
+    ZoomPulse,
+    Bounce,
+    SwingLoop,
+}
+
+impl ComboAnimation {
+    pub const fn all() -> &'static [ComboAnimation] {
+        &[
+            ComboAnimation::None,
+            ComboAnimation::FadeInOut,
+            ComboAnimation::ZoomPulse,
+            ComboAnimation::Bounce,
+            ComboAnimation::SwingLoop,
+        ]
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            ComboAnimation::None => "None",
+            ComboAnimation::FadeInOut => "Fade In/Out",
+            ComboAnimation::ZoomPulse => "Zoom Pulse",
+            ComboAnimation::Bounce => "Bounce",
+            ComboAnimation::SwingLoop => "Swing",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TextAlign {
     Left,
@@ -483,6 +817,14 @@ pub struct ClipKeyframe {
     pub scale: u16,
     pub rotation_deg: f32,
     pub opacity: u8,
+    #[serde(default = "default_effect_intensity")]
+    pub effect_intensity: f32,
+    #[serde(default = "default_speed")]
+    pub effect_speed: f32,
+    #[serde(default = "default_speed")]
+    pub effect_size: f32,
+    #[serde(default = "default_effect_intensity")]
+    pub effect_distance: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -540,7 +882,23 @@ pub struct TimelineClip {
     #[serde(default)]
     pub filter_preset: ColorFilterPreset,
     #[serde(default)]
+    pub lut_path: Option<PathBuf>,
+    #[serde(default)]
+    pub audio_normalized: bool,
+    #[serde(default)]
+    pub audio_detached: bool,
+    #[serde(default)]
+    pub effect: VideoEffect,
+    #[serde(default = "default_effect_intensity")]
+    pub effect_intensity: f32,
+    #[serde(default)]
+    pub effect_params: EffectParams,
+    #[serde(default)]
     pub transition_in: TransitionKind,
+    #[serde(default)]
+    pub transition_out: TransitionKind,
+    #[serde(default)]
+    pub combo_anim: ComboAnimation,
     #[serde(default = "default_transition_dur")]
     pub transition_dur_secs: f32,
     #[serde(default)]
@@ -552,6 +910,10 @@ pub struct TimelineClip {
 }
 
 fn default_transition_dur() -> f32 {
+    0.5
+}
+
+fn default_effect_intensity() -> f32 {
     0.5
 }
 
@@ -575,27 +937,134 @@ impl TimelineClip {
         )
     }
 
-    /// Returns (alpha_mult, scale_mult, x_offset_ratio) for `transition_in` at `time_secs`.
+    /// Returns (alpha_mult, scale_mult, x_offset_ratio) combining `transition_in` and `transition_out`.
     pub fn evaluate_transition(&self, time_secs: f32) -> (f32, f32, f32) {
-        if self.transition_in == TransitionKind::None {
-            return (1.0, 1.0, 0.0);
-        }
         let td = self
             .transition_dur_secs
             .clamp(0.1, (self.duration_secs * 0.5).max(0.1));
-        let local_t = (time_secs - self.start_secs).max(0.0);
-        if local_t >= td {
-            return (1.0, 1.0, 0.0);
+        let mut alpha = 1.0_f32;
+        let mut scale = 1.0_f32;
+        let mut x_off = 0.0_f32;
+
+        if self.transition_in != TransitionKind::None {
+            let local_t = (time_secs - self.start_secs).max(0.0);
+            if local_t < td {
+                let p = (local_t / td).clamp(0.0, 1.0);
+                let ease = 1.0 - (1.0 - p) * (1.0 - p);
+                match self.transition_in {
+                    TransitionKind::None => {}
+                    TransitionKind::Dissolve => alpha *= ease,
+                    TransitionKind::SlideLeft => x_off += 1.0 - ease,
+                    TransitionKind::SlideRight => x_off -= 1.0 - ease,
+                    TransitionKind::ZoomIn => {
+                        alpha *= ease;
+                        scale *= 0.72 + 0.28 * ease;
+                    }
+                }
+            }
         }
-        let p = (local_t / td).clamp(0.0, 1.0);
-        let ease = 1.0 - (1.0 - p) * (1.0 - p);
-        match self.transition_in {
-            TransitionKind::None => (1.0, 1.0, 0.0),
-            TransitionKind::Dissolve => (ease, 1.0, 0.0),
-            TransitionKind::SlideLeft => (1.0, 1.0, 1.0 - ease),
-            TransitionKind::SlideRight => (1.0, 1.0, -(1.0 - ease)),
-            TransitionKind::ZoomIn => (ease, 0.72 + 0.28 * ease, 0.0),
+
+        if self.transition_out != TransitionKind::None {
+            let rem_t = (self.end_secs() - time_secs).max(0.0);
+            if rem_t < td {
+                let p = (rem_t / td).clamp(0.0, 1.0);
+                let ease = 1.0 - (1.0 - p) * (1.0 - p);
+                match self.transition_out {
+                    TransitionKind::None => {}
+                    TransitionKind::Dissolve => alpha *= ease,
+                    TransitionKind::SlideLeft => x_off -= 1.0 - ease,
+                    TransitionKind::SlideRight => x_off += 1.0 - ease,
+                    TransitionKind::ZoomIn => {
+                        alpha *= ease;
+                        scale *= 0.72 + 0.28 * ease;
+                    }
+                }
+            }
         }
+
+        if self.combo_anim != ComboAnimation::None {
+            let local_t = (time_secs - self.start_secs).clamp(0.0, self.duration_secs);
+            let rem_t = (self.end_secs() - time_secs).max(0.0);
+            match self.combo_anim {
+                ComboAnimation::None => {}
+                ComboAnimation::FadeInOut => {
+                    let fin = (local_t / td).clamp(0.0, 1.0);
+                    let fout = (rem_t / td).clamp(0.0, 1.0);
+                    alpha *= fin.min(fout);
+                }
+                ComboAnimation::ZoomPulse => {
+                    let pulse = (local_t * 3.0).sin() * 0.08;
+                    scale *= 1.0 + pulse;
+                }
+                ComboAnimation::Bounce => {
+                    let b = (local_t * 4.5).sin().abs() * 0.04;
+                    x_off += (local_t * 2.5).sin() * 0.03;
+                    scale *= 1.0 + b;
+                }
+                ComboAnimation::SwingLoop => {
+                    x_off += (local_t * 3.2).sin() * 0.05;
+                }
+            }
+        }
+
+        (alpha, scale, x_off)
+    }
+
+    /// Evaluate keyframed (intensity, speed, size, distance, color_hex) at `time_secs`.
+    pub fn evaluate_effect_at(&self, time_secs: f32) -> (f32, f32, f32, f32, u32) {
+        if self.keyframes.is_empty() {
+            return (
+                self.effect_intensity,
+                self.effect_params.speed,
+                self.effect_params.size,
+                self.effect_params.distance,
+                self.effect_params.color_hex,
+            );
+        }
+        let local_t = (time_secs - self.start_secs).clamp(0.0, self.duration_secs);
+        let first = &self.keyframes[0];
+        if local_t <= first.time_offset_secs {
+            return (
+                first.effect_intensity,
+                first.effect_speed,
+                first.effect_size,
+                first.effect_distance,
+                self.effect_params.color_hex,
+            );
+        }
+        let last = &self.keyframes[self.keyframes.len() - 1];
+        if local_t >= last.time_offset_secs {
+            return (
+                last.effect_intensity,
+                last.effect_speed,
+                last.effect_size,
+                last.effect_distance,
+                self.effect_params.color_hex,
+            );
+        }
+        for pair in self.keyframes.windows(2) {
+            let a = &pair[0];
+            let b = &pair[1];
+            if local_t >= a.time_offset_secs && local_t <= b.time_offset_secs {
+                let span = (b.time_offset_secs - a.time_offset_secs).max(0.0001);
+                let t = ((local_t - a.time_offset_secs) / span).clamp(0.0, 1.0);
+                let lerp = |x: f32, y: f32| x + (y - x) * t;
+                return (
+                    lerp(a.effect_intensity, b.effect_intensity),
+                    lerp(a.effect_speed, b.effect_speed),
+                    lerp(a.effect_size, b.effect_size),
+                    lerp(a.effect_distance, b.effect_distance),
+                    self.effect_params.color_hex,
+                );
+            }
+        }
+        (
+            self.effect_intensity,
+            self.effect_params.speed,
+            self.effect_params.size,
+            self.effect_params.distance,
+            self.effect_params.color_hex,
+        )
     }
 
     /// Evaluate animated (pos_x, pos_y, scale, rotation_deg, opacity) at timeline `time_secs`.
@@ -689,6 +1158,10 @@ impl TimelineClip {
             kf.scale = self.scale;
             kf.rotation_deg = self.rotation_deg;
             kf.opacity = self.opacity;
+            kf.effect_intensity = self.effect_intensity;
+            kf.effect_speed = self.effect_params.speed;
+            kf.effect_size = self.effect_params.size;
+            kf.effect_distance = self.effect_params.distance;
         } else {
             self.keyframes.push(ClipKeyframe {
                 time_offset_secs: local_t,
@@ -697,6 +1170,10 @@ impl TimelineClip {
                 scale: self.scale,
                 rotation_deg: self.rotation_deg,
                 opacity: self.opacity,
+                effect_intensity: self.effect_intensity,
+                effect_speed: self.effect_params.speed,
+                effect_size: self.effect_params.size,
+                effect_distance: self.effect_params.distance,
             });
             self.keyframes.sort_by(|a, b| {
                 a.time_offset_secs

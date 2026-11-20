@@ -14,16 +14,18 @@ use gpui::{
     px, rgb,
 };
 use opencut_core::{
-    AspectRatio, ClipCrop, ColorFilterPreset, EditorCore, RecentProjectEntry, TextAnimation,
-    TextPreset, TrackKind, TransitionKind, format_timecode, load_recent_projects,
-    record_recent_project,
+    AspectRatio, ClipCrop, ColorFilterPreset, ComboAnimation, EditorCore, EffectCategory,
+    RecentProjectEntry, TextAnimation, TextPreset, TrackKind, TransitionKind, VideoEffect,
+    format_timecode, load_recent_projects, record_recent_project,
 };
 
 use crate::media_engine::{
-    AudioStreamPlayer, ExportFormat, ExportHandle, ExportOptions, VideoStreamPlayer,
-    apply_color_bgra, bgra_bytes_to_render_image, decode_single_frame_raw, detect_gpu_encoder,
-    export_freeze_frame, load_overlay_bgra, probe_duration_secs, probe_media_dimensions,
-    render_unrotated_text_bgra, reveal_in_explorer, rotate_bgra_bytes, start_export_timeline,
+    AudioStreamPlayer, CubeLut, ExportFormat, ExportHandle, ExportOptions, VideoStreamPlayer,
+    VoiceoverRecorder, apply_color_bgra, apply_cube_lut_bgra, apply_effect_bgra,
+    apply_effect_bgra_at, bgra_bytes_to_render_image, decode_single_frame_raw, detect_gpu_encoder,
+    export_freeze_frame, load_overlay_bgra, parse_cube_lut, probe_duration_secs,
+    probe_media_dimensions, render_unrotated_text_bgra, reveal_in_explorer, rotate_bgra_bytes,
+    start_export_timeline,
 };
 use crate::theme::Theme;
 
@@ -201,6 +203,17 @@ enum SliderField {
     Saturation,
     Temperature,
     TransitionDur,
+    EffectIntensity,
+    EffectSpeed,
+    EffectSize,
+    EffectDistance,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AnimSubTab {
+    In,
+    Out,
+    Combo,
 }
 
 const INSPECTOR_W: f32 = 280.0;
@@ -215,8 +228,125 @@ pub(crate) enum AppScreen {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum MediaPanelTab {
     Media,
+    Audio,
     Text,
+    Stickers,
+    Effects,
+    Animation,
     Filters,
+    Adjustment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TopMenuKind {
+    File,
+    Edit,
+    View,
+    Project,
+    Help,
+}
+
+impl TopMenuKind {
+    const ALL: [Self; 5] = [
+        Self::File,
+        Self::Edit,
+        Self::View,
+        Self::Project,
+        Self::Help,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::File => "File",
+            Self::Edit => "Edit",
+            Self::View => "View",
+            Self::Project => "Project",
+            Self::Help => "Help",
+        }
+    }
+
+    fn dropdown_left_px(self) -> f32 {
+        match self {
+            Self::File => 12.0,
+            Self::Edit => 54.0,
+            Self::View => 98.0,
+            Self::Project => 146.0,
+            Self::Help => 206.0,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CanvasBgKind {
+    DefaultDark,
+    Black,
+    White,
+    Green,
+}
+
+impl CanvasBgKind {
+    const ALL: [Self; 4] = [Self::DefaultDark, Self::Black, Self::White, Self::Green];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::DefaultDark => "Dark Slate",
+            Self::Black => "Black",
+            Self::White => "White",
+            Self::Green => "Chroma Green",
+        }
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::DefaultDark => Self::Black,
+            Self::Black => Self::White,
+            Self::White => Self::Green,
+            Self::Green => Self::DefaultDark,
+        }
+    }
+
+    fn color(self) -> gpui::Hsla {
+        match self {
+            Self::DefaultDark => Theme::bg_preview().into(),
+            Self::Black => rgb(0x000000).into(),
+            Self::White => rgb(0xffffff).into(),
+            Self::Green => rgb(0x00b140).into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelpModalKind {
+    Shortcuts,
+    Docs,
+    About,
+}
+
+#[derive(Clone, Copy)]
+struct InspectorSections {
+    transform: bool,
+    speed: bool,
+    color: bool,
+    effect: bool,
+    transition: bool,
+    audio: bool,
+    crop: bool,
+    text: bool,
+}
+
+impl Default for InspectorSections {
+    fn default() -> Self {
+        Self {
+            transform: true,
+            speed: false,
+            color: true,
+            effect: false,
+            transition: false,
+            audio: false,
+            crop: false,
+            text: true,
+        }
+    }
 }
 
 pub struct EditorView {
@@ -229,7 +359,12 @@ pub struct EditorView {
     pub(crate) draft_base_height: u32,
     pub(crate) hub_error: Option<String>,
     media_panel_tab: MediaPanelTab,
-    menu_open: bool,
+    active_top_menu: Option<TopMenuKind>,
+    recent_submenu_open: bool,
+    project_settings_modal_open: bool,
+    help_modal: Option<HelpModalKind>,
+    canvas_bg: CanvasBgKind,
+    show_grid: bool,
     media_filter: Option<TrackKind>,
     media_search_query: String,
     media_search_focused: bool,
@@ -268,6 +403,11 @@ pub struct EditorView {
     raw_video_sig: u64,
     raw_overlay_cache: HashMap<PathBuf, Arc<(Vec<u8>, u32, u32)>>,
     raw_text_cache: HashMap<usize, (u64, Arc<(Vec<u8>, u32, u32)>)>,
+    lut_cache: HashMap<PathBuf, Arc<CubeLut>>,
+    voiceover_recorder: Option<VoiceoverRecorder>,
+    effect_category: Option<EffectCategory>,
+    anim_tab: AnimSubTab,
+    ins_sections: InspectorSections,
     export_status: ExportStatus,
     export_modal_open: bool,
     export_options: ExportOptions,
@@ -285,7 +425,12 @@ impl EditorView {
             draft_base_height: 1080,
             hub_error: None,
             media_panel_tab: MediaPanelTab::Media,
-            menu_open: false,
+            active_top_menu: None,
+            recent_submenu_open: false,
+            project_settings_modal_open: false,
+            help_modal: None,
+            canvas_bg: CanvasBgKind::DefaultDark,
+            show_grid: false,
             media_filter: None,
             media_search_query: String::new(),
             media_search_focused: false,
@@ -324,6 +469,11 @@ impl EditorView {
             raw_video_sig: 0,
             raw_overlay_cache: HashMap::new(),
             raw_text_cache: HashMap::new(),
+            lut_cache: HashMap::new(),
+            voiceover_recorder: None,
+            effect_category: None,
+            anim_tab: AnimSubTab::In,
+            ins_sections: InspectorSections::default(),
             export_status: ExportStatus::Idle,
             export_modal_open: false,
             export_options: ExportOptions::default(),
@@ -475,6 +625,22 @@ impl EditorView {
                 let max_td = (c.duration_secs * 0.5).clamp(0.2, 3.0);
                 c.transition_dur_secs = ((0.1 + r * (max_td - 0.1)) * 10.0).round() / 10.0;
             }
+            SliderField::EffectIntensity => {
+                c.effect_intensity = (r * 100.0).round() / 100.0;
+                c.sync_keyframe_if_animated(playhead);
+            }
+            SliderField::EffectSpeed => {
+                c.effect_params.speed = ((0.1 + r * 2.9) * 20.0).round() / 20.0;
+                c.sync_keyframe_if_animated(playhead);
+            }
+            SliderField::EffectSize => {
+                c.effect_params.size = ((0.1 + r * 1.9) * 20.0).round() / 20.0;
+                c.sync_keyframe_if_animated(playhead);
+            }
+            SliderField::EffectDistance => {
+                c.effect_params.distance = (r * 100.0).round() / 100.0;
+                c.sync_keyframe_if_animated(playhead);
+            }
         }
     }
 
@@ -543,15 +709,128 @@ impl EditorView {
     }
 
     fn refresh_video_frame_transform(&mut self, flip_h: bool, rot: f32, cx: &mut Context<Self>) {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        let playhead = self.state.playhead_secs;
+        let ((cb, cc, cs, ct), eff, (eff_int, eff_spd, eff_sz, eff_dist, eff_col), vid_lut) =
+            self.state
+                .active_clips_at_playhead()
+                .into_iter()
+                .find(|c| c.track == TrackKind::Video)
+                .map(|v| {
+                    (
+                        v.effective_color(),
+                        v.effect,
+                        v.evaluate_effect_at(playhead),
+                        v.lut_path.clone(),
+                    )
+                })
+                .unwrap_or((
+                    (0.0, 0.0, 0.0, 0.0),
+                    VideoEffect::None,
+                    (0.5, 1.0, 1.0, 0.5, 0xfacc15),
+                    None,
+                ));
+        let adj_layers: Vec<_> = self
+            .state
+            .active_clips_at_playhead()
+            .into_iter()
+            .filter(|c| c.track == TrackKind::Adjustment)
+            .map(|a| {
+                (
+                    a.effective_color(),
+                    a.effect,
+                    a.evaluate_effect_at(playhead),
+                    a.lut_path.clone(),
+                )
+            })
+            .collect();
+        let any_time_anim = eff.is_time_animated()
+            || adj_layers.iter().any(|(_, ae, _, _)| ae.is_time_animated());
         let norm_rot = rot.rem_euclid(360.0);
-        let sig = ((flip_h as u64) << 32) | ((norm_rot * 2.0).round() as u64);
+        let mut h = DefaultHasher::new();
+        flip_h.hash(&mut h);
+        ((norm_rot * 2.0).round() as i32).hash(&mut h);
+        ((cb * 100.0).round() as i32).hash(&mut h);
+        ((cc * 100.0).round() as i32).hash(&mut h);
+        ((cs * 100.0).round() as i32).hash(&mut h);
+        ((ct * 100.0).round() as i32).hash(&mut h);
+        (eff as u8).hash(&mut h);
+        ((eff_int * 100.0).round() as i32).hash(&mut h);
+        ((eff_spd * 100.0).round() as i32).hash(&mut h);
+        ((eff_sz * 100.0).round() as i32).hash(&mut h);
+        ((eff_dist * 100.0).round() as i32).hash(&mut h);
+        eff_col.hash(&mut h);
+        vid_lut.hash(&mut h);
+        if any_time_anim {
+            ((playhead * 24.0).round() as i64).hash(&mut h);
+        }
+        for ((ab, ac, asat, atemp), aeff, (aei, aespd, aesz, aedist, aecol), alut) in &adj_layers
+        {
+            ((ab * 100.0).round() as i32).hash(&mut h);
+            ((ac * 100.0).round() as i32).hash(&mut h);
+            ((asat * 100.0).round() as i32).hash(&mut h);
+            ((atemp * 100.0).round() as i32).hash(&mut h);
+            (*aeff as u8).hash(&mut h);
+            ((aei * 100.0).round() as i32).hash(&mut h);
+            ((aespd * 100.0).round() as i32).hash(&mut h);
+            ((aesz * 100.0).round() as i32).hash(&mut h);
+            ((aedist * 100.0).round() as i32).hash(&mut h);
+            aecol.hash(&mut h);
+            alut.hash(&mut h);
+        }
+        let sig = h.finish();
+
         if self.raw_video_sig == sig && self.current_frame.is_some() {
             return;
         }
-        let Some((ref bytes, w, h)) = self.raw_video_frame else {
+        let lut_arc = vid_lut.as_ref().and_then(|p| self.ensure_lut_cached(p));
+        let mut adj_luts = Vec::with_capacity(adj_layers.len());
+        for (_, _, _, alut) in &adj_layers {
+            adj_luts.push(alut.as_ref().and_then(|p| self.ensure_lut_cached(p)));
+        }
+
+        let Some((ref bytes, w, h_px)) = self.raw_video_frame else {
             return;
         };
-        let (out_bytes, ow, oh) = rotate_bgra_bytes(bytes, w, h, flip_h, norm_rot);
+        let (mut out_bytes, ow, oh) = rotate_bgra_bytes(bytes, w, h_px, flip_h, norm_rot);
+        apply_color_bgra(&mut out_bytes, cb, cc, cs, ct);
+        apply_effect_bgra_at(
+            &mut out_bytes,
+            ow,
+            oh,
+            eff,
+            playhead,
+            eff_int,
+            eff_spd,
+            eff_sz,
+            eff_dist,
+            eff_col,
+        );
+        if let Some(lut) = lut_arc {
+            apply_cube_lut_bgra(&mut out_bytes, &lut);
+        }
+        for (idx, ((ab, ac, asat, atemp), aeff, (aei, aespd, aesz, aedist, aecol), _)) in
+            adj_layers.iter().enumerate()
+        {
+            apply_color_bgra(&mut out_bytes, *ab, *ac, *asat, *atemp);
+            apply_effect_bgra_at(
+                &mut out_bytes,
+                ow,
+                oh,
+                *aeff,
+                playhead,
+                *aei,
+                *aespd,
+                *aesz,
+                *aedist,
+                *aecol,
+            );
+            if let Some(Some(alut)) = adj_luts.get(idx) {
+                apply_cube_lut_bgra(&mut out_bytes, alut);
+            }
+        }
         if let Some(img) = bgra_bytes_to_render_image(out_bytes, ow, oh) {
             self.raw_video_sig = sig;
             self.set_current_frame(Some(img), cx);
@@ -829,8 +1108,15 @@ impl EditorView {
             };
             let (_, _, _, erot, _) = oclip.evaluate_at(self.state.playhead_secs);
             let norm_rot = erot.rem_euclid(360.0);
-            let needs_rot = oclip.flip_h || (norm_rot > 0.5 && norm_rot < 359.5);
-            if !needs_rot {
+            let (cb, cc, cs, ct) = oclip.effective_color();
+            let has_color = cb.abs() >= 0.005
+                || cc.abs() >= 0.005
+                || cs.abs() >= 0.005
+                || ct.abs() >= 0.005;
+            let has_effect = oclip.effect != VideoEffect::None && oclip.effect_intensity >= 0.01;
+            let needs_xf =
+                oclip.flip_h || has_color || has_effect || (norm_rot > 0.5 && norm_rot < 359.5);
+            if !needs_xf {
                 self.rotated_overlay_cache.remove(&oclip.id);
                 continue;
             }
@@ -840,6 +1126,12 @@ impl EditorView {
             path.hash(&mut hasher);
             oclip.flip_h.hash(&mut hasher);
             ((norm_rot * 2.0).round() as i32).hash(&mut hasher);
+            ((cb * 100.0).round() as i32).hash(&mut hasher);
+            ((cc * 100.0).round() as i32).hash(&mut hasher);
+            ((cs * 100.0).round() as i32).hash(&mut hasher);
+            ((ct * 100.0).round() as i32).hash(&mut hasher);
+            (oclip.effect as u8).hash(&mut hasher);
+            ((oclip.effect_intensity * 100.0).round() as i32).hash(&mut hasher);
             let sig = hasher.finish();
 
             if self
@@ -852,8 +1144,10 @@ impl EditorView {
 
             if let Some(raw_arc) = self.raw_overlay_cache.get(&path) {
                 let (ref bytes, w, h) = **raw_arc;
-                let (out_bytes, rw, rh) =
+                let (mut out_bytes, rw, rh) =
                     rotate_bgra_bytes(bytes, w, h, oclip.flip_h, norm_rot);
+                apply_color_bgra(&mut out_bytes, cb, cc, cs, ct);
+                apply_effect_bgra(&mut out_bytes, rw, rh, oclip.effect, oclip.effect_intensity);
                 if let Some(r_img) = bgra_bytes_to_render_image(out_bytes, rw, rh) {
                     self.rotated_overlay_cache
                         .insert(oclip.id, (sig, r_img, rw, rh));
@@ -982,6 +1276,142 @@ impl EditorView {
         .detach();
     }
 
+    fn ensure_lut_cached(&mut self, path: &PathBuf) -> Option<Arc<CubeLut>> {
+        if let Some(lut) = self.lut_cache.get(path) {
+            return Some(lut.clone());
+        }
+        let parsed = Arc::new(parse_cube_lut(path)?);
+        self.lut_cache.insert(path.clone(), parsed.clone());
+        Some(parsed)
+    }
+
+    fn refresh_all_visual_transforms(&mut self, cx: &mut Context<Self>) {
+        self.sync_rotated_texts(cx);
+        self.sync_rotated_overlays(cx);
+        if let Some((fh, rot)) = self
+            .state
+            .active_clips_at_playhead()
+            .into_iter()
+            .find(|c| c.track == TrackKind::Video)
+            .map(|v| (v.flip_h, v.evaluate_at(self.state.playhead_secs).3))
+        {
+            self.refresh_video_frame_transform(fh, rot, cx);
+        }
+    }
+
+    fn prompt_import_lut(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from("Import 3D LUT (.cube)")),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.into_iter().next() {
+                    let _ = this.update(cx, |view, cx| {
+                        if view.ensure_lut_cached(&path).is_some() {
+                            view.state.push_undo();
+                            if let Some(c) = view.state.selected_clip_mut() {
+                                c.lut_path = Some(path.clone());
+                                view.state.status_message = format!(
+                                    "Applied LUT: {}",
+                                    path.file_name().and_then(|n| n.to_str()).unwrap_or("LUT")
+                                );
+                            }
+                            view.refresh_all_visual_transforms(cx);
+                        } else {
+                            view.state.status_message = "Invalid .cube LUT file".into();
+                        }
+                        cx.notify();
+                    });
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn prompt_import_srt(&mut self, cx: &mut Context<Self>) {
+        let rx = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some(SharedString::from("Import Subtitles (.srt)")),
+        });
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(paths))) = rx.await {
+                if let Some(path) = paths.into_iter().next() {
+                    if let Ok(content) = std::fs::read_to_string(&path) {
+                        let _ = this.update(cx, |view, cx| {
+                            view.state.import_srt_subtitles(&content);
+                            view.sync_preview_after_seek(cx);
+                            cx.notify();
+                        });
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn prompt_export_srt(&mut self, cx: &mut Context<Self>) {
+        let content = self.state.export_srt_subtitles();
+        if content.trim().is_empty() {
+            self.state.status_message = "No text subtitles to export".into();
+            cx.notify();
+            return;
+        }
+        let default_dir = std::env::temp_dir();
+        let rx = cx.prompt_for_new_path(&default_dir, Some("subtitles.srt"));
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(path))) = rx.await {
+                let final_path = if path.extension().is_none() {
+                    path.with_extension("srt")
+                } else {
+                    path
+                };
+                let ok = std::fs::write(&final_path, content).is_ok();
+                let _ = this.update(cx, |view, cx| {
+                    view.state.status_message = if ok {
+                        format!("Exported SRT: {}", final_path.display())
+                    } else {
+                        "Failed to write SRT file".into()
+                    };
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn toggle_voiceover_recording(&mut self, cx: &mut Context<Self>) {
+        if let Some(rec) = self.voiceover_recorder.take() {
+            let task = cx.background_executor().spawn(async move { rec.stop() });
+            cx.spawn(async move |this, cx| {
+                if let Some((path, dur)) = task.await {
+                    let _ = this.update(cx, |view, cx| {
+                        view.state.add_recorded_audio_clip(path, dur);
+                        view.sync_preview_after_seek(cx);
+                        cx.notify();
+                    });
+                }
+            })
+            .detach();
+            self.state.status_message = "Saving voiceover...".into();
+        } else {
+            match VoiceoverRecorder::start() {
+                Ok(rec) => {
+                    self.voiceover_recorder = Some(rec);
+                    self.state.status_message = "Recording microphone... Click again to stop".into();
+                }
+                Err(err) => {
+                    self.state.status_message = err;
+                }
+            }
+        }
+        cx.notify();
+    }
+
     fn prompt_import_font(&mut self, cx: &mut Context<Self>) {
         let rx = cx.prompt_for_paths(PathPromptOptions {
             files: true,
@@ -1106,6 +1536,73 @@ impl EditorView {
         .detach();
     }
 
+    fn save_project_as(&mut self, cx: &mut Context<Self>) {
+        let dir = PathBuf::from(".");
+        let suggested = format!("{}.opencut", self.state.project_name.replace(' ', "_"));
+        let rx = cx.prompt_for_new_path(&dir, Some(&suggested));
+
+        cx.spawn(async move |this, cx| {
+            if let Ok(Ok(Some(mut path))) = rx.await {
+                if path.extension().is_none() {
+                    path.set_extension("opencut");
+                }
+                let _ = this.update(cx, |view, cx| {
+                    match view.state.save_to_file(&path) {
+                        Ok(()) => {
+                            view.recent_projects = record_recent_project(RecentProjectEntry {
+                                name: view.state.project_name.clone(),
+                                path,
+                                aspect_ratio: view.state.aspect_ratio,
+                                base_height: view.state.base_height,
+                            });
+                        }
+                        Err(err) => view.state.status_message = err,
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    fn new_project(&mut self, cx: &mut Context<Self>) {
+        self.state = EditorCore::new();
+        self.player.stop();
+        self.audio_player.stop();
+        self.clear_preview_cache();
+        self.timeline_scroll_x = 0.0;
+        self.editing_text_clip_id = None;
+        self.state.status_message = "New project created".into();
+        cx.notify();
+    }
+
+    fn clear_preview_cache(&mut self) {
+        self.rotated_text_cache.clear();
+        self.rotated_overlay_cache.clear();
+        self.raw_overlay_cache.clear();
+        self.raw_text_cache.clear();
+        self.lut_cache.clear();
+        self.media_dim_cache.clear();
+        self.raw_video_frame = None;
+        self.raw_video_sig = 0;
+        self.current_frame = None;
+    }
+
+    fn reset_layout(&mut self) {
+        self.preview_zoom = 1.0;
+        self.timeline_scroll_x = 0.0;
+        self.state.px_per_sec = 24.0;
+        self.show_grid = false;
+        self.show_safe_zone = false;
+        self.preview_fullscreen = false;
+        self.ins_sections = InspectorSections::default();
+        self.state.status_message = "Layout reset".into();
+    }
+
+    fn zoom_timeline(&mut self, factor: f32) {
+        self.state.px_per_sec = (self.state.px_per_sec * factor).clamp(4.0, 240.0);
+    }
+
     fn save_project(&mut self, cx: &mut Context<Self>) {
         if let Some(existing) = self.state.project_path.clone() {
             match self.state.save_to_file(&existing) {
@@ -1221,6 +1718,72 @@ impl EditorView {
         }
 
         match (ctrl, shift, key) {
+            (true, false, "n") => {
+                self.new_project(cx);
+            }
+            (true, false, "o") => {
+                self.prompt_open_project(cx);
+            }
+            (true, true, "s") => {
+                self.save_project_as(cx);
+            }
+            (true, false, "i") => {
+                self.prompt_import_media(cx);
+            }
+            (true, false, "e") => {
+                if !matches!(self.export_status, ExportStatus::Exporting { .. }) {
+                    self.export_options.height = self.state.base_height.max(480);
+                    self.export_options.fps = self.state.fps.clamp(24, 60);
+                    self.export_modal_open = true;
+                    cx.notify();
+                }
+            }
+            (true, false, "x") => {
+                self.state.copy_selected_clip();
+                self.state.delete_selected_clip();
+                self.sync_preview_after_seek(cx);
+                self.state.status_message = "Clip cut to clipboard".into();
+                cx.notify();
+            }
+            (true, false, "a") => {
+                if let Some(first) = self.state.clips.first() {
+                    let id = first.id;
+                    self.state.selected_clip_id = Some(id);
+                    self.state.status_message =
+                        format!("Selected clip ({} clips on timeline)", self.state.clips.len());
+                } else {
+                    self.state.status_message = "Timeline is empty".into();
+                }
+                cx.notify();
+            }
+            (true, false, "=") | (true, true, "=") => {
+                self.zoom_timeline(1.25);
+                cx.notify();
+            }
+            (true, false, "-") => {
+                self.zoom_timeline(0.8);
+                cx.notify();
+            }
+            (true, false, "0") => {
+                self.reset_layout();
+                cx.notify();
+            }
+            (false, false, "g") => {
+                self.show_grid = !self.show_grid;
+                cx.notify();
+            }
+            (false, false, "s") => {
+                self.show_safe_zone = !self.show_safe_zone;
+                cx.notify();
+            }
+            (false, false, "f11") => {
+                self.preview_fullscreen = !self.preview_fullscreen;
+                cx.notify();
+            }
+            (false, false, "f1") => {
+                self.help_modal = Some(HelpModalKind::Shortcuts);
+                cx.notify();
+            }
             (false, false, "space") => {
                 self.state.toggle_play();
                 self.sync_preview_after_seek(cx);
@@ -1869,6 +2432,7 @@ impl EditorView {
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let status = self.state.status_message.clone();
         let project_name = self.state.project_name.clone();
+        let active_menu = self.active_top_menu;
 
         div()
             .h(px(36.))
@@ -1887,34 +2451,58 @@ impl EditorView {
                     .gap_2()
                     .child(
                         div()
-                            .id("btn-top-menu")
-                            .px_2p5()
-                            .py_1()
-                            .rounded_sm()
-                            .bg(if self.menu_open {
-                                Theme::bg_hover()
-                            } else {
-                                Theme::bg_surface()
-                            })
-                            .border_1()
-                            .border_color(if self.menu_open {
-                                Theme::accent()
-                            } else {
-                                Theme::border()
-                            })
                             .flex()
                             .items_center()
-                            .gap_1p5()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::MEDIUM)
-                            .text_color(Theme::text_primary())
-                            .cursor_pointer()
-                            .hover(|s| s.bg(Theme::bg_hover()))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.menu_open = !this.menu_open;
-                                cx.notify();
-                            }))
-                            .child("≡ Menu"),
+                            .gap_0p5()
+                            .children(TopMenuKind::ALL.into_iter().map(|kind| {
+                                let is_open = active_menu == Some(kind);
+                                div()
+                                    .id(SharedString::from(format!("top-menu-{:?}", kind)))
+                                    .px_2p5()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(if is_open {
+                                        Theme::bg_surface()
+                                    } else {
+                                        Theme::bg_panel()
+                                    })
+                                    .border_b_2()
+                                    .border_color(if is_open {
+                                        Theme::accent()
+                                    } else {
+                                        Theme::bg_panel()
+                                    })
+                                    .text_xs()
+                                    .font_weight(if is_open {
+                                        gpui::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui::FontWeight::MEDIUM
+                                    })
+                                    .text_color(if is_open {
+                                        Theme::text_primary()
+                                    } else {
+                                        Theme::text_secondary()
+                                    })
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        if this.active_top_menu == Some(kind) {
+                                            this.active_top_menu = None;
+                                        } else {
+                                            this.active_top_menu = Some(kind);
+                                        }
+                                        this.recent_submenu_open = false;
+                                        cx.notify();
+                                    }))
+                                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                                        if *hovered && this.active_top_menu.is_some() && this.active_top_menu != Some(kind) {
+                                            this.active_top_menu = Some(kind);
+                                            this.recent_submenu_open = false;
+                                            cx.notify();
+                                        }
+                                    }))
+                                    .child(kind.label())
+                            })),
                     )
                     .child(div().w(px(1.)).h(px(16.)).bg(Theme::border()))
                     .child(
@@ -1971,7 +2559,8 @@ impl EditorView {
                                 this.export_options.height = this.state.base_height.max(480);
                                 this.export_options.fps = this.state.fps.clamp(24, 60);
                                 this.export_modal_open = true;
-                                this.menu_open = false;
+                                this.active_top_menu = None;
+                                this.recent_submenu_open = false;
                                 cx.notify();
                             }
                         })),
@@ -1979,7 +2568,7 @@ impl EditorView {
             )
     }
 
-    fn render_menu_dropdown(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_menu_dropdown(&self, kind: TopMenuKind, cx: &mut Context<Self>) -> impl IntoElement {
         let item = |id: &'static str, label: &'static str, shortcut: &'static str| {
             div()
                 .id(id)
@@ -1990,6 +2579,7 @@ impl EditorView {
                 .flex()
                 .items_center()
                 .justify_between()
+                .gap_4()
                 .text_xs()
                 .text_color(Theme::text_primary())
                 .cursor_pointer()
@@ -1998,6 +2588,40 @@ impl EditorView {
                 .child(div().text_xs().text_color(Theme::text_muted()).child(shortcut))
         };
 
+        let check_item = |id: &'static str, label: &'static str, checked: bool, shortcut: &'static str| {
+            div()
+                .id(id)
+                .w_full()
+                .px_3()
+                .py_1p5()
+                .rounded_sm()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap_4()
+                .text_xs()
+                .text_color(Theme::text_primary())
+                .cursor_pointer()
+                .hover(|s| s.bg(Theme::bg_hover()))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            div()
+                                .w(px(12.))
+                                .text_color(Theme::accent())
+                                .child(if checked { "✓" } else { "" }),
+                        )
+                        .child(label),
+                )
+                .child(div().text_xs().text_color(Theme::text_muted()).child(shortcut))
+        };
+
+        let sep = || div().my_1().h(px(1.)).w_full().bg(Theme::border());
+        let left_px = kind.dropdown_left_px();
+
         div()
             .id("top-menu-backdrop")
             .absolute()
@@ -2005,7 +2629,8 @@ impl EditorView {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
-                    this.menu_open = false;
+                    this.active_top_menu = None;
+                    this.recent_submenu_open = false;
                     cx.notify();
                 }),
             )
@@ -2014,8 +2639,8 @@ impl EditorView {
                     .id("top-menu-dropdown")
                     .absolute()
                     .top(px(38.))
-                    .left(px(12.))
-                    .w(px(230.))
+                    .left(px(left_px))
+                    .w(px(248.))
                     .p_1p5()
                     .rounded_md()
                     .bg(Theme::bg_panel())
@@ -2026,43 +2651,709 @@ impl EditorView {
                     .flex_col()
                     .gap_0p5()
                     .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
-                    .child(item("menu-home", "Back to Projects", "").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.menu_open = false;
-                            this.state.is_playing = false;
-                            this.player.stop();
-                            this.audio_player.stop();
-                            this.recent_projects = load_recent_projects();
-                            this.screen = AppScreen::ProjectHub;
-                            cx.notify();
-                        },
-                    )))
-                    .child(div().my_1().h(px(1.)).w_full().bg(Theme::border()))
-                    .child(item("menu-open", "Open Project...", "").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.menu_open = false;
-                            this.prompt_open_project(cx);
-                        },
-                    )))
-                    .child(item("menu-save", "Save Project", "Ctrl+S").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.menu_open = false;
-                            this.save_project(cx);
-                        },
-                    )))
-                    .child(div().my_1().h(px(1.)).w_full().bg(Theme::border()))
-                    .child(item("menu-import", "Import Media...", "").on_click(cx.listener(
-                        |this, _, _, cx| {
-                            this.menu_open = false;
-                            this.prompt_import_media(cx);
-                        },
-                    )))
-                    .child(item("menu-import-font", "Import Font (.ttf/.otf)...", "").on_click(
-                        cx.listener(|this, _, _, cx| {
-                            this.menu_open = false;
-                            this.prompt_import_font(cx);
-                        }),
-                    )),
+                    .when(kind == TopMenuKind::File, |el| {
+                        el.child(item("menu-new", "New project", "Ctrl+N").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.recent_submenu_open = false;
+                                this.new_project(cx);
+                            },
+                        )))
+                        .child(item("menu-open", "Open...", "Ctrl+O").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.recent_submenu_open = false;
+                                this.prompt_open_project(cx);
+                            },
+                        )))
+                        .child(
+                            item("menu-recent", "Open recent", "▸").on_click(cx.listener(
+                                |this, _, _, cx| {
+                                    this.recent_submenu_open = !this.recent_submenu_open;
+                                    cx.notify();
+                                },
+                            )),
+                        )
+                        .child(sep())
+                        .child(item("menu-save", "Save", "Ctrl+S").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.recent_submenu_open = false;
+                                this.save_project(cx);
+                            },
+                        )))
+                        .child(item("menu-save-as", "Save as...", "Ctrl+Shift+S").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.recent_submenu_open = false;
+                                this.save_project_as(cx);
+                            }),
+                        ))
+                        .child(sep())
+                        .child(item("menu-import", "Import media...", "Ctrl+I").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.recent_submenu_open = false;
+                                this.prompt_import_media(cx);
+                            }),
+                        ))
+                        .child(item("menu-import-font", "Import font (.ttf/.otf)...", "").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.recent_submenu_open = false;
+                                this.prompt_import_font(cx);
+                            }),
+                        ))
+                        .child(sep())
+                        .child(item("menu-export", "Export...", "Ctrl+E").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.recent_submenu_open = false;
+                                if !matches!(this.export_status, ExportStatus::Exporting { .. }) {
+                                    this.export_options.height = this.state.base_height.max(480);
+                                    this.export_options.fps = this.state.fps.clamp(24, 60);
+                                    this.export_modal_open = true;
+                                }
+                                cx.notify();
+                            },
+                        )))
+                        .child(item("menu-home", "Back to Projects", "").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.recent_submenu_open = false;
+                                this.state.is_playing = false;
+                                this.player.stop();
+                                this.audio_player.stop();
+                                this.recent_projects = load_recent_projects();
+                                this.screen = AppScreen::ProjectHub;
+                                cx.notify();
+                            },
+                        )))
+                    })
+                    .when(kind == TopMenuKind::Edit, |el| {
+                        el.child(item("menu-undo", "Undo", "Ctrl+Z").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                if this.state.undo() {
+                                    this.sync_preview_after_seek(cx);
+                                }
+                                cx.notify();
+                            },
+                        )))
+                        .child(item("menu-redo", "Redo", "Ctrl+Y").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                if this.state.redo() {
+                                    this.sync_preview_after_seek(cx);
+                                }
+                                cx.notify();
+                            },
+                        )))
+                        .child(sep())
+                        .child(item("menu-cut", "Cut", "Ctrl+X").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.state.copy_selected_clip();
+                                this.state.delete_selected_clip();
+                                this.sync_preview_after_seek(cx);
+                                cx.notify();
+                            },
+                        )))
+                        .child(item("menu-copy", "Copy", "Ctrl+C").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.state.copy_selected_clip();
+                                cx.notify();
+                            },
+                        )))
+                        .child(item("menu-paste", "Paste", "Ctrl+V").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                if this.state.paste_clip_at_playhead().is_some() {
+                                    this.sync_preview_after_seek(cx);
+                                }
+                                cx.notify();
+                            },
+                        )))
+                        .child(item("menu-delete", "Delete", "Del").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.state.delete_selected_clip();
+                                this.sync_preview_after_seek(cx);
+                                cx.notify();
+                            },
+                        )))
+                        .child(sep())
+                        .child(item("menu-select-all", "Select all", "Ctrl+A").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.active_top_menu = None;
+                                if let Some(first) = this.state.clips.first() {
+                                    let id = first.id;
+                                    this.state.selected_clip_id = Some(id);
+                                    this.state.status_message = format!(
+                                        "Selected clip ({} clips on timeline)",
+                                        this.state.clips.len()
+                                    );
+                                }
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .when(kind == TopMenuKind::View, |el| {
+                        el.child(item("menu-zoom-in", "Zoom timeline in", "Ctrl+=").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.zoom_timeline(1.25);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(item("menu-zoom-out", "Zoom timeline out", "Ctrl+-").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.zoom_timeline(0.8);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(sep())
+                        .child(
+                            check_item("menu-show-grid", "Show grid", self.show_grid, "G").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.active_top_menu = None;
+                                    this.show_grid = !this.show_grid;
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            check_item("menu-safe-zone", "Safe zone", self.show_safe_zone, "S")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.active_top_menu = None;
+                                    this.show_safe_zone = !this.show_safe_zone;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            check_item(
+                                "menu-fullscreen",
+                                "Fullscreen preview",
+                                self.preview_fullscreen,
+                                "F11",
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.preview_fullscreen = !this.preview_fullscreen;
+                                cx.notify();
+                            })),
+                        )
+                        .child(sep())
+                        .child(item("menu-reset-layout", "Reset layout", "Ctrl+0").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.reset_layout();
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .when(kind == TopMenuKind::Project, |el| {
+                        el.child(
+                            item("menu-proj-settings", "Project settings...", "").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.active_top_menu = None;
+                                    this.project_settings_modal_open = true;
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .id("menu-canvas-bg")
+                                .w_full()
+                                .px_3()
+                                .py_1p5()
+                                .rounded_sm()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .text_xs()
+                                .text_color(Theme::text_primary())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(Theme::bg_hover()))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.canvas_bg = this.canvas_bg.next();
+                                    this.state.status_message =
+                                        format!("Canvas background: {}", this.canvas_bg.label());
+                                    cx.notify();
+                                }))
+                                .child("Canvas background")
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(Theme::accent())
+                                        .child(self.canvas_bg.label()),
+                                ),
+                        )
+                        .child(sep())
+                        .child(item("menu-clear-cache", "Clear cache", "").on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.clear_preview_cache();
+                                this.sync_preview_after_seek(cx);
+                                this.state.status_message = "Preview cache cleared".into();
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .when(kind == TopMenuKind::Help, |el| {
+                        el.child(
+                            item("menu-shortcuts", "Keyboard shortcuts", "F1").on_click(
+                                cx.listener(|this, _, _, cx| {
+                                    this.active_top_menu = None;
+                                    this.help_modal = Some(HelpModalKind::Shortcuts);
+                                    cx.notify();
+                                }),
+                            ),
+                        )
+                        .child(item("menu-docs", "Documentation", "").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.help_modal = Some(HelpModalKind::Docs);
+                                cx.notify();
+                            },
+                        )))
+                        .child(sep())
+                        .child(item("menu-about", "About OpenCut Pro", "").on_click(cx.listener(
+                            |this, _, _, cx| {
+                                this.active_top_menu = None;
+                                this.help_modal = Some(HelpModalKind::About);
+                                cx.notify();
+                            },
+                        )))
+                    }),
+            )
+            .when(
+                kind == TopMenuKind::File && self.recent_submenu_open,
+                |el| {
+                    let recents = self.recent_projects.clone();
+                    el.child(
+                        div()
+                            .id("recent-submenu")
+                            .absolute()
+                            .top(px(90.))
+                            .left(px(left_px + 252.))
+                            .w(px(240.))
+                            .p_1p5()
+                            .rounded_md()
+                            .bg(Theme::bg_panel())
+                            .border_1()
+                            .border_color(Theme::border())
+                            .shadow_lg()
+                            .flex()
+                            .flex_col()
+                            .gap_0p5()
+                            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+                            .when(recents.is_empty(), |sub| {
+                                sub.child(
+                                    div()
+                                        .px_3()
+                                        .py_1p5()
+                                        .text_xs()
+                                        .text_color(Theme::text_muted())
+                                        .child("(No recent projects)"),
+                                )
+                            })
+                            .children(recents.into_iter().enumerate().map(|(i, entry)| {
+                                let path = entry.path.clone();
+                                div()
+                                    .id(SharedString::from(format!("recent-item-{}", i)))
+                                    .w_full()
+                                    .px_3()
+                                    .py_1p5()
+                                    .rounded_sm()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .text_xs()
+                                    .text_color(Theme::text_primary())
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.active_top_menu = None;
+                                        this.recent_submenu_open = false;
+                                        this.open_project_path(path.clone(), cx);
+                                    }))
+                                    .child(entry.name)
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(Theme::text_muted())
+                                            .child(entry.aspect_ratio.label()),
+                                    )
+                            })),
+                    )
+                },
+            )
+    }
+
+    fn render_project_settings_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("proj-settings-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(gpui::rgba(0x00000099))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.project_settings_modal_open = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(400.))
+                    .p_5()
+                    .rounded_lg()
+                    .bg(Theme::bg_panel())
+                    .border_1()
+                    .border_color(Theme::border())
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_3p5()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(Theme::text_primary())
+                                    .child("Project Settings"),
+                            )
+                            .child(
+                                div()
+                                    .id("proj-settings-close")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .text_color(Theme::text_muted())
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.project_settings_modal_open = false;
+                                        cx.notify();
+                                    }))
+                                    .child("✕"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(Theme::text_secondary())
+                                    .child("Aspect Ratio"),
+                            )
+                            .child(div().flex().flex_wrap().gap_1p5().children(
+                                AspectRatio::all().iter().copied().map(|r| {
+                                    let active = self.state.aspect_ratio == r;
+                                    div()
+                                        .id(SharedString::from(format!("ps-ratio-{:?}", r)))
+                                        .px_2p5()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::border()
+                                        })
+                                        .text_xs()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.state.set_aspect_ratio(r);
+                                            this.player.stop();
+                                            this.sync_preview_after_seek(cx);
+                                            cx.notify();
+                                        }))
+                                        .child(r.label())
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(Theme::text_secondary())
+                                    .child("Resolution"),
+                            )
+                            .child(div().flex().gap_1p5().children(
+                                [(720u32, "720p"), (1080u32, "1080p"), (2160u32, "4K")]
+                                    .into_iter()
+                                    .map(|(h, lbl)| {
+                                        let active = self.state.base_height == h;
+                                        div()
+                                            .id(SharedString::from(format!("ps-res-{}", h)))
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(if active {
+                                                Theme::accent()
+                                            } else {
+                                                Theme::bg_surface()
+                                            })
+                                            .border_1()
+                                            .border_color(if active {
+                                                Theme::accent()
+                                            } else {
+                                                Theme::border()
+                                            })
+                                            .text_xs()
+                                            .text_color(Theme::text_primary())
+                                            .cursor_pointer()
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.base_height = h;
+                                                this.sync_preview_after_seek(cx);
+                                                cx.notify();
+                                            }))
+                                            .child(lbl)
+                                    }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(Theme::text_secondary())
+                                    .child("Frame Rate (FPS)"),
+                            )
+                            .child(div().flex().gap_1p5().children([24u32, 30, 60].into_iter().map(
+                                |fps| {
+                                    let active = self.state.fps == fps;
+                                    div()
+                                        .id(SharedString::from(format!("ps-fps-{}", fps)))
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::border()
+                                        })
+                                        .text_xs()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.state.fps = fps;
+                                            cx.notify();
+                                        }))
+                                        .child(format!("{} fps", fps))
+                                },
+                            ))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_1p5()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(Theme::text_secondary())
+                                    .child("Canvas Background"),
+                            )
+                            .child(div().flex().flex_wrap().gap_1p5().children(
+                                CanvasBgKind::ALL.into_iter().map(|bg| {
+                                    let active = self.canvas_bg == bg;
+                                    div()
+                                        .id(SharedString::from(format!("ps-bg-{:?}", bg)))
+                                        .px_2p5()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::border()
+                                        })
+                                        .text_xs()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.canvas_bg = bg;
+                                            cx.notify();
+                                        }))
+                                        .child(bg.label())
+                                }),
+                            )),
+                    ),
+            )
+    }
+
+    fn render_help_modal(&self, kind: HelpModalKind, cx: &mut Context<Self>) -> impl IntoElement {
+        let title = match kind {
+            HelpModalKind::Shortcuts => "Keyboard Shortcuts",
+            HelpModalKind::Docs => "Quick Guide",
+            HelpModalKind::About => "About OpenCut Pro",
+        };
+        let row = |action: &'static str, keys: &'static str| {
+            div()
+                .w_full()
+                .py_1()
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_b_1()
+                .border_color(Theme::border())
+                .child(div().text_xs().text_color(Theme::text_primary()).child(action))
+                .child(
+                    div()
+                        .px_1p5()
+                        .py_0p5()
+                        .rounded_sm()
+                        .bg(Theme::bg_surface())
+                        .text_xs()
+                        .text_color(Theme::text_secondary())
+                        .child(keys),
+                )
+        };
+
+        div()
+            .id("help-modal-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(gpui::rgba(0x00000099))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.help_modal = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(400.))
+                    .p_5()
+                    .rounded_lg()
+                    .bg(Theme::bg_panel())
+                    .border_1()
+                    .border_color(Theme::border())
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(Theme::text_primary())
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .id("help-modal-close")
+                                    .px_2()
+                                    .py_0p5()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .text_color(Theme::text_muted())
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.help_modal = None;
+                                        cx.notify();
+                                    }))
+                                    .child("✕"),
+                            ),
+                    )
+                    .when(kind == HelpModalKind::Shortcuts, |el| {
+                        el.child(row("Play / Pause", "Space"))
+                            .child(row("Split clip at playhead", "Ctrl+B"))
+                            .child(row("Undo / Redo", "Ctrl+Z / Ctrl+Y"))
+                            .child(row("Cut / Copy / Paste", "Ctrl+X / Ctrl+C / Ctrl+V"))
+                            .child(row("Delete / Ripple Delete", "Del / Shift+Del"))
+                            .child(row("Save / Save As", "Ctrl+S / Ctrl+Shift+S"))
+                            .child(row("Toggle Grid / Safe Zone", "G / S"))
+                            .child(row("Fullscreen Preview", "F11"))
+                            .child(row("Step 1 frame", ", / ."))
+                    })
+                    .when(kind == HelpModalKind::Docs, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(Theme::text_secondary())
+                                .child("1. Import video/audio/images in the Media tab or drag & drop files directly."),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(Theme::text_secondary())
+                                .child("2. Add Text, Stickers, Effects, Animation, Filters, or Adjustment Layers from the left rail."),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(Theme::text_secondary())
+                                .child("3. Select any clip or effect bar on the timeline to fine-tune Transform, Speed, Color, and Effect Parameters in the right Properties panel."),
+                        )
+                    })
+                    .when(kind == HelpModalKind::About, |el| {
+                        el.child(
+                            div()
+                                .text_xs()
+                                .text_color(Theme::text_primary())
+                                .child("OpenCut Pro — Desktop Video Editor (GPUI + FFmpeg)"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(Theme::text_muted())
+                                .child("Supports multi-track timeline, keyframes, GLSL-style effects, LUT filters, SRT subtitles, voiceover recording, and hardware-accelerated export."),
+                        )
+                    }),
             )
     }
 
@@ -2153,7 +3444,8 @@ impl EditorView {
     fn render_media_pool(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let effective_filter = match self.media_panel_tab {
             MediaPanelTab::Media => self.media_filter,
-            MediaPanelTab::Text => None,
+            MediaPanelTab::Audio => Some(TrackKind::Audio),
+            _ => None,
         };
         let assets: Vec<_> = self
             .state
@@ -2169,10 +3461,10 @@ impl EditorView {
 
         div()
             .id("media-pool-dropzone")
-            .w(px(272.))
+            .w(px(296.))
             .h_full()
             .flex()
-            .flex_col()
+            .flex_row()
             .bg(Theme::bg_panel())
             .border_r_1()
             .border_color(Theme::border())
@@ -2187,45 +3479,52 @@ impl EditorView {
                     .import_paths_with_probe(paths.paths().to_vec(), probe_duration_secs);
                 cx.notify();
             }))
-            // CapCut-style top tab strip: Media | Text
+            // Left vertical icon rail (icon + small label)
             .child(
                 div()
-                    .h(px(34.))
-                    .px_2()
+                    .w(px(62.))
+                    .h_full()
+                    .py_1p5()
                     .flex()
-                    .items_center()
-                    .gap_1()
-                    .border_b_1()
+                    .flex_col()
+                    .gap_0p5()
+                    .bg(Theme::bg_app())
+                    .border_r_1()
                     .border_color(Theme::border())
                     .children(
                         [
-                            (MediaPanelTab::Media, "Media"),
-                            (MediaPanelTab::Text, "Text"),
+                            (MediaPanelTab::Media, "📁", "Media"),
+                            (MediaPanelTab::Audio, "🎵", "Audio"),
+                            (MediaPanelTab::Text, "T", "Text"),
+                            (MediaPanelTab::Stickers, "★", "Stickers"),
+                            (MediaPanelTab::Effects, "✦", "Effects"),
+                            (MediaPanelTab::Animation, "✧", "Animation"),
+                            (MediaPanelTab::Filters, "◐", "Filters"),
+                            (MediaPanelTab::Adjustment, "⚙", "Adjust"),
                         ]
                         .into_iter()
-                        .map(|(tab, label)| {
+                        .map(|(tab, icon, label)| {
                             let is_active = active_tab == tab;
                             div()
                                 .id(SharedString::from(format!("mp-tab-{}", label)))
-                                .px_2p5()
-                                .py_1()
-                                .rounded_sm()
+                                .w_full()
+                                .py_2()
+                                .px_1()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .justify_center()
+                                .gap_0p5()
                                 .bg(if is_active {
                                     Theme::bg_surface()
                                 } else {
-                                    Theme::bg_panel()
+                                    Theme::bg_app()
                                 })
-                                .border_b_2()
+                                .border_l_2()
                                 .border_color(if is_active {
                                     Theme::accent()
                                 } else {
-                                    Theme::bg_panel()
-                                })
-                                .text_xs()
-                                .font_weight(if is_active {
-                                    gpui::FontWeight::SEMIBOLD
-                                } else {
-                                    gpui::FontWeight::MEDIUM
+                                    Theme::bg_app()
                                 })
                                 .text_color(if is_active {
                                     Theme::text_primary()
@@ -2233,15 +3532,42 @@ impl EditorView {
                                     Theme::text_secondary()
                                 })
                                 .cursor_pointer()
-                                .hover(|s| s.bg(Theme::bg_hover()))
+                                .hover(|s| s.bg(Theme::bg_hover()).text_color(Theme::text_primary()))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.media_panel_tab = tab;
                                     cx.notify();
                                 }))
-                                .child(label)
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(if is_active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::text_secondary()
+                                        })
+                                        .child(icon),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.))
+                                        .font_weight(if is_active {
+                                            gpui::FontWeight::SEMIBOLD
+                                        } else {
+                                            gpui::FontWeight::NORMAL
+                                        })
+                                        .child(label),
+                                )
                         }),
                     ),
             )
+            .child(
+                div()
+                    .flex_1()
+                    .h_full()
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
             .when(active_tab == MediaPanelTab::Text, |el| {
                 el.child(
                     div()
@@ -2318,10 +3644,640 @@ impl EditorView {
                                         }))
                                         .child(preset.label())
                                 })),
+                        )
+                        .child(
+                            div()
+                                .pt_2()
+                                .border_t_1()
+                                .border_color(Theme::border())
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_secondary())
+                                .child("Subtitles (.srt)"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    self.header_button("mp-import-srt", "Import .srt", false)
+                                        .flex_1()
+                                        .text_center()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.prompt_import_srt(cx);
+                                        })),
+                                )
+                                .child(
+                                    self.header_button("mp-export-srt", "Export .srt", false)
+                                        .flex_1()
+                                        .text_center()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.prompt_export_srt(cx);
+                                        })),
+                                ),
                         ),
                 )
             })
-            .when(active_tab != MediaPanelTab::Text, |el| {
+            .when(active_tab == MediaPanelTab::Audio, |el| {
+                let is_rec = self.voiceover_recorder.is_some();
+                let rec_label = if let Some(ref rec) = self.voiceover_recorder {
+                    format!("⏹ Stop Rec ({:.1}s)", rec.elapsed_secs())
+                } else {
+                    "🎙 Record Voiceover".into()
+                };
+                el.child(
+                    div()
+                        .p_2()
+                        .flex()
+                        .flex_col()
+                        .gap_1p5()
+                        .border_b_1()
+                        .border_color(Theme::border())
+                        .child(
+                            div()
+                                .id("mp-voiceover-btn")
+                                .w_full()
+                                .py_1p5()
+                                .rounded_md()
+                                .bg(if is_rec {
+                                    rgb(0xdc2626)
+                                } else {
+                                    Theme::accent()
+                                })
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_center()
+                                .text_color(Theme::text_primary())
+                                .cursor_pointer()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_voiceover_recording(cx);
+                                }))
+                                .child(rec_label),
+                        )
+                        .child(
+                            self.header_button("mp-detach-audio", "✂ Detach Audio from Video", false)
+                                .w_full()
+                                .text_center()
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.state.detach_audio_selected() {
+                                        this.sync_preview_after_seek(cx);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when(active_tab == MediaPanelTab::Stickers, |el| {
+                let stickers = [
+                    ("🔥", "Fire"),
+                    ("⭐", "Star"),
+                    ("❤️", "Heart"),
+                    ("😂", "Laugh"),
+                    ("🎉", "Party"),
+                    ("👍", "Like"),
+                    ("⚡", "Bolt"),
+                    ("🎬", "Cut"),
+                    ("✨", "Sparkle"),
+                    ("🎵", "Music"),
+                    ("📌", "Pin"),
+                    ("💯", "100"),
+                ];
+                el.child(
+                    div()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_secondary())
+                                .child("STICKERS (Click to add at playhead)"),
+                        )
+                        .child(
+                            div()
+                                .grid()
+                                .grid_cols(4)
+                                .gap_1p5()
+                                .children(stickers.into_iter().enumerate().map(|(i, (glyph, name))| {
+                                    div()
+                                        .id(SharedString::from(format!("mp-stk-{}", i)))
+                                        .py_2()
+                                        .rounded_md()
+                                        .bg(Theme::bg_surface())
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .flex()
+                                        .flex_col()
+                                        .items_center()
+                                        .justify_center()
+                                        .cursor_pointer()
+                                        .hover(|s| {
+                                            s.border_color(Theme::accent()).bg(Theme::bg_hover())
+                                        })
+                                        .child(div().text_lg().child(glyph))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(Theme::text_muted())
+                                                .child(name),
+                                        )
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            if let Some(cid) = this.state.add_text_clip(glyph, 4.0) {
+                                                if let Some(c) = this
+                                                    .state
+                                                    .clips
+                                                    .iter_mut()
+                                                    .find(|c| c.id == cid)
+                                                {
+                                                    c.name = format!("Sticker {}", name);
+                                                    if let Some(ref mut td) = c.text {
+                                                        td.font_size = 72.0;
+                                                        td.stroke_width = 0.0;
+                                                        td.bg_color_hex = None;
+                                                    }
+                                                }
+                                                this.sync_preview_after_seek(cx);
+                                            }
+                                            cx.notify();
+                                        }))
+                                })),
+                        ),
+                )
+            })
+            .when(active_tab == MediaPanelTab::Effects, |el| {
+                let cur_cat = self.effect_category;
+                let cur_eff = self.state.selected_clip().map(|c| c.effect);
+                let effects_list: Vec<VideoEffect> = match cur_cat {
+                    None => VideoEffect::all()
+                        .iter()
+                        .copied()
+                        .filter(|e| *e != VideoEffect::None)
+                        .collect(),
+                    Some(cat) => VideoEffect::by_category(cat).to_vec(),
+                };
+                el.child(
+                    div()
+                        .id("mp-effects-scroll")
+                        .flex_1()
+                        .overflow_y_scroll()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_secondary())
+                                .child("EFFECTS (+ Add to Timeline)"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_1()
+                                .child({
+                                    let active = cur_cat.is_none();
+                                    div()
+                                        .id("mp-ecat-all")
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .bg(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::border()
+                                        })
+                                        .text_xs()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .child("Tất cả")
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.effect_category = None;
+                                            cx.notify();
+                                        }))
+                                })
+                                .children(EffectCategory::all().iter().copied().map(|cat| {
+                                    let active = cur_cat == Some(cat);
+                                    div()
+                                        .id(SharedString::from(format!("mp-ecat-{:?}", cat)))
+                                        .px_2()
+                                        .py_0p5()
+                                        .rounded_sm()
+                                        .bg(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::border()
+                                        })
+                                        .text_xs()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .child(cat.label())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.effect_category = Some(cat);
+                                            cx.notify();
+                                        }))
+                                })),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_1p5()
+                                .children(effects_list.into_iter().map(|eff| {
+                                    let active = cur_eff == Some(eff);
+                                    div()
+                                        .id(SharedString::from(format!("mp-eff-{:?}", eff)))
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .rounded_sm()
+                                        .bg(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::border()
+                                        })
+                                        .text_xs()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .child(eff.label())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.state.add_effect_clip(eff, 3.0);
+                                            this.refresh_all_visual_transforms(cx);
+                                            cx.notify();
+                                        }))
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(Theme::text_muted())
+                                .child("Note: Body segmentation effects require AI; all 6 standard categories render live & export."),
+                        ),
+                )
+            })
+            .when(active_tab == MediaPanelTab::Animation, |el| {
+                let anim_tab = self.anim_tab;
+                let cur_in = self.state.selected_clip().map(|c| c.transition_in);
+                let cur_out = self.state.selected_clip().map(|c| c.transition_out);
+                let cur_combo = self.state.selected_clip().map(|c| c.combo_anim);
+                let anim_dur = self.state.selected_clip().map(|c| (c.transition_dur_secs, (c.duration_secs * 0.5).clamp(0.2, 3.0)));
+                el.child(
+                    div()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2p5()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .children([
+                                    (AnimSubTab::In, "In"),
+                                    (AnimSubTab::Out, "Out"),
+                                    (AnimSubTab::Combo, "Combo"),
+                                ]
+                                .into_iter()
+                                .map(|(tab, label)| {
+                                    let active = anim_tab == tab;
+                                    div()
+                                        .id(SharedString::from(format!("mp-anim-sub-{:?}", tab)))
+                                        .px_2p5()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::border()
+                                        })
+                                        .text_xs()
+                                        .font_weight(if active {
+                                            gpui::FontWeight::SEMIBOLD
+                                        } else {
+                                            gpui::FontWeight::NORMAL
+                                        })
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .child(label)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.anim_tab = tab;
+                                            cx.notify();
+                                        }))
+                                })),
+                        )
+                        .when(anim_tab == AnimSubTab::In, |col| {
+                            col.child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1p5()
+                                    .children(TransitionKind::all().iter().copied().map(|tr| {
+                                        let active = cur_in == Some(tr);
+                                        div()
+                                            .id(SharedString::from(format!("mp-anim-in-{:?}", tr)))
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(if active {
+                                                Theme::accent()
+                                            } else {
+                                                Theme::bg_surface()
+                                            })
+                                            .border_1()
+                                            .border_color(if active {
+                                                Theme::accent()
+                                            } else {
+                                                Theme::border()
+                                            })
+                                            .text_xs()
+                                            .text_color(Theme::text_primary())
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(Theme::bg_hover()))
+                                            .child(tr.label())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.push_undo();
+                                                if let Some(c) = this.state.selected_clip_mut() {
+                                                    c.transition_in = tr;
+                                                    this.state.status_message =
+                                                        format!("Animation In: {}", tr.label());
+                                                }
+                                                cx.notify();
+                                            }))
+                                    })),
+                            )
+                        })
+                        .when(anim_tab == AnimSubTab::Out, |col| {
+                            col.child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1p5()
+                                    .children(TransitionKind::all().iter().copied().map(|tr| {
+                                        let active = cur_out == Some(tr);
+                                        div()
+                                            .id(SharedString::from(format!("mp-anim-out-{:?}", tr)))
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(if active {
+                                                Theme::accent()
+                                            } else {
+                                                Theme::bg_surface()
+                                            })
+                                            .border_1()
+                                            .border_color(if active {
+                                                Theme::accent()
+                                            } else {
+                                                Theme::border()
+                                            })
+                                            .text_xs()
+                                            .text_color(Theme::text_primary())
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(Theme::bg_hover()))
+                                            .child(tr.label())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.push_undo();
+                                                if let Some(c) = this.state.selected_clip_mut() {
+                                                    c.transition_out = tr;
+                                                    this.state.status_message =
+                                                        format!("Animation Out: {}", tr.label());
+                                                }
+                                                cx.notify();
+                                            }))
+                                    })),
+                            )
+                        })
+                        .when(anim_tab == AnimSubTab::Combo, |col| {
+                            col.child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap_1p5()
+                                    .children(ComboAnimation::all().iter().copied().map(|combo| {
+                                        let active = cur_combo == Some(combo);
+                                        div()
+                                            .id(SharedString::from(format!(
+                                                "mp-anim-combo-{:?}",
+                                                combo
+                                            )))
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded_sm()
+                                            .bg(if active {
+                                                Theme::accent()
+                                            } else {
+                                                Theme::bg_surface()
+                                            })
+                                            .border_1()
+                                            .border_color(if active {
+                                                Theme::accent()
+                                            } else {
+                                                Theme::border()
+                                            })
+                                            .text_xs()
+                                            .text_color(Theme::text_primary())
+                                            .cursor_pointer()
+                                            .hover(|s| s.bg(Theme::bg_hover()))
+                                            .child(combo.label())
+                                            .on_click(cx.listener(move |this, _, _, cx| {
+                                                this.state.push_undo();
+                                                if let Some(c) = this.state.selected_clip_mut() {
+                                                    c.combo_anim = combo;
+                                                    this.state.status_message =
+                                                        format!("Animation Combo: {}", combo.label());
+                                                }
+                                                cx.notify();
+                                            }))
+                                    })),
+                            )
+                        })
+                        .when_some(anim_dur, |col, (dur, max_td)| {
+                            col.when(
+                                cur_in.is_some_and(|t| t != TransitionKind::None)
+                                    || cur_out.is_some_and(|t| t != TransitionKind::None)
+                                    || cur_combo.is_some_and(|c| c != ComboAnimation::None),
+                                |col| {
+                                    col.child(self.inspector_slider(
+                                        "Duration",
+                                        format!("{:.1}s", dur),
+                                        ((dur - 0.1) / (max_td - 0.1)).clamp(0.0, 1.0),
+                                        Theme::accent(),
+                                        SliderField::TransitionDur,
+                                        cx,
+                                    ))
+                                },
+                            )
+                        }),
+                )
+            })
+            .when(active_tab == MediaPanelTab::Filters, |el| {
+                let cur_filter = self.state.selected_clip().map(|c| c.filter_preset);
+                let has_lut = self
+                    .state
+                    .selected_clip()
+                    .and_then(|c| c.lut_path.as_ref())
+                    .is_some();
+                el.child(
+                    div()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .child(
+                            div()
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_secondary())
+                                .child("COLOR FILTERS (Click to apply)"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_1p5()
+                                .children(ColorFilterPreset::all().iter().copied().map(|fp| {
+                                    let active = cur_filter == Some(fp);
+                                    div()
+                                        .id(SharedString::from(format!("mp-flt-{:?}", fp)))
+                                        .px_2p5()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(if active {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::border()
+                                        })
+                                        .text_xs()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                        .child(fp.label())
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.state.push_undo();
+                                            if let Some(c) = this.state.selected_clip_mut() {
+                                                c.filter_preset = fp;
+                                                this.state.status_message =
+                                                    format!("Filter: {}", fp.label());
+                                            }
+                                            this.refresh_all_visual_transforms(cx);
+                                            cx.notify();
+                                        }))
+                                })),
+                        )
+                        .child(
+                            div()
+                                .pt_2()
+                                .border_t_1()
+                                .border_color(Theme::border())
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(Theme::text_secondary())
+                                .child("3D LUT (.cube)"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_1p5()
+                                .child(
+                                    self.header_button("mp-import-lut", "Import .cube LUT", false)
+                                        .flex_1()
+                                        .text_center()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.prompt_import_lut(cx);
+                                        })),
+                                )
+                                .when(has_lut, |el| {
+                                    el.child(
+                                        self.header_button("mp-clear-lut", "Clear", false)
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.state.push_undo();
+                                                if let Some(c) = this.state.selected_clip_mut() {
+                                                    c.lut_path = None;
+                                                }
+                                                this.refresh_all_visual_transforms(cx);
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        ),
+                )
+            })
+            .when(active_tab == MediaPanelTab::Adjustment, |el| {
+                el.child(
+                    div()
+                        .p_3()
+                        .flex()
+                        .flex_col()
+                        .gap_2p5()
+                        .child(
+                            div()
+                                .id("mp-add-adj")
+                                .w_full()
+                                .py_1p5()
+                                .rounded_md()
+                                .bg(Theme::accent())
+                                .text_xs()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_center()
+                                .text_color(Theme::text_primary())
+                                .cursor_pointer()
+                                .hover(|s| s.bg(rgb(Theme::ACCENT_HOVER)))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.state.add_adjustment_clip(5.0);
+                                    this.refresh_all_visual_transforms(cx);
+                                    cx.notify();
+                                }))
+                                .child("+ Add Adjustment Layer (5s)"),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(Theme::text_muted())
+                                .child("Adjustment Layers apply color filters, effects, and .cube LUTs to all video layers underneath them."),
+                        ),
+                )
+            })
+            .when(
+                active_tab == MediaPanelTab::Media || active_tab == MediaPanelTab::Audio,
+                |el| {
                 el.child(
                     div()
                         .p_2()
@@ -2405,7 +4361,9 @@ impl EditorView {
                                 .child("+ Import"),
                         ),
                 )
-                .when(active_tab == MediaPanelTab::Media, |el| {
+                .when(
+                    active_tab == MediaPanelTab::Media || active_tab == MediaPanelTab::Audio,
+                    |el| {
                     el.child(
                         div()
                             .px_2()
@@ -2609,6 +4567,7 @@ impl EditorView {
                     }))
             })
         })
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2932,13 +4891,14 @@ impl EditorView {
             if let Some(frame) = self.current_frame.clone() {
                 let vid = vclip.id;
                 let (epx, epy, esc, erot, eop) = vclip.evaluate_at(self.state.playhead_secs);
-                let vscale = (esc as f32 / 100.0).clamp(0.1, 2.0);
-                let valpha = (eop as f32 / 100.0).clamp(0.0, 1.0);
+                let (tr_a, tr_s, tr_x) = vclip.evaluate_transition(self.state.playhead_secs);
+                let vscale = ((esc as f32 / 100.0) * tr_s).clamp(0.1, 2.5);
+                let valpha = ((eop as f32 / 100.0) * tr_a).clamp(0.0, 1.0);
                 let (fit_w, fit_h) =
                     self.fit_media_box(vclip.source_path.as_ref(), preview_w, preview_h);
                 let box_w = fit_w * vscale;
                 let box_h = fit_h * vscale;
-                let vox = epx * preview_scale;
+                let vox = epx * preview_scale + tr_x * preview_w;
                 let voy = epy * preview_scale;
                 let is_sel = self.state.selected_clip_id == Some(vid);
                 let obj_cx = pv_center_x + vox;
@@ -3046,12 +5006,13 @@ impl EditorView {
                 let path = oclip.source_path.clone()?;
                 let oid = oclip.id;
                 let (epx, epy, esc, erot, eop) = oclip.evaluate_at(self.state.playhead_secs);
-                let oscale = (esc as f32 / 100.0).clamp(0.1, 2.0);
-                let oalpha = (eop as f32 / 100.0).clamp(0.0, 1.0);
+                let (tr_a, tr_s, tr_x) = oclip.evaluate_transition(self.state.playhead_secs);
+                let oscale = ((esc as f32 / 100.0) * tr_s).clamp(0.1, 2.5);
+                let oalpha = ((eop as f32 / 100.0) * tr_a).clamp(0.0, 1.0);
                 let (fit_w, fit_h) = self.fit_media_box(Some(&path), preview_w, preview_h);
                 let box_w = fit_w * oscale;
                 let box_h = fit_h * oscale;
-                let ox = epx * preview_scale;
+                let ox = epx * preview_scale + tr_x * preview_w;
                 let oy = epy * preview_scale;
                 let is_sel = self.state.selected_clip_id == Some(oid);
                 let obj_cx = pv_center_x + ox;
@@ -3080,7 +5041,17 @@ impl EditorView {
                 }
 
                 let norm_rot = erot.rem_euclid(360.0);
-                let use_rot_ovl = oclip.flip_h || (norm_rot > 0.5 && norm_rot < 359.5);
+                let (cb, cc, cs, ct) = oclip.effective_color();
+                let has_color = cb.abs() >= 0.005
+                    || cc.abs() >= 0.005
+                    || cs.abs() >= 0.005
+                    || ct.abs() >= 0.005;
+                let has_effect =
+                    oclip.effect != VideoEffect::None && oclip.effect_intensity >= 0.01;
+                let use_rot_ovl = oclip.flip_h
+                    || has_color
+                    || has_effect
+                    || (norm_rot > 0.5 && norm_rot < 359.5);
                 let cached_ovl = if use_rot_ovl {
                     self.rotated_overlay_cache
                         .get(&oid)
@@ -3182,12 +5153,13 @@ impl EditorView {
                 };
 
                 let (epx, epy, esc, erot, eop) = tclip.evaluate_at(self.state.playhead_secs);
-                let clip_scale = (esc as f32 / 100.0).clamp(0.1, 2.0);
+                let (tr_a, tr_s, tr_x) = tclip.evaluate_transition(self.state.playhead_secs);
+                let clip_scale = ((esc as f32 / 100.0) * tr_s).clamp(0.1, 2.5);
                 let scaled_font =
                     (td.font_size * clip_scale * preview_scale * anim_scale).clamp(8.0, 220.0);
-                let ox = epx * preview_scale;
+                let ox = epx * preview_scale + tr_x * preview_w;
                 let oy = (epy + anim_dy) * preview_scale;
-                let alpha = ((eop as f32 / 100.0) * anim_alpha).clamp(0.0, 1.0);
+                let alpha = ((eop as f32 / 100.0) * anim_alpha * tr_a).clamp(0.0, 1.0);
                 let obj_cx = pv_center_x + ox;
                 let obj_cy = pv_center_y + oy;
                 let display_text = if is_editing {
@@ -3456,7 +5428,7 @@ impl EditorView {
                                     .absolute()
                                     .inset_0()
                                     .rounded_lg()
-                                    .bg(Theme::bg_preview())
+                                    .bg(self.canvas_bg.color())
                                     .border_1()
                                     .border_color(Theme::border())
                                     .overflow_hidden()
@@ -3481,13 +5453,11 @@ impl EditorView {
                                     .child(base_layer)
                                     .children(overlay_elements)
                                     .children(text_elements)
-                            .when(self.show_safe_zone, |el| {
+                            .when(self.show_grid, |el| {
                                 let gx1 = preview_w / 3.0;
                                 let gx2 = preview_w * 2.0 / 3.0;
                                 let gy1 = preview_h / 3.0;
                                 let gy2 = preview_h * 2.0 / 3.0;
-                                let sx = preview_w * 0.08;
-                                let sy = preview_h * 0.08;
                                 el.child(
                                     div()
                                         .absolute()
@@ -3527,7 +5497,16 @@ impl EditorView {
                                                 .h(px(1.))
                                                 .w_full()
                                                 .bg(gpui::rgba(0xffffff33)),
-                                        )
+                                        ),
+                                )
+                            })
+                            .when(self.show_safe_zone, |el| {
+                                let sx = preview_w * 0.08;
+                                let sy = preview_h * 0.08;
+                                el.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
                                         .child(
                                             div()
                                                 .absolute()
@@ -3911,6 +5890,56 @@ impl EditorView {
             )
     }
 
+    fn inspector_section_header(
+        &self,
+        id: &'static str,
+        title: &'static str,
+        summary: String,
+        is_open: bool,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id)
+            .w_full()
+            .px_2()
+            .py_1()
+            .rounded_sm()
+            .bg(Theme::bg_surface())
+            .border_1()
+            .border_color(Theme::border())
+            .flex()
+            .items_center()
+            .justify_between()
+            .cursor_pointer()
+            .hover(|s| s.bg(Theme::bg_hover()))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(Theme::text_secondary())
+                            .child(if is_open { "▾" } else { "▸" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(Theme::text_primary())
+                            .child(title),
+                    ),
+            )
+            .when(!summary.is_empty(), |el| {
+                el.child(
+                    div()
+                        .text_xs()
+                        .text_color(Theme::text_muted())
+                        .child(summary),
+                )
+            })
+    }
+
     fn render_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.state.selected_clip().cloned();
 
@@ -3976,40 +6005,58 @@ impl EditorView {
                                     )),
                             ),
                     )
-                    .child({
-                        let (_, _, _, _, eop) = clip.evaluate_at(self.state.playhead_secs);
-                        self.inspector_slider(
-                            "Opacity",
-                            format!("{}%", eop),
-                            eop as f32 / 100.0,
-                            Theme::accent(),
-                            SliderField::Opacity,
-                            cx,
+                    .child(
+                        self.inspector_section_header(
+                            "sec-transform",
+                            "TRANSFORM & ALIGN",
+                            {
+                                let (_, _, esc, erot, eop) =
+                                    clip.evaluate_at(self.state.playhead_secs);
+                                format!("{}% • {:.0}° • {}%", esc, erot, eop)
+                            },
+                            self.ins_sections.transform,
                         )
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.ins_sections.transform = !this.ins_sections.transform;
+                            cx.notify();
+                        })),
+                    )
+                    .when(self.ins_sections.transform, |el| {
+                        el.child({
+                            let (_, _, _, _, eop) = clip.evaluate_at(self.state.playhead_secs);
+                            self.inspector_slider(
+                                "Opacity",
+                                format!("{}%", eop),
+                                eop as f32 / 100.0,
+                                Theme::accent(),
+                                SliderField::Opacity,
+                                cx,
+                            )
+                        })
+                        .when(clip.track != TrackKind::Text, |el| {
+                            let (_, _, esc, _, _) = clip.evaluate_at(self.state.playhead_secs);
+                            el.child(self.inspector_slider(
+                                "Scale",
+                                format!("{}%", esc),
+                                ((esc as f32 - 10.0) / 190.0).clamp(0.0, 1.0),
+                                Theme::accent(),
+                                SliderField::Scale,
+                                cx,
+                            ))
+                        })
+                        .child({
+                            let (_, _, _, erot, _) = clip.evaluate_at(self.state.playhead_secs);
+                            self.inspector_slider(
+                                "Rotate",
+                                format!("{:.0}°", erot),
+                                (erot.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0),
+                                Theme::accent(),
+                                SliderField::Rotation,
+                                cx,
+                            )
+                        })
                     })
-                    .when(clip.track != TrackKind::Text, |el| {
-                        let (_, _, esc, _, _) = clip.evaluate_at(self.state.playhead_secs);
-                        el.child(self.inspector_slider(
-                            "Scale",
-                            format!("{}%", esc),
-                            ((esc as f32 - 10.0) / 190.0).clamp(0.0, 1.0),
-                            Theme::accent(),
-                            SliderField::Scale,
-                            cx,
-                        ))
-                    })
-                    .child({
-                        let (_, _, _, erot, _) = clip.evaluate_at(self.state.playhead_secs);
-                        self.inspector_slider(
-                            "Rotate",
-                            format!("{:.0}°", erot),
-                            (erot.rem_euclid(360.0) / 360.0).clamp(0.0, 1.0),
-                            Theme::accent(),
-                            SliderField::Rotation,
-                            cx,
-                        )
-                    })
-                    .when(clip.track.is_visual(), |el| {
+                    .when(self.ins_sections.transform && clip.track.is_visual(), |el| {
                         let (_, _, _, erot, _) = clip.evaluate_at(self.state.playhead_secs);
                         let cur_rot = erot.rem_euclid(360.0);
                         let presets: [(&str, f32, bool); 5] = [
@@ -4176,68 +6223,478 @@ impl EditorView {
                         )
                     })
                     .when(clip.track == TrackKind::Video || clip.track == TrackKind::Audio, |el| {
-                        el.child(self.inspector_slider(
-                            "Speed",
-                            format!("{:.2}x", clip.speed),
-                            ((clip.speed - 0.25) / 3.75).clamp(0.0, 1.0),
-                            Theme::accent(),
-                            SliderField::Speed,
-                            cx,
-                        ))
-                    })
-                    .when(clip.track == TrackKind::Video, |el| {
+                        let rev_tag = if clip.reversed { " • Rev" } else { "" };
                         el.child(
-                            div()
-                                .id("ins-rev-btn")
-                                .w_full()
-                                .py_1()
-                                .rounded_sm()
-                                .bg(if clip.reversed {
-                                    Theme::accent()
-                                } else {
-                                    Theme::bg_surface()
-                                })
-                                .border_1()
-                                .border_color(Theme::border())
-                                .text_xs()
-                                .text_center()
-                                .text_color(Theme::text_primary())
-                                .cursor_pointer()
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.state.toggle_reverse_selected() {
-                                        this.sync_preview_after_seek(cx);
-                                    }
-                                    cx.notify();
-                                }))
-                                .child("⟲ Reverse"),
+                            self.inspector_section_header(
+                                "sec-speed",
+                                "SPEED & REVERSE",
+                                format!("{:.2}x{}", clip.speed, rev_tag),
+                                self.ins_sections.speed,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ins_sections.speed = !this.ins_sections.speed;
+                                cx.notify();
+                            })),
                         )
+                        .when(self.ins_sections.speed, |el| {
+                            el.child(self.inspector_slider(
+                                "Speed",
+                                format!("{:.2}x", clip.speed),
+                                ((clip.speed - 0.25) / 3.75).clamp(0.0, 1.0),
+                                Theme::accent(),
+                                SliderField::Speed,
+                                cx,
+                            ))
+                            .when(clip.track == TrackKind::Video, |el| {
+                                el.child(
+                                    div()
+                                        .id("ins-rev-btn")
+                                        .w_full()
+                                        .py_1()
+                                        .rounded_sm()
+                                        .bg(if clip.reversed {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::bg_surface()
+                                        })
+                                        .border_1()
+                                        .border_color(Theme::border())
+                                        .text_xs()
+                                        .text_center()
+                                        .text_color(Theme::text_primary())
+                                        .cursor_pointer()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            if this.state.toggle_reverse_selected() {
+                                                this.sync_preview_after_seek(cx);
+                                            }
+                                            cx.notify();
+                                        }))
+                                        .child("⟲ Reverse"),
+                                )
+                            })
+                        })
+                    })
+                    .when(
+                        clip.track == TrackKind::Video
+                            || clip.track == TrackKind::Overlay
+                            || clip.track == TrackKind::Adjustment,
+                        |el| {
+                            let cur_fp = clip.filter_preset;
+                        el.child(
+                            self.inspector_section_header(
+                                "sec-color",
+                                "COLOR & FILTERS",
+                                cur_fp.label().to_string(),
+                                self.ins_sections.color,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ins_sections.color = !this.ins_sections.color;
+                                cx.notify();
+                            })),
+                        )
+                        .when(self.ins_sections.color, |el| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1p5()
+                                    .child(
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .text_color(Theme::text_muted())
+                                                    .child("Presets & Adjustments"),
+                                            )
+                                        .child(
+                                            div()
+                                                .id("ins-color-reset")
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .bg(Theme::bg_surface())
+                                                .border_1()
+                                                .border_color(Theme::border())
+                                                .text_xs()
+                                                .text_color(Theme::text_secondary())
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(Theme::bg_hover()))
+                                                .child("Reset")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.state.push_undo();
+                                                    if let Some(c) = this.state.selected_clip_mut() {
+                                                        c.filter_preset = ColorFilterPreset::None;
+                                                        c.color = opencut_core::ColorAdjustment::default();
+                                                    }
+                                                    this.sync_rotated_overlays(cx);
+                                                    if let Some((fh, rot)) = this
+                                                        .state
+                                                        .active_clips_at_playhead()
+                                                        .into_iter()
+                                                        .find(|c| c.track == TrackKind::Video)
+                                                        .map(|v| {
+                                                            (
+                                                                v.flip_h,
+                                                                v.evaluate_at(this.state.playhead_secs).3,
+                                                            )
+                                                        })
+                                                    {
+                                                        this.refresh_video_frame_transform(fh, rot, cx);
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_1()
+                                        .children(ColorFilterPreset::all().iter().copied().map(|fp| {
+                                            let active = cur_fp == fp;
+                                            div()
+                                                .id(SharedString::from(format!("ins-fp-{:?}", fp)))
+                                                .px_1p5()
+                                                .py_0p5()
+                                                .rounded_sm()
+                                                .bg(if active {
+                                                    Theme::accent()
+                                                } else {
+                                                    Theme::bg_surface()
+                                                })
+                                                .border_1()
+                                                .border_color(if active {
+                                                    Theme::accent()
+                                                } else {
+                                                    Theme::border()
+                                                })
+                                                .text_xs()
+                                                .text_color(Theme::text_primary())
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(Theme::bg_hover()))
+                                                .child(fp.label())
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.push_undo();
+                                                    if let Some(c) = this.state.selected_clip_mut() {
+                                                        c.filter_preset = fp;
+                                                    }
+                                                    this.sync_rotated_overlays(cx);
+                                                    if let Some((fh, rot)) = this
+                                                        .state
+                                                        .active_clips_at_playhead()
+                                                        .into_iter()
+                                                        .find(|c| c.track == TrackKind::Video)
+                                                        .map(|v| {
+                                                            (
+                                                                v.flip_h,
+                                                                v.evaluate_at(this.state.playhead_secs).3,
+                                                            )
+                                                        })
+                                                    {
+                                                        this.refresh_video_frame_transform(fh, rot, cx);
+                                                    }
+                                                    cx.notify();
+                                                }))
+                                        })),
+                                )
+                                .child(self.inspector_slider(
+                                    "Bright",
+                                    format!("{:+.0}%", clip.color.brightness * 100.0),
+                                    ((clip.color.brightness + 1.0) * 0.5).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::Brightness,
+                                    cx,
+                                ))
+                                .child(self.inspector_slider(
+                                    "Contrast",
+                                    format!("{:+.0}%", clip.color.contrast * 100.0),
+                                    ((clip.color.contrast + 1.0) * 0.5).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::Contrast,
+                                    cx,
+                                ))
+                                .child(self.inspector_slider(
+                                    "Saturate",
+                                    format!("{:+.0}%", clip.color.saturation * 100.0),
+                                    ((clip.color.saturation + 1.0) * 0.5).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::Saturation,
+                                    cx,
+                                ))
+                                .child(self.inspector_slider(
+                                    "Temp",
+                                    format!("{:+.0}%", clip.color.temperature * 100.0),
+                                    ((clip.color.temperature + 1.0) * 0.5).clamp(0.0, 1.0),
+                                    Theme::accent(),
+                                    SliderField::Temperature,
+                                    cx,
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            self.header_button(
+                                                "ins-lut-pick",
+                                                clip.lut_path
+                                                    .as_ref()
+                                                    .and_then(|p| p.file_name())
+                                                    .and_then(|n| n.to_str())
+                                                    .map(|n| format!("LUT: {}", n))
+                                                    .unwrap_or_else(|| "Import .cube LUT".into()),
+                                                clip.lut_path.is_some(),
+                                            )
+                                            .flex_1()
+                                            .text_center()
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.prompt_import_lut(cx);
+                                            })),
+                                        )
+                                        .when(clip.lut_path.is_some(), |el| {
+                                            el.child(
+                                                self.header_button("ins-lut-clear", "✕", false)
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.state.push_undo();
+                                                        if let Some(c) =
+                                                            this.state.selected_clip_mut()
+                                                        {
+                                                            c.lut_path = None;
+                                                        }
+                                                        this.refresh_all_visual_transforms(cx);
+                                                        cx.notify();
+                                                    })),
+                                            )
+                                        }),
+                                ),
+                            )
+                        })
+                    })
+                    .when(
+                        (clip.track == TrackKind::Video
+                            || clip.track == TrackKind::Overlay
+                            || clip.track == TrackKind::Adjustment)
+                            && clip.effect != VideoEffect::None,
+                        |el| {
+                            let cur_eff = clip.effect;
+                            let spec = cur_eff.param_spec();
+                            let (ei, esp, esz, eds, ecol) =
+                                clip.evaluate_effect_at(self.state.playhead_secs);
+                        el.child(
+                            self.inspector_section_header(
+                                "sec-effect",
+                                "EFFECT PARAMETERS",
+                                format!("{} • {:.0}%", cur_eff.label(), ei * 100.0),
+                                self.ins_sections.effect,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ins_sections.effect = !this.ins_sections.effect;
+                                cx.notify();
+                            })),
+                        )
+                        .when(self.ins_sections.effect, |el| {
+                            el.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1p5()
+                                    .when(true, |el| {
+                                        let eff_colors: [u32; 6] = [
+                                            0xfacc15, 0x38bdf8, 0xf43f5e, 0xa855f7, 0x22c55e,
+                                            0xffffff,
+                                        ];
+                                        el.child(self.inspector_slider(
+                                            "Intensity",
+                                            format!("{:.0}%", ei * 100.0),
+                                            ei.clamp(0.0, 1.0),
+                                            Theme::accent(),
+                                            SliderField::EffectIntensity,
+                                            cx,
+                                        ))
+                                        .when(spec.has_speed, |el| {
+                                            el.child(self.inspector_slider(
+                                                "Speed",
+                                                format!("{:.2}x", esp),
+                                                ((esp - 0.1) / 2.9).clamp(0.0, 1.0),
+                                                Theme::accent(),
+                                                SliderField::EffectSpeed,
+                                                cx,
+                                            ))
+                                        })
+                                        .when(spec.has_size, |el| {
+                                            el.child(self.inspector_slider(
+                                                "Size",
+                                                format!("{:.2}x", esz),
+                                                ((esz - 0.1) / 1.9).clamp(0.0, 1.0),
+                                                Theme::accent(),
+                                                SliderField::EffectSize,
+                                                cx,
+                                            ))
+                                        })
+                                        .when(spec.has_distance, |el| {
+                                            el.child(self.inspector_slider(
+                                                "Distance",
+                                                format!("{:.0}%", eds * 100.0),
+                                                eds.clamp(0.0, 1.0),
+                                                Theme::accent(),
+                                                SliderField::EffectDistance,
+                                                cx,
+                                            ))
+                                        })
+                                        .when(spec.has_color, |el| {
+                                            el.child(
+                                                div()
+                                                    .flex()
+                                                    .items_center()
+                                                    .justify_between()
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(Theme::text_secondary())
+                                                            .child("Color"),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .flex()
+                                                            .items_center()
+                                                            .gap_1()
+                                                            .children(eff_colors.into_iter().map(
+                                                                |hex| {
+                                                                    div()
+                                                                        .id(SharedString::from(
+                                                                            format!(
+                                                                                "ins-ecol-{:x}",
+                                                                                hex
+                                                                            ),
+                                                                        ))
+                                                                        .w(px(16.))
+                                                                        .h(px(16.))
+                                                                        .rounded_full()
+                                                                        .bg(rgb(hex))
+                                                                        .border_1()
+                                                                        .border_color(
+                                                                            if ecol == hex {
+                                                                                Theme::text_primary()
+                                                                            } else {
+                                                                                Theme::border()
+                                                                            },
+                                                                        )
+                                                                        .cursor_pointer()
+                                                                        .on_click(cx.listener(
+                                                                            move |this, _, _, cx| {
+                                                                                this.state.push_undo();
+                                                                                if let Some(c) = this
+                                                                                    .state
+                                                                                    .selected_clip_mut()
+                                                                                {
+                                                                                    c.effect_params
+                                                                                        .color_hex = hex;
+                                                                                }
+                                                                                this.refresh_all_visual_transforms(cx);
+                                                                                cx.notify();
+                                                                            },
+                                                                        ))
+                                                                },
+                                                            )),
+                                                    ),
+                                            )
+                                        })
+                                    }),
+                            )
+                        })
                     })
                     .when(clip.track.is_audible(), |el| {
                         let max_fade = (clip.duration_secs * 0.5).clamp(0.1, 5.0);
-                        el.child(self.inspector_slider(
-                            "Volume",
-                            format!("{}%", clip.volume),
-                            clip.volume as f32 / 100.0,
-                            Theme::accent(),
-                            SliderField::Volume,
-                            cx,
-                        ))
-                        .child(self.inspector_slider(
-                            "Fade In",
-                            format!("{:.1}s", clip.fade_in_secs),
-                            (clip.fade_in_secs / max_fade).clamp(0.0, 1.0),
-                            Theme::accent(),
-                            SliderField::FadeIn,
-                            cx,
-                        ))
-                        .child(self.inspector_slider(
-                            "Fade Out",
-                            format!("{:.1}s", clip.fade_out_secs),
-                            (clip.fade_out_secs / max_fade).clamp(0.0, 1.0),
-                            Theme::accent(),
-                            SliderField::FadeOut,
-                            cx,
-                        ))
+                        el.child(
+                            self.inspector_section_header(
+                                "sec-audio",
+                                "AUDIO",
+                                format!("{}%", clip.volume),
+                                self.ins_sections.audio,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ins_sections.audio = !this.ins_sections.audio;
+                                cx.notify();
+                            })),
+                        )
+                        .when(self.ins_sections.audio, |el| {
+                            el.child(self.inspector_slider(
+                                "Volume",
+                                format!("{}%", clip.volume),
+                                clip.volume as f32 / 100.0,
+                                Theme::accent(),
+                                SliderField::Volume,
+                                cx,
+                            ))
+                            .child(self.inspector_slider(
+                                "Fade In",
+                                format!("{:.1}s", clip.fade_in_secs),
+                                (clip.fade_in_secs / max_fade).clamp(0.0, 1.0),
+                                Theme::accent(),
+                                SliderField::FadeIn,
+                                cx,
+                            ))
+                            .child(self.inspector_slider(
+                                "Fade Out",
+                                format!("{:.1}s", clip.fade_out_secs),
+                                (clip.fade_out_secs / max_fade).clamp(0.0, 1.0),
+                                Theme::accent(),
+                                SliderField::FadeOut,
+                                cx,
+                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1p5()
+                                    .child(
+                                        self.header_button(
+                                            "ins-loudnorm-btn",
+                                            if clip.audio_normalized {
+                                                "✓ Normalize (loudnorm)"
+                                            } else {
+                                                "Normalize (loudnorm)"
+                                            },
+                                            clip.audio_normalized,
+                                        )
+                                        .flex_1()
+                                        .text_center()
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.state.push_undo();
+                                            if let Some(c) = this.state.selected_clip_mut() {
+                                                c.audio_normalized = !c.audio_normalized;
+                                                this.state.status_message = if c.audio_normalized {
+                                                    "Audio loudnorm enabled".into()
+                                                } else {
+                                                    "Audio loudnorm disabled".into()
+                                                };
+                                            }
+                                            cx.notify();
+                                        })),
+                                    )
+                                    .when(
+                                        clip.track == TrackKind::Video && !clip.audio_detached,
+                                        |el| {
+                                            el.child(
+                                                self.header_button(
+                                                    "ins-detach-audio",
+                                                    "Detach",
+                                                    false,
+                                                )
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    if this.state.detach_audio_selected() {
+                                                        this.sync_preview_after_seek(cx);
+                                                    }
+                                                    cx.notify();
+                                                })),
+                                            )
+                                        },
+                                    ),
+                            )
+                        })
                     })
                     .when(
                         clip.track == TrackKind::Video || clip.track == TrackKind::Overlay,
@@ -4246,21 +6703,25 @@ impl EditorView {
                                 || clip.crop.right > 0.001
                                 || clip.crop.top > 0.001
                                 || clip.crop.bottom > 0.001;
-                            el.child(div().h(px(1.)).w_full().bg(Theme::border()))
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                .text_color(Theme::text_secondary())
-                                                .child("CROP"),
-                                        )
-                                        .when(has_crop, |el| {
-                                            el.child(
+                            el.child(
+                                self.inspector_section_header(
+                                    "sec-crop",
+                                    "CROP",
+                                    if has_crop { "Active".into() } else { "None".into() },
+                                    self.ins_sections.crop,
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.ins_sections.crop = !this.ins_sections.crop;
+                                    cx.notify();
+                                })),
+                            )
+                            .when(self.ins_sections.crop, |el| {
+                                el.when(has_crop, |el| {
+                                    el.child(
+                                        div()
+                                            .flex()
+                                            .justify_end()
+                                            .child(
                                                 div()
                                                     .id("ins-reset-crop")
                                                     .px_1p5()
@@ -4276,10 +6737,10 @@ impl EditorView {
                                                         }
                                                         cx.notify();
                                                     }))
-                                                    .child("Reset"),
-                                            )
-                                        }),
-                                )
+                                                    .child("Reset Crop"),
+                                            ),
+                                    )
+                                })
                                 .child(self.inspector_slider(
                                     "Left",
                                     format!("{}%", (clip.crop.left * 100.0).round() as u32),
@@ -4312,6 +6773,7 @@ impl EditorView {
                                     SliderField::CropBottom,
                                     cx,
                                 ))
+                            })
                         },
                     )
                     .when(clip.track == TrackKind::Text, |el| {
@@ -4320,8 +6782,20 @@ impl EditorView {
                         let col_g = ((td.color_hex >> 8) & 0xff) as u8;
                         let col_b = (td.color_hex & 0xff) as u8;
 
-                        el.child(div().h(px(1.)).w_full().bg(Theme::border()))
-                            .child(
+                        el.child(
+                            self.inspector_section_header(
+                                "sec-text",
+                                "TEXT STYLE",
+                                format!("{} • {:.0}px", td.font_family, td.font_size),
+                                self.ins_sections.text,
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.ins_sections.text = !this.ins_sections.text;
+                                cx.notify();
+                            })),
+                        )
+                        .when(self.ins_sections.text, |el| {
+                            el.child(
                                 div()
                                     .p_2()
                                     .rounded_md()
@@ -4845,6 +7319,7 @@ impl EditorView {
                                     cx,
                                 ))
                             })
+                        })
                     })
             } else {
                 div()
@@ -5964,6 +8439,14 @@ impl Render for EditorView {
                     if matches!(
                         field,
                         SliderField::Rotation
+                            | SliderField::Brightness
+                            | SliderField::Contrast
+                            | SliderField::Saturation
+                            | SliderField::Temperature
+                            | SliderField::EffectIntensity
+                            | SliderField::EffectSpeed
+                            | SliderField::EffectSize
+                            | SliderField::EffectDistance
                             | SliderField::FontSize
                             | SliderField::FontWeight
                             | SliderField::ColorR
@@ -5973,7 +8456,18 @@ impl Render for EditorView {
                             | SliderField::ShadowOffset
                             | SliderField::BgPadding
                     ) {
-                        if field == SliderField::Rotation {
+                        if matches!(
+                            field,
+                            SliderField::Rotation
+                                | SliderField::Brightness
+                                | SliderField::Contrast
+                                | SliderField::Saturation
+                                | SliderField::Temperature
+                                | SliderField::EffectIntensity
+                                | SliderField::EffectSpeed
+                                | SliderField::EffectSize
+                                | SliderField::EffectDistance
+                        ) {
                             this.sync_rotated_texts(cx);
                             this.sync_rotated_overlays(cx);
                             if let Some((flip_h, rot)) = this
@@ -6266,8 +8760,14 @@ impl Render for EditorView {
             .when(self.export_modal_open, |el| {
                 el.child(self.render_export_modal(cx))
             })
-            .when(self.menu_open, |el| {
-                el.child(self.render_menu_dropdown(cx))
+            .when(self.project_settings_modal_open, |el| {
+                el.child(self.render_project_settings_modal(cx))
+            })
+            .when_some(self.help_modal, |el, kind| {
+                el.child(self.render_help_modal(kind, cx))
+            })
+            .when_some(self.active_top_menu, |el, kind| {
+                el.child(self.render_menu_dropdown(kind, cx))
             })
             .into_any_element()
     }
