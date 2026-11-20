@@ -25,7 +25,7 @@ use crate::media_engine::{
     apply_effect_bgra_at, bgra_bytes_to_render_image, decode_single_frame_raw, detect_gpu_encoder,
     export_freeze_frame, load_overlay_bgra, parse_cube_lut, probe_duration_secs,
     probe_media_dimensions, render_unrotated_text_bgra, reveal_in_explorer, rotate_bgra_bytes,
-    start_export_timeline,
+    rotate_bgra_bytes_fast, start_export_timeline,
 };
 use crate::theme::Theme;
 
@@ -328,7 +328,6 @@ struct InspectorSections {
     speed: bool,
     color: bool,
     effect: bool,
-    transition: bool,
     audio: bool,
     crop: bool,
     text: bool,
@@ -341,7 +340,6 @@ impl Default for InspectorSections {
             speed: false,
             color: true,
             effect: false,
-            transition: false,
             audio: false,
             crop: false,
             text: true,
@@ -748,8 +746,10 @@ impl EditorView {
             .collect();
         let any_time_anim = eff.is_time_animated()
             || adj_layers.iter().any(|(_, ae, _, _)| ae.is_time_animated());
+        let is_fast = self.preview_text_drag.is_some() || self.slider_drag.is_some();
         let norm_rot = rot.rem_euclid(360.0);
         let mut h = DefaultHasher::new();
+        is_fast.hash(&mut h);
         flip_h.hash(&mut h);
         ((norm_rot * 2.0).round() as i32).hash(&mut h);
         ((cb * 100.0).round() as i32).hash(&mut h);
@@ -794,7 +794,11 @@ impl EditorView {
         let Some((ref bytes, w, h_px)) = self.raw_video_frame else {
             return;
         };
-        let (mut out_bytes, ow, oh) = rotate_bgra_bytes(bytes, w, h_px, flip_h, norm_rot);
+        let (mut out_bytes, ow, oh) = if is_fast {
+            rotate_bgra_bytes_fast(bytes, w, h_px, flip_h, norm_rot)
+        } else {
+            rotate_bgra_bytes(bytes, w, h_px, flip_h, norm_rot)
+        };
         apply_color_bgra(&mut out_bytes, cb, cc, cs, ct);
         apply_effect_bgra_at(
             &mut out_bytes,
@@ -1022,7 +1026,9 @@ impl EditorView {
             td.shadow_color_hex.hash(&mut base_hasher);
             let base_sig = base_hasher.finish();
 
+            let is_fast = self.preview_text_drag.is_some() || self.slider_drag.is_some();
             let mut rot_hasher = DefaultHasher::new();
+            is_fast.hash(&mut rot_hasher);
             base_sig.hash(&mut rot_hasher);
             tclip.flip_h.hash(&mut rot_hasher);
             ((norm_rot * 2.0).round() as i32).hash(&mut rot_hasher);
@@ -1039,8 +1045,11 @@ impl EditorView {
             if let Some((cached_base_sig, raw_arc)) = self.raw_text_cache.get(&tclip.id) {
                 if *cached_base_sig == base_sig {
                     let (ref bytes, w, h) = **raw_arc;
-                    let (out_bytes, rw, rh) =
-                        rotate_bgra_bytes(bytes, w, h, tclip.flip_h, norm_rot);
+                    let (out_bytes, rw, rh) = if is_fast {
+                        rotate_bgra_bytes_fast(bytes, w, h, tclip.flip_h, norm_rot)
+                    } else {
+                        rotate_bgra_bytes(bytes, w, h, tclip.flip_h, norm_rot)
+                    };
                     if let Some(r_img) = bgra_bytes_to_render_image(out_bytes, rw, rh) {
                         self.rotated_text_cache.insert(tclip.id, (sig, r_img, rw, rh));
                     }
@@ -1122,7 +1131,9 @@ impl EditorView {
             }
             self.ensure_media_dims_cached(path.clone(), cx);
 
+            let is_fast = self.preview_text_drag.is_some() || self.slider_drag.is_some();
             let mut hasher = DefaultHasher::new();
+            is_fast.hash(&mut hasher);
             path.hash(&mut hasher);
             oclip.flip_h.hash(&mut hasher);
             ((norm_rot * 2.0).round() as i32).hash(&mut hasher);
@@ -1144,8 +1155,11 @@ impl EditorView {
 
             if let Some(raw_arc) = self.raw_overlay_cache.get(&path) {
                 let (ref bytes, w, h) = **raw_arc;
-                let (mut out_bytes, rw, rh) =
-                    rotate_bgra_bytes(bytes, w, h, oclip.flip_h, norm_rot);
+                let (mut out_bytes, rw, rh) = if is_fast {
+                    rotate_bgra_bytes_fast(bytes, w, h, oclip.flip_h, norm_rot)
+                } else {
+                    rotate_bgra_bytes(bytes, w, h, oclip.flip_h, norm_rot)
+                };
                 apply_color_bgra(&mut out_bytes, cb, cc, cs, ct);
                 apply_effect_bgra(&mut out_bytes, rw, rh, oclip.effect, oclip.effect_intensity);
                 if let Some(r_img) = bgra_bytes_to_render_image(out_bytes, rw, rh) {

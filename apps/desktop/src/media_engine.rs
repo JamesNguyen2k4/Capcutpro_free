@@ -239,6 +239,73 @@ pub fn rotate_bgra_bytes(
     (dst, dw as u32, dh as u32)
 }
 
+/// Fast 16.16 fixed-point nearest-neighbor rotation for smooth interactive preview dragging.
+pub fn rotate_bgra_bytes_fast(
+    src: &[u8],
+    w: u32,
+    h: u32,
+    flip_h: bool,
+    rot_deg: f32,
+) -> (Vec<u8>, u32, u32) {
+    let norm_rot = rot_deg.rem_euclid(360.0);
+    if (!flip_h && (norm_rot <= 0.5 || norm_rot >= 359.5))
+        || (norm_rot - 90.0).abs() <= 0.5
+        || (norm_rot - 180.0).abs() <= 0.5
+        || (norm_rot - 270.0).abs() <= 0.5
+        || norm_rot <= 0.5
+        || norm_rot >= 359.5
+        || w == 0
+        || h == 0
+        || src.len() < (w * h * 4) as usize
+    {
+        return rotate_bgra_bytes(src, w, h, flip_h, rot_deg);
+    }
+
+    let sw = w as usize;
+    let sh = h as usize;
+    let rad = norm_rot.to_radians();
+    let cos_a = rad.cos();
+    let sin_a = rad.sin();
+    let dw = ((w as f32 * cos_a.abs() + h as f32 * sin_a.abs()).ceil() as usize).max(2);
+    let dh = ((w as f32 * sin_a.abs() + h as f32 * cos_a.abs()).ceil() as usize).max(2);
+    let mut dst = vec![0u8; dw * dh * 4];
+
+    let scx = (sw as f32 - 1.0) * 0.5;
+    let scy = (sh as f32 - 1.0) * 0.5;
+    let dcx = (dw as f32 - 1.0) * 0.5;
+    let dcy = (dh as f32 - 1.0) * 0.5;
+
+    let dxx = if flip_h { -cos_a } else { cos_a };
+    let dxy = if flip_h { -sin_a } else { sin_a };
+    let dxx_fp = (dxx * 65536.0).round() as i32;
+    let dyx_fp = (-sin_a * 65536.0).round() as i32;
+
+    for dy in 0..dh {
+        let ry = dy as f32 - dcy;
+        let start_sx = if flip_h {
+            (sw as f32 - 1.0) - ((-dcx) * cos_a + ry * sin_a + scx)
+        } else {
+            (-dcx) * cos_a + ry * sin_a + scx
+        };
+        let start_sy = -(-dcx) * sin_a + ry * cos_a + scy;
+        let mut sx_fp = (start_sx * 65536.0 + 32768.0) as i32;
+        let mut sy_fp = (start_sy * 65536.0 + 32768.0) as i32;
+        let row = &mut dst[dy * dw * 4..(dy + 1) * dw * 4];
+        for dst_px in row.chunks_exact_mut(4) {
+            let ix = (sx_fp >> 16) as usize;
+            let iy = (sy_fp >> 16) as usize;
+            if ix < sw && iy < sh {
+                let si = (iy * sw + ix) * 4;
+                dst_px.copy_from_slice(&src[si..si + 4]);
+            }
+            sx_fp = sx_fp.wrapping_add(dxx_fp);
+            sy_fp = sy_fp.wrapping_add(dyx_fp);
+        }
+        let _ = dxy;
+    }
+    (dst, dw as u32, dh as u32)
+}
+
 pub fn apply_color_bgra(
     bytes: &mut [u8],
     brightness: f32,
