@@ -2706,3 +2706,303 @@ pub fn start_export_timeline(
 
     handle
 }
+
+pub type ReverseCacheKey = (PathBuf, u64, u64);
+
+pub fn make_reverse_cache_key(path: &Path, src_in_secs: f32, src_dur_secs: f32) -> ReverseCacheKey {
+    let in_ms = (src_in_secs.max(0.0) * 1000.0).round() as u64;
+    let dur_ms = (src_dur_secs.max(0.1) * 1000.0).round() as u64;
+    (path.to_path_buf(), in_ms, dur_ms)
+}
+
+#[derive(Clone)]
+pub struct ReverseHandle {
+    pub clip_id: usize,
+    pub cache_key: ReverseCacheKey,
+    pub output_path: PathBuf,
+    pub progress_pct: Arc<Mutex<f32>>,
+    pub status_label: Arc<Mutex<String>>,
+    pub finished: Arc<AtomicBool>,
+    pub cancelled: Arc<AtomicBool>,
+    pub error: Arc<Mutex<Option<String>>>,
+}
+
+fn run_ffmpeg_reverse_chunk(
+    source_path: &Path,
+    out_path: &Path,
+    start_secs: f32,
+    dur_secs: f32,
+    has_audio: bool,
+    progress_pct: &Arc<Mutex<f32>>,
+    base_pct: f32,
+    weight_pct: f32,
+    cancelled: &Arc<AtomicBool>,
+) -> Result<(), String> {
+    let mut cmd = Command::new("ffmpeg");
+    apply_no_window(&mut cmd);
+    cmd.args([
+        "-y",
+        "-v",
+        "error",
+        "-ss",
+        &format!("{:.3}", start_secs.max(0.0)),
+        "-t",
+        &format!("{:.3}", dur_secs.max(0.05)),
+        "-i",
+    ])
+    .arg(source_path)
+    .args([
+        "-vf",
+        "reverse",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "17",
+        "-pix_fmt",
+        "yuv420p",
+        "-g",
+        "15",
+    ]);
+
+    if has_audio {
+        cmd.args(["-af", "areverse", "-c:a", "aac", "-b:a", "192k"]);
+    } else {
+        cmd.arg("-an");
+    }
+
+    cmd.args(["-progress", "pipe:1", "-nostats"])
+        .arg(out_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut process = cmd.spawn().map_err(|e| format!("Failed to spawn ffmpeg: {e}"))?;
+    let total_us = (dur_secs.max(0.05) as f64) * 1_000_000.0;
+
+    if let Some(stdout) = process.stdout.take() {
+        let reader = BufReader::new(stdout);
+        for line in reader.lines().map_while(Result::ok) {
+            if cancelled.load(Ordering::Relaxed) {
+                let _ = process.kill();
+                let _ = process.wait();
+                let _ = std::fs::remove_file(out_path);
+                return Err("Cancelled".to_string());
+            }
+            if let Some(val) = line.strip_prefix("out_time_us=") {
+                if let Ok(us) = val.trim().parse::<f64>() {
+                    let frac = (us / total_us).clamp(0.0, 1.0) as f32;
+                    if let Ok(mut p) = progress_pct.lock() {
+                        *p = (base_pct + weight_pct * frac).clamp(0.0, 99.5);
+                    }
+                }
+            }
+        }
+    }
+
+    if cancelled.load(Ordering::Relaxed) {
+        let _ = process.kill();
+        let _ = process.wait();
+        let _ = std::fs::remove_file(out_path);
+        return Err("Cancelled".to_string());
+    }
+
+    let output = process
+        .wait_with_output()
+        .map_err(|e| format!("FFmpeg wait failed: {e}"))?;
+    if !output.status.success() {
+        let _ = std::fs::remove_file(out_path);
+        let msg = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .last()
+            .unwrap_or("FFmpeg reverse failed")
+            .to_string();
+        return Err(msg);
+    }
+    Ok(())
+}
+
+/// Pre-renders a reversed MP4 (video + audio) in a background thread with chunked progress.
+pub fn start_reverse_video(
+    clip_id: usize,
+    source_path: PathBuf,
+    src_in_secs: f32,
+    src_dur_secs: f32,
+) -> ReverseHandle {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let cache_key = make_reverse_cache_key(&source_path, src_in_secs, src_dur_secs);
+    let mut h = DefaultHasher::new();
+    cache_key.hash(&mut h);
+    let hash_id = h.finish();
+    let output_path = std::env::temp_dir().join(format!("opencut_rev_{:016x}.mp4", hash_id));
+
+    let progress_pct = Arc::new(Mutex::new(0.0_f32));
+    let status_label = Arc::new(Mutex::new("Preparing reverse...".to_string()));
+    let finished = Arc::new(AtomicBool::new(false));
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let error = Arc::new(Mutex::new(None));
+
+    let handle = ReverseHandle {
+        clip_id,
+        cache_key,
+        output_path: output_path.clone(),
+        progress_pct: progress_pct.clone(),
+        status_label: status_label.clone(),
+        finished: finished.clone(),
+        cancelled: cancelled.clone(),
+        error: error.clone(),
+    };
+
+    std::thread::spawn(move || {
+        let has_audio = has_audio_stream(&source_path);
+        let total_dur = src_dur_secs.max(0.1);
+        const CHUNK_SECS: f32 = 15.0;
+
+        if total_dur <= 18.0 {
+            if let Ok(mut lbl) = status_label.lock() {
+                *lbl = "Reversing video & audio...".to_string();
+            }
+            if let Err(err_msg) = run_ffmpeg_reverse_chunk(
+                &source_path,
+                &output_path,
+                src_in_secs,
+                total_dur,
+                has_audio,
+                &progress_pct,
+                0.0,
+                99.5,
+                &cancelled,
+            ) {
+                if !cancelled.load(Ordering::Relaxed) {
+                    if let Ok(mut e) = error.lock() {
+                        *e = Some(err_msg);
+                    }
+                }
+                finished.store(true, Ordering::Relaxed);
+                return;
+            }
+        } else {
+            let num_chunks = (total_dur / CHUNK_SECS).ceil().max(1.0) as usize;
+            let mut chunk_ranges = Vec::with_capacity(num_chunks);
+            for i in 0..num_chunks {
+                let offset = i as f32 * CHUNK_SECS;
+                let dur = (total_dur - offset).min(CHUNK_SECS);
+                if dur > 0.04 {
+                    chunk_ranges.push((src_in_secs + offset, dur));
+                }
+            }
+            // Reverse order of chunks so the output plays backwards from end to start
+            chunk_ranges.reverse();
+            let total_c = chunk_ranges.len().max(1);
+            let mut chunk_files: Vec<PathBuf> = Vec::with_capacity(total_c);
+
+            for (idx, (c_start, c_dur)) in chunk_ranges.iter().enumerate() {
+                if cancelled.load(Ordering::Relaxed) {
+                    for f in &chunk_files {
+                        let _ = std::fs::remove_file(f);
+                    }
+                    finished.store(true, Ordering::Relaxed);
+                    return;
+                }
+                if let Ok(mut lbl) = status_label.lock() {
+                    *lbl = format!("Reversing segment {}/{}...", idx + 1, total_c);
+                }
+                let chunk_path = std::env::temp_dir()
+                    .join(format!("opencut_rev_{:016x}_c{}.mp4", hash_id, idx));
+                let base_pct = (idx as f32 / total_c as f32) * 95.0;
+                let weight_pct = (1.0 / total_c as f32) * 95.0;
+
+                if let Err(err_msg) = run_ffmpeg_reverse_chunk(
+                    &source_path,
+                    &chunk_path,
+                    *c_start,
+                    *c_dur,
+                    has_audio,
+                    &progress_pct,
+                    base_pct,
+                    weight_pct,
+                    &cancelled,
+                ) {
+                    for f in &chunk_files {
+                        let _ = std::fs::remove_file(f);
+                    }
+                    if !cancelled.load(Ordering::Relaxed) {
+                        if let Ok(mut e) = error.lock() {
+                            *e = Some(err_msg);
+                        }
+                    }
+                    finished.store(true, Ordering::Relaxed);
+                    return;
+                }
+                chunk_files.push(chunk_path);
+            }
+
+            if let Ok(mut lbl) = status_label.lock() {
+                *lbl = "Finalizing reversed video...".to_string();
+            }
+            let list_path =
+                std::env::temp_dir().join(format!("opencut_rev_{:016x}_list.txt", hash_id));
+            let mut list_content = String::new();
+            for f in &chunk_files {
+                let escaped = f.to_string_lossy().replace('\\', "/").replace('\'', "'\\''");
+                list_content.push_str(&format!("file '{}'\n", escaped));
+            }
+            if let Err(e) = std::fs::write(&list_path, list_content) {
+                for f in &chunk_files {
+                    let _ = std::fs::remove_file(f);
+                }
+                if let Ok(mut err) = error.lock() {
+                    *err = Some(format!("Failed to write concat list: {e}"));
+                }
+                finished.store(true, Ordering::Relaxed);
+                return;
+            }
+
+            let mut concat_cmd = Command::new("ffmpeg");
+            apply_no_window(&mut concat_cmd);
+            concat_cmd
+                .args(["-y", "-v", "error", "-f", "concat", "-safe", "0", "-i"])
+                .arg(&list_path)
+                .args(["-c", "copy"])
+                .arg(&output_path);
+
+            let concat_res = concat_cmd.output();
+            let _ = std::fs::remove_file(&list_path);
+            for f in &chunk_files {
+                let _ = std::fs::remove_file(f);
+            }
+
+            match concat_res {
+                Ok(out) if out.status.success() => {}
+                Ok(out) => {
+                    let msg = String::from_utf8_lossy(&out.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("FFmpeg concat failed")
+                        .to_string();
+                    if let Ok(mut err) = error.lock() {
+                        *err = Some(msg);
+                    }
+                    finished.store(true, Ordering::Relaxed);
+                    return;
+                }
+                Err(e) => {
+                    if let Ok(mut err) = error.lock() {
+                        *err = Some(e.to_string());
+                    }
+                    finished.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+
+        if let Ok(mut p) = progress_pct.lock() {
+            *p = 100.0;
+        }
+        finished.store(true, Ordering::Relaxed);
+    });
+
+    handle
+}

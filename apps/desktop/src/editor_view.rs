@@ -20,12 +20,13 @@ use opencut_core::{
 };
 
 use crate::media_engine::{
-    AudioStreamPlayer, CubeLut, ExportFormat, ExportHandle, ExportOptions, VideoStreamPlayer,
-    VoiceoverRecorder, apply_color_bgra, apply_cube_lut_bgra, apply_effect_bgra,
-    apply_effect_bgra_at, bgra_bytes_to_render_image, decode_single_frame_raw, detect_gpu_encoder,
-    export_freeze_frame, load_overlay_bgra, parse_cube_lut, probe_duration_secs,
-    probe_media_dimensions, render_unrotated_text_bgra, reveal_in_explorer, rotate_bgra_bytes,
-    rotate_bgra_bytes_fast, start_export_timeline,
+    AudioStreamPlayer, CubeLut, ExportFormat, ExportHandle, ExportOptions, ReverseCacheKey,
+    ReverseHandle, VideoStreamPlayer, VoiceoverRecorder, apply_color_bgra, apply_cube_lut_bgra,
+    apply_effect_bgra, apply_effect_bgra_at, bgra_bytes_to_render_image, decode_single_frame_raw,
+    detect_gpu_encoder, export_freeze_frame, load_overlay_bgra, make_reverse_cache_key,
+    parse_cube_lut, probe_duration_secs, probe_media_dimensions, render_unrotated_text_bgra,
+    reveal_in_explorer, rotate_bgra_bytes, rotate_bgra_bytes_fast, start_export_timeline,
+    start_reverse_video,
 };
 use crate::theme::Theme;
 
@@ -66,6 +67,15 @@ enum ExportStatus {
     Exporting { handle: ExportHandle, progress: f32 },
     Done { output_path: PathBuf },
     Error { message: String },
+}
+
+enum ReverseStatus {
+    Idle,
+    Reversing {
+        handle: ReverseHandle,
+        progress: f32,
+        label: String,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -409,6 +419,8 @@ pub struct EditorView {
     export_status: ExportStatus,
     export_modal_open: bool,
     export_options: ExportOptions,
+    reverse_status: ReverseStatus,
+    reversed_cache: HashMap<ReverseCacheKey, PathBuf>,
 }
 
 impl EditorView {
@@ -475,6 +487,8 @@ impl EditorView {
             export_status: ExportStatus::Idle,
             export_modal_open: false,
             export_options: ExportOptions::default(),
+            reverse_status: ReverseStatus::Idle,
+            reversed_cache: HashMap::new(),
         };
         view.ensure_playback_loop(cx);
         view
@@ -693,6 +707,10 @@ impl EditorView {
                         changed = true;
                     }
 
+                    if view.poll_reverse_progress(cx) {
+                        changed = true;
+                    }
+
                     if changed {
                         cx.notify();
                     }
@@ -863,7 +881,7 @@ impl EditorView {
         };
 
         let (_, _, _, rot, _) = active.evaluate_at(self.state.playhead_secs);
-        let Some(path) = active.source_path else {
+        let Some((path, eff_src_in, eff_rev)) = self.resolve_effective_video_source(&active) else {
             return;
         };
 
@@ -873,11 +891,15 @@ impl EditorView {
             || self.player.active_ratio() != Some(self.state.aspect_ratio)
             || self.player.active_height() != Some(ph)
             || cur_crop != active.crop
-            || cur_rev != active.reversed
+            || cur_rev != eff_rev
         {
             let dt = (self.state.playhead_secs - active.start_secs).max(0.0);
             let spd = active.speed.clamp(0.25, 4.0);
-            let offset = active.source_in_secs + dt * spd;
+            let offset = if eff_rev {
+                eff_src_in + ((active.duration_secs - dt) * spd).max(0.0)
+            } else {
+                eff_src_in + dt * spd
+            };
             let rev_src_dur = ((active.duration_secs - dt) * spd).max(0.1);
             self.player.start(
                 active.id,
@@ -888,8 +910,8 @@ impl EditorView {
                 false,
                 0.0,
                 active.crop,
-                active.reversed,
-                active.source_in_secs,
+                eff_rev,
+                eff_src_in,
                 rev_src_dur,
             );
         }
@@ -901,14 +923,61 @@ impl EditorView {
         self.refresh_video_frame_transform(active.flip_h, rot, cx);
     }
 
+    fn resolve_effective_video_source(
+        &self,
+        clip: &opencut_core::TimelineClip,
+    ) -> Option<(PathBuf, f32, bool)> {
+        let path = clip.source_path.clone()?;
+        if !clip.reversed {
+            return Some((path, clip.source_in_secs, false));
+        }
+        let spd = clip.speed.clamp(0.25, 4.0);
+        let src_dur = (clip.duration_secs * spd).max(0.1);
+        let key = make_reverse_cache_key(&path, clip.source_in_secs, src_dur);
+        if let Some(rev_path) = self.reversed_cache.get(&key) {
+            if rev_path.exists() {
+                return Some((rev_path.clone(), 0.0, false));
+            }
+        }
+        Some((path, clip.source_in_secs, true))
+    }
+
+    fn resolve_clips_for_playback(
+        &self,
+        clips: Vec<opencut_core::TimelineClip>,
+    ) -> Vec<opencut_core::TimelineClip> {
+        clips
+            .into_iter()
+            .map(|mut c| {
+                if c.reversed {
+                    if let Some((eff_path, eff_in, eff_rev)) =
+                        self.resolve_effective_video_source(&c)
+                    {
+                        c.source_path = Some(eff_path);
+                        c.source_in_secs = eff_in;
+                        c.reversed = eff_rev;
+                    }
+                }
+                c
+            })
+            .collect()
+    }
+
     fn sync_preview_after_seek(&mut self, cx: &mut Context<Self>) {
         self.sync_rotated_texts(cx);
         self.sync_rotated_overlays(cx);
         self.audio_player.stop();
         if self.state.is_playing {
-            let audio_clips = self.state.active_audio_clips_at(self.state.playhead_secs);
+            let raw_audio: Vec<_> = self
+                .state
+                .active_audio_clips_at(self.state.playhead_secs)
+                .into_iter()
+                .cloned()
+                .collect();
+            let resolved_audio = self.resolve_clips_for_playback(raw_audio);
+            let audio_refs: Vec<_> = resolved_audio.iter().collect();
             self.audio_player
-                .sync_playing_clips(&audio_clips, self.state.playhead_secs);
+                .sync_playing_clips(&audio_refs, self.state.playhead_secs);
         }
 
         let active_video = self
@@ -926,7 +995,7 @@ impl EditorView {
         };
 
         let (_, _, _, rot, _) = active.evaluate_at(self.state.playhead_secs);
-        let Some(path) = active.source_path else {
+        let Some((path, eff_src_in, eff_rev)) = self.resolve_effective_video_source(&active) else {
             self.player.stop();
             self.raw_video_frame = None;
             self.set_current_frame(None, cx);
@@ -935,10 +1004,10 @@ impl EditorView {
 
         let dt = (self.state.playhead_secs - active.start_secs).clamp(0.0, active.duration_secs);
         let spd = active.speed.clamp(0.25, 4.0);
-        let offset = if active.reversed {
-            active.source_in_secs + ((active.duration_secs - dt) * spd).max(0.0)
+        let offset = if eff_rev {
+            eff_src_in + ((active.duration_secs - dt) * spd).max(0.0)
         } else {
-            active.source_in_secs + dt * spd
+            eff_src_in + dt * spd
         };
         let rev_src_dur = ((active.duration_secs - dt) * spd).max(0.1);
         let ph = self.preview_quality.height();
@@ -963,8 +1032,8 @@ impl EditorView {
                 false,
                 0.0,
                 active.crop,
-                active.reversed,
-                active.source_in_secs,
+                eff_rev,
+                eff_src_in,
                 rev_src_dur,
             );
         } else {
@@ -1904,6 +1973,60 @@ impl EditorView {
         updated
     }
 
+    fn poll_reverse_progress(&mut self, cx: &mut Context<Self>) -> bool {
+        let ReverseStatus::Reversing {
+            handle,
+            progress,
+            label,
+        } = &mut self.reverse_status
+        else {
+            return false;
+        };
+
+        let mut updated = false;
+        if let Ok(pct) = handle.progress_pct.lock() {
+            if (*pct - *progress).abs() >= 0.5 || *pct >= 100.0 {
+                *progress = *pct;
+                updated = true;
+            }
+        }
+        if let Ok(lbl) = handle.status_label.lock() {
+            if *lbl != *label {
+                *label = lbl.clone();
+                updated = true;
+            }
+        }
+
+        if handle.finished.load(Ordering::Relaxed) {
+            let cancelled = handle.cancelled.load(Ordering::Relaxed);
+            let err_msg = handle.error.lock().ok().and_then(|e| e.clone());
+            let clip_id = handle.clip_id;
+            let cache_key = handle.cache_key.clone();
+            let out_path = handle.output_path.clone();
+            self.reverse_status = ReverseStatus::Idle;
+
+            if cancelled {
+                self.state.status_message = "Reverse cancelled".into();
+            } else if let Some(msg) = err_msg {
+                self.state.status_message = format!("Reverse failed: {}", msg);
+            } else if out_path.exists() {
+                self.reversed_cache.insert(cache_key, out_path);
+                if let Some(clip) = self.state.clips.iter().find(|c| c.id == clip_id) {
+                    if !clip.reversed {
+                        self.state.selected_clip_id = Some(clip_id);
+                        self.state.toggle_reverse_selected();
+                    }
+                }
+                self.sync_preview_after_seek(cx);
+            } else {
+                self.state.status_message = "Reverse failed: output missing".into();
+            }
+            return true;
+        }
+
+        updated
+    }
+
     fn prompt_export_video(&mut self, cx: &mut Context<Self>) {
         if matches!(self.export_status, ExportStatus::Exporting { .. }) {
             return;
@@ -1941,7 +2064,7 @@ impl EditorView {
                 }
 
                 let _ = this.update(cx, |view, cx| {
-                    let clips = view.state.clips.clone();
+                    let clips = view.resolve_clips_for_playback(view.state.clips.clone());
                     let tracks = view.state.tracks.clone();
                     let ratio = view.state.aspect_ratio;
                     let base_height = view.state.base_height;
@@ -1964,6 +2087,109 @@ impl EditorView {
             }
         })
         .detach();
+    }
+
+    fn render_reverse_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (pct, label) = match &self.reverse_status {
+            ReverseStatus::Reversing {
+                progress, label, ..
+            } => (progress.clamp(0.0, 100.0), label.clone()),
+            ReverseStatus::Idle => (0.0, String::new()),
+        };
+
+        div()
+            .id("reverse-modal-backdrop")
+            .absolute()
+            .inset_0()
+            .bg(gpui::rgba(0x00000099))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+            .child(
+                div()
+                    .w(px(360.))
+                    .p_5()
+                    .rounded_lg()
+                    .bg(Theme::bg_panel())
+                    .border_1()
+                    .border_color(Theme::border())
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(Theme::text_primary())
+                                    .child("⟳ Reversing Video"),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(Theme::accent())
+                                    .child(format!("{:.0}%", pct)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(Theme::text_secondary())
+                            .child(label),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(8.))
+                            .rounded_full()
+                            .bg(Theme::bg_surface())
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(gpui::relative(pct / 100.0))
+                                    .bg(Theme::accent()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .pt_1()
+                            .child(
+                                div()
+                                    .id("rev-cancel-btn")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .bg(Theme::bg_surface())
+                                    .border_1()
+                                    .border_color(Theme::border())
+                                    .text_xs()
+                                    .text_color(Theme::text_primary())
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        if let ReverseStatus::Reversing { handle, .. } =
+                                            &this.reverse_status
+                                        {
+                                            handle.cancelled.store(true, Ordering::Relaxed);
+                                        }
+                                        this.reverse_status = ReverseStatus::Idle;
+                                        this.state.status_message = "Reverse cancelled".into();
+                                        cx.notify();
+                                    }))
+                                    .child("Cancel"),
+                            ),
+                    ),
+            )
     }
 
     fn render_export_modal(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6319,9 +6545,62 @@ impl EditorView {
                                         .text_color(Theme::text_primary())
                                         .cursor_pointer()
                                         .on_click(cx.listener(|this, _, _, cx| {
-                                            if this.state.toggle_reverse_selected() {
-                                                this.sync_preview_after_seek(cx);
+                                            if matches!(
+                                                this.reverse_status,
+                                                ReverseStatus::Reversing { .. }
+                                            ) {
+                                                return;
                                             }
+                                            let Some(sel_id) = this.state.selected_clip_id else {
+                                                return;
+                                            };
+                                            let Some(clip) =
+                                                this.state.clips.iter().find(|c| c.id == sel_id).cloned()
+                                            else {
+                                                return;
+                                            };
+                                            if clip.reversed {
+                                                if this.state.toggle_reverse_selected() {
+                                                    this.sync_preview_after_seek(cx);
+                                                }
+                                                cx.notify();
+                                                return;
+                                            }
+                                            let Some(src_path) = clip.source_path.clone() else {
+                                                return;
+                                            };
+                                            let spd = clip.speed.clamp(0.25, 4.0);
+                                            let src_dur = (clip.duration_secs * spd).max(0.1);
+                                            let key = make_reverse_cache_key(
+                                                &src_path,
+                                                clip.source_in_secs,
+                                                src_dur,
+                                            );
+                                            if let Some(cached) = this.reversed_cache.get(&key) {
+                                                if cached.exists() {
+                                                    if this.state.toggle_reverse_selected() {
+                                                        this.sync_preview_after_seek(cx);
+                                                    }
+                                                    cx.notify();
+                                                    return;
+                                                }
+                                            }
+                                            this.state.is_playing = false;
+                                            this.player.stop();
+                                            this.audio_player.stop();
+                                            let handle = start_reverse_video(
+                                                clip.id,
+                                                src_path,
+                                                clip.source_in_secs,
+                                                src_dur,
+                                            );
+                                            this.state.status_message =
+                                                "Reversing video...".into();
+                                            this.reverse_status = ReverseStatus::Reversing {
+                                                handle,
+                                                progress: 0.0,
+                                                label: "Preparing reverse...".into(),
+                                            };
                                             cx.notify();
                                         }))
                                         .child("⟲ Reverse"),
@@ -8815,6 +9094,10 @@ impl Render for EditorView {
             .when(self.export_modal_open, |el| {
                 el.child(self.render_export_modal(cx))
             })
+            .when(
+                matches!(self.reverse_status, ReverseStatus::Reversing { .. }),
+                |el| el.child(self.render_reverse_modal(cx)),
+            )
             .when(self.project_settings_modal_open, |el| {
                 el.child(self.render_project_settings_modal(cx))
             })
