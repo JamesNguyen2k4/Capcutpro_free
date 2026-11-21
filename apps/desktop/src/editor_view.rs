@@ -226,8 +226,27 @@ enum AnimSubTab {
     Combo,
 }
 
-const INSPECTOR_W: f32 = 280.0;
-const SLIDER_W: f32 = 136.0;
+const DEFAULT_MEDIA_POOL_W: f32 = 296.0;
+const MIN_MEDIA_POOL_W: f32 = 220.0;
+const DEFAULT_INSPECTOR_W: f32 = 304.0;
+const MIN_INSPECTOR_W: f32 = 260.0;
+const DEFAULT_TIMELINE_H: f32 = 248.0;
+const MIN_TIMELINE_H: f32 = 170.0;
+const TRACK_ROW_H: f32 = 38.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PanelResizeKind {
+    MediaPool,
+    Inspector,
+    Timeline,
+}
+
+#[derive(Clone, Copy)]
+struct PanelResizeDrag {
+    kind: PanelResizeKind,
+    start_pos: f32,
+    start_size: f32,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AppScreen {
@@ -332,27 +351,44 @@ enum HelpModalKind {
     About,
 }
 
-#[derive(Clone, Copy)]
-struct InspectorSections {
-    transform: bool,
-    speed: bool,
-    color: bool,
-    effect: bool,
-    audio: bool,
-    crop: bool,
-    text: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InspectorTab {
+    Basic,
+    Audio,
+    Speed,
+    Color,
+    Effects,
+    Crop,
+    Text,
 }
 
-impl Default for InspectorSections {
-    fn default() -> Self {
-        Self {
-            transform: true,
-            speed: false,
-            color: true,
-            effect: false,
-            audio: false,
-            crop: false,
-            text: true,
+impl InspectorTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Basic => "Basic",
+            Self::Audio => "Audio",
+            Self::Speed => "Speed",
+            Self::Color => "Color",
+            Self::Effects => "Effects",
+            Self::Crop => "Crop",
+            Self::Text => "Text",
+        }
+    }
+
+    fn tabs_for(track: TrackKind) -> &'static [Self] {
+        match track {
+            TrackKind::Video => &[
+                Self::Basic,
+                Self::Audio,
+                Self::Speed,
+                Self::Color,
+                Self::Effects,
+                Self::Crop,
+            ],
+            TrackKind::Overlay => &[Self::Basic, Self::Color, Self::Effects, Self::Crop],
+            TrackKind::Adjustment => &[Self::Color, Self::Effects, Self::Basic],
+            TrackKind::Audio => &[Self::Audio, Self::Speed],
+            TrackKind::Text => &[Self::Text, Self::Basic],
         }
     }
 }
@@ -391,9 +427,17 @@ pub struct EditorView {
     decode_in_flight: bool,
     decode_dirty: bool,
     timeline_scroll_x: f32,
+    timeline_scroll_y: f32,
     scrollbar_dragging: bool,
     scrollbar_drag_start_x: f32,
     scrollbar_drag_start_scroll: f32,
+    v_scrollbar_dragging: bool,
+    v_scrollbar_drag_start_y: f32,
+    v_scrollbar_drag_start_scroll: f32,
+    media_panel_w: f32,
+    inspector_w: f32,
+    timeline_h: f32,
+    panel_resize_drag: Option<PanelResizeDrag>,
     playhead_dragging: bool,
     clip_drag: Option<ClipDragState>,
     preview_text_drag: Option<PreviewTextDragState>,
@@ -415,12 +459,13 @@ pub struct EditorView {
     voiceover_recorder: Option<VoiceoverRecorder>,
     effect_category: Option<EffectCategory>,
     anim_tab: AnimSubTab,
-    ins_sections: InspectorSections,
+    inspector_tab: InspectorTab,
     export_status: ExportStatus,
     export_modal_open: bool,
     export_options: ExportOptions,
     reverse_status: ReverseStatus,
     reversed_cache: HashMap<ReverseCacheKey, PathBuf>,
+    timeline_transform_menu_pos: Option<(f32, f32)>,
 }
 
 impl EditorView {
@@ -459,9 +504,17 @@ impl EditorView {
             decode_in_flight: false,
             decode_dirty: false,
             timeline_scroll_x: 0.0,
+            timeline_scroll_y: 0.0,
             scrollbar_dragging: false,
             scrollbar_drag_start_x: 0.0,
             scrollbar_drag_start_scroll: 0.0,
+            v_scrollbar_dragging: false,
+            v_scrollbar_drag_start_y: 0.0,
+            v_scrollbar_drag_start_scroll: 0.0,
+            media_panel_w: DEFAULT_MEDIA_POOL_W,
+            inspector_w: DEFAULT_INSPECTOR_W,
+            timeline_h: DEFAULT_TIMELINE_H,
+            panel_resize_drag: None,
             playhead_dragging: false,
             clip_drag: None,
             preview_text_drag: None,
@@ -483,12 +536,13 @@ impl EditorView {
             voiceover_recorder: None,
             effect_category: None,
             anim_tab: AnimSubTab::In,
-            ins_sections: InspectorSections::default(),
+            inspector_tab: InspectorTab::Basic,
             export_status: ExportStatus::Idle,
             export_modal_open: false,
             export_options: ExportOptions::default(),
             reverse_status: ReverseStatus::Idle,
             reversed_cache: HashMap::new(),
+            timeline_transform_menu_pos: None,
         };
         view.ensure_playback_loop(cx);
         view
@@ -1674,11 +1728,15 @@ impl EditorView {
     fn reset_layout(&mut self) {
         self.preview_zoom = 1.0;
         self.timeline_scroll_x = 0.0;
+        self.timeline_scroll_y = 0.0;
+        self.media_panel_w = DEFAULT_MEDIA_POOL_W;
+        self.inspector_w = DEFAULT_INSPECTOR_W;
+        self.timeline_h = DEFAULT_TIMELINE_H;
         self.state.px_per_sec = 24.0;
         self.show_grid = false;
         self.show_safe_zone = false;
         self.preview_fullscreen = false;
-        self.ins_sections = InspectorSections::default();
+        self.inspector_tab = InspectorTab::Basic;
         self.state.status_message = "Layout reset".into();
     }
 
@@ -3701,7 +3759,7 @@ impl EditorView {
 
         div()
             .id("media-pool-dropzone")
-            .w(px(296.))
+            .w(px(self.media_panel_w))
             .h_full()
             .flex()
             .flex_row()
@@ -5113,8 +5171,8 @@ impl EditorView {
             ((win_w - 48.0).max(240.0), (win_h - 48.0 - 48.0).max(180.0))
         } else {
             (
-                (win_w - 272.0 - INSPECTOR_W - 64.0).max(200.0),
-                (win_h - 36.0 - 234.0 - 48.0 - 56.0).max(180.0),
+                (win_w - self.media_panel_w - self.inspector_w - 64.0).max(200.0),
+                (win_h - 36.0 - self.timeline_h - 48.0 - 56.0).max(180.0),
             )
         };
         let target_ratio = self.state.aspect_ratio.ratio_f32();
@@ -5130,12 +5188,12 @@ impl EditorView {
         let pv_center_x = if self.preview_fullscreen {
             win_w * 0.5
         } else {
-            272.0 + (win_w - 272.0 - INSPECTOR_W) * 0.5
+            self.media_panel_w + (win_w - self.media_panel_w - self.inspector_w) * 0.5
         };
         let pv_center_y = if self.preview_fullscreen {
             (win_h - 48.0) * 0.5
         } else {
-            36.0 + (win_h - 36.0 - 234.0 - 48.0) * 0.5
+            36.0 + (win_h - 36.0 - self.timeline_h - 48.0) * 0.5
         };
 
         let mut selected_handle_overlay: Option<gpui::AnyElement> = None;
@@ -6171,138 +6229,114 @@ impl EditorView {
             )
     }
 
-    fn inspector_section_header(
-        &self,
-        id: &'static str,
-        title: &'static str,
-        summary: String,
-        is_open: bool,
-    ) -> gpui::Stateful<gpui::Div> {
-        div()
-            .id(id)
-            .w_full()
-            .px_2()
-            .py_1()
-            .rounded_sm()
-            .bg(Theme::bg_surface())
-            .border_1()
-            .border_color(Theme::border())
-            .flex()
-            .items_center()
-            .justify_between()
-            .cursor_pointer()
-            .hover(|s| s.bg(Theme::bg_hover()))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(Theme::text_secondary())
-                            .child(if is_open { "▾" } else { "▸" }),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(Theme::text_primary())
-                            .child(title),
-                    ),
-            )
-            .when(!summary.is_empty(), |el| {
-                el.child(
-                    div()
-                        .text_xs()
-                        .text_color(Theme::text_muted())
-                        .child(summary),
-                )
-            })
-    }
-
     fn render_inspector(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let selected = self.state.selected_clip().cloned();
 
         div()
-            .w(px(INSPECTOR_W))
+            .w(px(self.inspector_w))
             .h_full()
             .flex()
             .flex_col()
             .bg(Theme::bg_panel())
             .border_l_1()
             .border_color(Theme::border())
-            .child(
-                div()
-                    .h(px(36.))
-                    .px_3()
-                    .flex()
-                    .items_center()
-                    .border_b_1()
-                    .border_color(Theme::border())
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(Theme::text_secondary())
-                            .child("INSPECTOR"),
-                    ),
-            )
             .child(if let Some(clip) = selected {
+                let tabs = InspectorTab::tabs_for(clip.track);
+                let active_tab = if tabs.contains(&self.inspector_tab) {
+                    self.inspector_tab
+                } else {
+                    tabs[0]
+                };
+
                 div()
-                    .id("inspector-scroll")
                     .flex_1()
-                    .overflow_y_scroll()
-                    .p_3()
+                    .min_h_0()
                     .flex()
                     .flex_col()
-                    .gap_2p5()
                     .child(
                         div()
-                            .p_2p5()
-                            .rounded_md()
-                            .bg(Theme::bg_surface())
-                            .border_1()
+                            .px_3()
+                            .pt_2()
+                            .pb_1p5()
+                            .border_b_1()
                             .border_color(Theme::border())
                             .flex()
-                            .flex_col()
-                            .gap_1()
+                            .items_center()
+                            .justify_between()
+                            .gap_2()
                             .child(
                                 div()
+                                    .flex_1()
+                                    .min_w_0()
                                     .text_xs()
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
                                     .text_color(Theme::text_primary())
+                                    .truncate()
                                     .child(clip.name.clone()),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(Theme::text_secondary())
+                                    .text_color(Theme::text_muted())
                                     .child(format!(
-                                        "Track {} • Start {:.1}s • Dur {:.1}s",
+                                        "{} • {:.1}s",
                                         clip.track.label(),
-                                        clip.start_secs,
                                         clip.duration_secs
                                     )),
                             ),
                     )
                     .child(
-                        self.inspector_section_header(
-                            "sec-transform",
-                            "TRANSFORM & ALIGN",
-                            {
-                                let (_, _, esc, erot, eop) =
-                                    clip.evaluate_at(self.state.playhead_secs);
-                                format!("{}% • {:.0}° • {}%", esc, erot, eop)
-                            },
-                            self.ins_sections.transform,
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.ins_sections.transform = !this.ins_sections.transform;
-                            cx.notify();
-                        })),
+                        div()
+                            .w_full()
+                            .px_2()
+                            .border_b_1()
+                            .border_color(Theme::border())
+                            .bg(Theme::bg_panel())
+                            .flex()
+                            .items_center()
+                            .gap_0p5()
+                            .children(tabs.iter().copied().map(|tab| {
+                                let is_active = tab == active_tab;
+                                div()
+                                    .id(SharedString::from(format!("ins-tab-{:?}", tab)))
+                                    .px_2()
+                                    .py_2()
+                                    .border_b_2()
+                                    .border_color(if is_active {
+                                        Theme::accent()
+                                    } else {
+                                        gpui::rgba(0x00000000)
+                                    })
+                                    .text_xs()
+                                    .font_weight(if is_active {
+                                        gpui::FontWeight::SEMIBOLD
+                                    } else {
+                                        gpui::FontWeight::NORMAL
+                                    })
+                                    .text_color(if is_active {
+                                        Theme::accent()
+                                    } else {
+                                        Theme::text_secondary()
+                                    })
+                                    .cursor_pointer()
+                                    .hover(|s| s.text_color(Theme::text_primary()))
+                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                        this.inspector_tab = tab;
+                                        cx.notify();
+                                    }))
+                                    .child(tab.label())
+                            })),
                     )
-                    .when(self.ins_sections.transform, |el| {
+                    .child(
+                        div()
+                            .id("inspector-scroll")
+                            .flex_1()
+                            .overflow_y_scroll()
+                            .p_3()
+                            .flex()
+                            .flex_col()
+                            .gap_2p5()
+                            .when(active_tab == InspectorTab::Basic, |el| {
                         el.child({
                             let (_, _, _, _, eop) = clip.evaluate_at(self.state.playhead_secs);
                             self.inspector_slider(
@@ -6337,7 +6371,7 @@ impl EditorView {
                             )
                         })
                     })
-                    .when(self.ins_sections.transform && clip.track.is_visual(), |el| {
+                    .when(active_tab == InspectorTab::Basic && clip.track.is_visual(), |el| {
                         let (_, _, _, erot, _) = clip.evaluate_at(self.state.playhead_secs);
                         let cur_rot = erot.rem_euclid(360.0);
                         let presets: [(&str, f32, bool); 5] = [
@@ -6503,21 +6537,10 @@ impl EditorView {
                                 ),
                         )
                     })
-                    .when(clip.track == TrackKind::Video || clip.track == TrackKind::Audio, |el| {
-                        let rev_tag = if clip.reversed { " • Rev" } else { "" };
-                        el.child(
-                            self.inspector_section_header(
-                                "sec-speed",
-                                "SPEED & REVERSE",
-                                format!("{:.2}x{}", clip.speed, rev_tag),
-                                self.ins_sections.speed,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.ins_sections.speed = !this.ins_sections.speed;
-                                cx.notify();
-                            })),
-                        )
-                        .when(self.ins_sections.speed, |el| {
+                    .when(
+                        active_tab == InspectorTab::Speed
+                            && (clip.track == TrackKind::Video || clip.track == TrackKind::Audio),
+                        |el| {
                             el.child(self.inspector_slider(
                                 "Speed",
                                 format!("{:.2}x", clip.speed),
@@ -6526,107 +6549,14 @@ impl EditorView {
                                 SliderField::Speed,
                                 cx,
                             ))
-                            .when(clip.track == TrackKind::Video, |el| {
-                                el.child(
-                                    div()
-                                        .id("ins-rev-btn")
-                                        .w_full()
-                                        .py_1()
-                                        .rounded_sm()
-                                        .bg(if clip.reversed {
-                                            Theme::accent()
-                                        } else {
-                                            Theme::bg_surface()
-                                        })
-                                        .border_1()
-                                        .border_color(Theme::border())
-                                        .text_xs()
-                                        .text_center()
-                                        .text_color(Theme::text_primary())
-                                        .cursor_pointer()
-                                        .on_click(cx.listener(|this, _, _, cx| {
-                                            if matches!(
-                                                this.reverse_status,
-                                                ReverseStatus::Reversing { .. }
-                                            ) {
-                                                return;
-                                            }
-                                            let Some(sel_id) = this.state.selected_clip_id else {
-                                                return;
-                                            };
-                                            let Some(clip) =
-                                                this.state.clips.iter().find(|c| c.id == sel_id).cloned()
-                                            else {
-                                                return;
-                                            };
-                                            if clip.reversed {
-                                                if this.state.toggle_reverse_selected() {
-                                                    this.sync_preview_after_seek(cx);
-                                                }
-                                                cx.notify();
-                                                return;
-                                            }
-                                            let Some(src_path) = clip.source_path.clone() else {
-                                                return;
-                                            };
-                                            let spd = clip.speed.clamp(0.25, 4.0);
-                                            let src_dur = (clip.duration_secs * spd).max(0.1);
-                                            let key = make_reverse_cache_key(
-                                                &src_path,
-                                                clip.source_in_secs,
-                                                src_dur,
-                                            );
-                                            if let Some(cached) = this.reversed_cache.get(&key) {
-                                                if cached.exists() {
-                                                    if this.state.toggle_reverse_selected() {
-                                                        this.sync_preview_after_seek(cx);
-                                                    }
-                                                    cx.notify();
-                                                    return;
-                                                }
-                                            }
-                                            this.state.is_playing = false;
-                                            this.player.stop();
-                                            this.audio_player.stop();
-                                            let handle = start_reverse_video(
-                                                clip.id,
-                                                src_path,
-                                                clip.source_in_secs,
-                                                src_dur,
-                                            );
-                                            this.state.status_message =
-                                                "Reversing video...".into();
-                                            this.reverse_status = ReverseStatus::Reversing {
-                                                handle,
-                                                progress: 0.0,
-                                                label: "Preparing reverse...".into(),
-                                            };
-                                            cx.notify();
-                                        }))
-                                        .child("⟲ Reverse"),
-                                )
-                            })
-                        })
                     })
                     .when(
-                        clip.track == TrackKind::Video
-                            || clip.track == TrackKind::Overlay
-                            || clip.track == TrackKind::Adjustment,
+                        active_tab == InspectorTab::Color
+                            && (clip.track == TrackKind::Video
+                                || clip.track == TrackKind::Overlay
+                                || clip.track == TrackKind::Adjustment),
                         |el| {
                             let cur_fp = clip.filter_preset;
-                        el.child(
-                            self.inspector_section_header(
-                                "sec-color",
-                                "COLOR & FILTERS",
-                                cur_fp.label().to_string(),
-                                self.ins_sections.color,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.ins_sections.color = !this.ins_sections.color;
-                                cx.notify();
-                            })),
-                        )
-                        .when(self.ins_sections.color, |el| {
                             el.child(
                                 div()
                                     .flex()
@@ -6805,31 +6735,28 @@ impl EditorView {
                                         }),
                                 ),
                             )
-                        })
                     })
                     .when(
-                        (clip.track == TrackKind::Video
-                            || clip.track == TrackKind::Overlay
-                            || clip.track == TrackKind::Adjustment)
-                            && clip.effect != VideoEffect::None,
+                        active_tab == InspectorTab::Effects
+                            && (clip.track == TrackKind::Video
+                                || clip.track == TrackKind::Overlay
+                                || clip.track == TrackKind::Adjustment),
                         |el| {
+                            if clip.effect == VideoEffect::None {
+                                return el.child(
+                                    div()
+                                        .p_2p5()
+                                        .rounded_md()
+                                        .bg(Theme::bg_surface())
+                                        .text_xs()
+                                        .text_color(Theme::text_muted())
+                                        .child("No effect applied. Select an effect from the left Effects panel."),
+                                );
+                            }
                             let cur_eff = clip.effect;
                             let spec = cur_eff.param_spec();
                             let (ei, esp, esz, eds, ecol) =
                                 clip.evaluate_effect_at(self.state.playhead_secs);
-                        el.child(
-                            self.inspector_section_header(
-                                "sec-effect",
-                                "EFFECT PARAMETERS",
-                                format!("{} • {:.0}%", cur_eff.label(), ei * 100.0),
-                                self.ins_sections.effect,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.ins_sections.effect = !this.ins_sections.effect;
-                                cx.notify();
-                            })),
-                        )
-                        .when(self.ins_sections.effect, |el| {
                             el.child(
                                 div()
                                     .flex()
@@ -6938,24 +6865,10 @@ impl EditorView {
                                         })
                                     }),
                             )
-                        })
                     })
-                    .when(clip.track.is_audible(), |el| {
+                    .when(active_tab == InspectorTab::Audio && clip.track.is_audible(), |el| {
                         let max_fade = (clip.duration_secs * 0.5).clamp(0.1, 5.0);
-                        el.child(
-                            self.inspector_section_header(
-                                "sec-audio",
-                                "AUDIO",
-                                format!("{}%", clip.volume),
-                                self.ins_sections.audio,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.ins_sections.audio = !this.ins_sections.audio;
-                                cx.notify();
-                            })),
-                        )
-                        .when(self.ins_sections.audio, |el| {
-                            el.child(self.inspector_slider(
+                        el.child(self.inspector_slider(
                                 "Volume",
                                 format!("{}%", clip.volume),
                                 clip.volume as f32 / 100.0,
@@ -7028,29 +6941,16 @@ impl EditorView {
                                         },
                                     ),
                             )
-                        })
                     })
                     .when(
-                        clip.track == TrackKind::Video || clip.track == TrackKind::Overlay,
+                        active_tab == InspectorTab::Crop
+                            && (clip.track == TrackKind::Video || clip.track == TrackKind::Overlay),
                         |el| {
                             let has_crop = clip.crop.left > 0.001
                                 || clip.crop.right > 0.001
                                 || clip.crop.top > 0.001
                                 || clip.crop.bottom > 0.001;
-                            el.child(
-                                self.inspector_section_header(
-                                    "sec-crop",
-                                    "CROP",
-                                    if has_crop { "Active".into() } else { "None".into() },
-                                    self.ins_sections.crop,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.ins_sections.crop = !this.ins_sections.crop;
-                                    cx.notify();
-                                })),
-                            )
-                            .when(self.ins_sections.crop, |el| {
-                                el.when(has_crop, |el| {
+                            el.when(has_crop, |el| {
                                     el.child(
                                         div()
                                             .flex()
@@ -7107,29 +7007,15 @@ impl EditorView {
                                     SliderField::CropBottom,
                                     cx,
                                 ))
-                            })
                         },
                     )
-                    .when(clip.track == TrackKind::Text, |el| {
+                    .when(active_tab == InspectorTab::Text && clip.track == TrackKind::Text, |el| {
                         let td = clip.text.clone().unwrap_or_default();
                         let col_r = ((td.color_hex >> 16) & 0xff) as u8;
                         let col_g = ((td.color_hex >> 8) & 0xff) as u8;
                         let col_b = (td.color_hex & 0xff) as u8;
 
                         el.child(
-                            self.inspector_section_header(
-                                "sec-text",
-                                "TEXT STYLE",
-                                format!("{} • {:.0}px", td.font_family, td.font_size),
-                                self.ins_sections.text,
-                            )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.ins_sections.text = !this.ins_sections.text;
-                                cx.notify();
-                            })),
-                        )
-                        .when(self.ins_sections.text, |el| {
-                            el.child(
                                 div()
                                     .p_2()
                                     .rounded_md()
@@ -7653,16 +7539,19 @@ impl EditorView {
                                     cx,
                                 ))
                             })
-                        })
                     })
+                    )
             } else {
                 div()
-                    .id("inspector-empty")
                     .p_4()
                     .text_xs()
                     .text_color(Theme::text_muted())
                     .child("Select a clip on the timeline to inspect, drag, or trim its edges.")
             })
+    }
+
+    fn inspector_slider_w(&self) -> f32 {
+        (self.inspector_w - 168.0).clamp(92.0, 260.0)
     }
 
     fn inspector_slider(
@@ -7674,9 +7563,10 @@ impl EditorView {
         field: SliderField,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let slider_w = self.inspector_slider_w();
         let clamped = ratio.clamp(0.0, 1.0);
-        let fill_w = SLIDER_W * clamped;
-        let thumb_x = (fill_w - 5.0).clamp(0.0, SLIDER_W - 10.0);
+        let fill_w = slider_w * clamped;
+        let thumb_x = (fill_w - 5.0).clamp(0.0, slider_w - 10.0);
 
         div()
             .flex()
@@ -7693,7 +7583,7 @@ impl EditorView {
             .child(
                 div()
                     .id(SharedString::from(format!("sld-{}", label)))
-                    .w(px(SLIDER_W))
+                    .w(px(slider_w))
                     .h(px(20.))
                     .flex()
                     .items_center()
@@ -7705,9 +7595,9 @@ impl EditorView {
                             cx.stop_propagation();
                             this.state.push_undo();
                             this.slider_drag = Some(field);
-                            let slider_left =
-                                f32::from(window.viewport_size().width) - 62.0 - SLIDER_W;
-                            let r = (f32::from(event.position.x) - slider_left) / SLIDER_W;
+                            let sw = this.inspector_slider_w();
+                            let slider_left = f32::from(window.viewport_size().width) - 62.0 - sw;
+                            let r = (f32::from(event.position.x) - slider_left) / sw;
                             this.apply_slider_ratio(field, r);
                             cx.notify();
                         }),
@@ -7747,6 +7637,202 @@ impl EditorView {
                     .text_right()
                     .text_color(Theme::text_primary())
                     .child(value),
+            )
+    }
+
+    fn trigger_reverse_selected(&mut self, cx: &mut Context<Self>) {
+        if matches!(self.reverse_status, ReverseStatus::Reversing { .. }) {
+            return;
+        }
+        let Some(sel_id) = self.state.selected_clip_id else {
+            return;
+        };
+        let Some(clip) = self
+            .state
+            .clips
+            .iter()
+            .find(|c| c.id == sel_id && c.track == TrackKind::Video)
+            .cloned()
+        else {
+            return;
+        };
+        if clip.reversed {
+            if self.state.toggle_reverse_selected() {
+                self.sync_preview_after_seek(cx);
+            }
+            cx.notify();
+            return;
+        }
+        let Some(src_path) = clip.source_path.clone() else {
+            return;
+        };
+        let spd = clip.speed.clamp(0.25, 4.0);
+        let src_dur = (clip.duration_secs * spd).max(0.1);
+        let key = make_reverse_cache_key(&src_path, clip.source_in_secs, src_dur);
+        if let Some(cached) = self.reversed_cache.get(&key) {
+            if cached.exists() {
+                if self.state.toggle_reverse_selected() {
+                    self.sync_preview_after_seek(cx);
+                }
+                cx.notify();
+                return;
+            }
+        }
+        self.state.is_playing = false;
+        self.player.stop();
+        self.audio_player.stop();
+        let handle = start_reverse_video(clip.id, src_path, clip.source_in_secs, src_dur);
+        self.state.status_message = "Reversing video...".into();
+        self.reverse_status = ReverseStatus::Reversing {
+            handle,
+            progress: 0.0,
+            label: "Preparing reverse...".into(),
+        };
+        cx.notify();
+    }
+
+    fn trigger_freeze_at_playhead(&mut self, cx: &mut Context<Self>) {
+        let Some(vclip) = self
+            .state
+            .active_clips_at_playhead()
+            .into_iter()
+            .find(|c| c.track == TrackKind::Video)
+            .cloned()
+        else {
+            self.state.status_message = "Place playhead over a video clip to freeze".into();
+            cx.notify();
+            return;
+        };
+        let Some(path) = vclip.source_path else {
+            return;
+        };
+        let offset = vclip.source_in_secs + (self.state.playhead_secs - vclip.start_secs).max(0.0);
+        if let Some(img_path) = export_freeze_frame(&path, offset) {
+            self.state.insert_freeze_frame_at_playhead(img_path, 3.0);
+            self.sync_preview_after_seek(cx);
+        } else {
+            self.state.status_message = "Failed to capture freeze frame".into();
+        }
+        cx.notify();
+    }
+
+    fn render_timeline_transform_menu(
+        &self,
+        pos: (f32, f32),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let sel = self.state.selected_clip();
+        let has_sel = sel.is_some();
+        let is_video = sel.is_some_and(|c| c.track == TrackKind::Video);
+        let is_rev = sel.is_some_and(|c| c.track == TrackKind::Video && c.reversed);
+        let is_mirror = sel.is_some_and(|c| c.flip_h);
+
+        let menu_item = |id: &'static str,
+                         icon: &'static str,
+                         label: &'static str,
+                         active: bool,
+                         enabled: bool| {
+            div()
+                .id(id)
+                .w_full()
+                .px_2p5()
+                .py_1p5()
+                .rounded_sm()
+                .flex()
+                .items_center()
+                .justify_between()
+                .text_xs()
+                .text_color(if !enabled {
+                    Theme::text_muted()
+                } else if active {
+                    Theme::accent()
+                } else {
+                    Theme::text_primary()
+                })
+                .when(enabled, |el| {
+                    el.cursor_pointer().hover(|s| s.bg(Theme::bg_hover()))
+                })
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(div().w(px(16.)).text_center().child(icon))
+                        .child(label),
+                )
+                .when(active, |el| {
+                    el.child(div().text_xs().text_color(Theme::accent()).child("✓"))
+                })
+        };
+
+        div()
+            .id("tl-transform-backdrop")
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.timeline_transform_menu_pos = None;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .id("tl-transform-dropdown")
+                    .absolute()
+                    .left(px((pos.0 - 30.0).max(8.0)))
+                    .top(px(pos.1 + 16.0))
+                    .w(px(164.))
+                    .p_1p5()
+                    .rounded_md()
+                    .bg(Theme::bg_panel())
+                    .border_1()
+                    .border_color(Theme::border())
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .on_mouse_down(MouseButton::Left, cx.listener(|_, _, _, _| {}))
+                    .child(menu_item("tlm-freeze", "❄", "Freeze", false, true).on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.timeline_transform_menu_pos = None;
+                            this.trigger_freeze_at_playhead(cx);
+                        }),
+                    ))
+                    .child(
+                        menu_item("tlm-reverse", "⟲", "Reverse", is_rev, is_video).on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.timeline_transform_menu_pos = None;
+                                if is_video {
+                                    this.trigger_reverse_selected(cx);
+                                } else {
+                                    cx.notify();
+                                }
+                            }),
+                        ),
+                    )
+                    .child(
+                        menu_item("tlm-mirror", "⇄", "Mirror", is_mirror, has_sel).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.timeline_transform_menu_pos = None;
+                                if this.state.toggle_mirror_selected() {
+                                    this.sync_preview_after_seek(cx);
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        menu_item("tlm-rotate", "↻", "Rotate", false, has_sel).on_click(
+                            cx.listener(|this, _, _, cx| {
+                                this.timeline_transform_menu_pos = None;
+                                if this.state.rotate_selected_90() {
+                                    this.sync_preview_after_seek(cx);
+                                }
+                                cx.notify();
+                            }),
+                        ),
+                    ),
             )
     }
 
@@ -7820,10 +7906,25 @@ impl EditorView {
         let ruler_marks: Vec<u32> = (0..=(total_secs as u32)).step_by(ruler_step).collect();
         let tracks = self.state.tracks.clone();
         let markers = self.state.markers.clone();
+        let tracks_vp_h = (self.timeline_h - 34.0 - 26.0 - 16.0).max(40.0);
+        let tracks_total_h = tracks.len() as f32 * TRACK_ROW_H;
+        let max_scroll_y = (tracks_total_h - tracks_vp_h).max(0.0);
+        let scroll_y = self.timeline_scroll_y.clamp(0.0, max_scroll_y);
+        let v_thumb_h = if tracks_total_h > 0.0 {
+            ((tracks_vp_h / tracks_total_h) * tracks_vp_h).clamp(24.0, tracks_vp_h)
+        } else {
+            tracks_vp_h
+        };
+        let v_thumb_space = (tracks_vp_h - v_thumb_h).max(0.0);
+        let v_thumb_top = if max_scroll_y > 0.0 {
+            (scroll_y / max_scroll_y) * v_thumb_space
+        } else {
+            0.0
+        };
 
         div()
             .id("timeline-root")
-            .h(px(234.))
+            .h(px(self.timeline_h))
             .w_full()
             .flex()
             .flex_col()
@@ -7837,6 +7938,8 @@ impl EditorView {
                 };
 
                 let vp_w = (f32::from(window.viewport_size().width) - TRACK_HEADER_W).max(200.0);
+                let vp_h = (this.timeline_h - 34.0 - 26.0 - 16.0).max(40.0);
+                let cur_max_y = (this.state.tracks.len() as f32 * TRACK_ROW_H - vp_h).max(0.0);
 
                 if event.modifiers.control {
                     let old_pps = this.state.px_per_sec;
@@ -7850,12 +7953,20 @@ impl EditorView {
                     let new_scroll = time_at_cursor * new_pps - cursor_in_tracks;
                     let new_max = (this.state.total_duration_secs * new_pps - vp_w).max(0.0);
                     this.timeline_scroll_x = new_scroll.clamp(0.0, new_max);
-                } else {
+                } else if event.modifiers.shift || (dx.abs() > dy.abs() && dx.abs() > 0.1) {
                     let delta = if dx.abs() > dy.abs() { dx } else { dy };
                     let new_max =
                         (this.state.total_duration_secs * this.state.px_per_sec - vp_w).max(0.0);
                     this.timeline_scroll_x =
                         (this.timeline_scroll_x - delta * 2.0).clamp(0.0, new_max);
+                } else if cur_max_y > 0.0 {
+                    this.timeline_scroll_y =
+                        (this.timeline_scroll_y - dy * 1.5).clamp(0.0, cur_max_y);
+                } else {
+                    let new_max =
+                        (this.state.total_duration_secs * this.state.px_per_sec - vp_w).max(0.0);
+                    this.timeline_scroll_x =
+                        (this.timeline_scroll_x - dy * 2.0).clamp(0.0, new_max);
                 }
                 cx.notify();
             }))
@@ -8065,72 +8176,67 @@ impl EditorView {
                                 })),
                             )
                             .child(div().w(px(1.)).h(px(16.)).mx_1().bg(Theme::border()))
-                            .child(
-                                self.icon_button(
-                                    "tl-mirror",
-                                    "⇄",
-                                    "Mirror Horizontally",
-                                    self.state.selected_clip().map(|c| c.flip_h).unwrap_or(false),
-                                    selected_clip_id.is_some(),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.state.toggle_mirror_selected() {
-                                        this.sync_preview_after_seek(cx);
-                                    }
-                                    cx.notify();
-                                })),
-                            )
-                            .child(
-                                self.icon_button(
-                                    "tl-rot90",
-                                    "↻",
-                                    "Rotate (0° / 90° / 180° / 270°)",
-                                    false,
-                                    selected_clip_id.is_some(),
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if this.state.rotate_selected_90() {
-                                        this.sync_preview_after_seek(cx);
-                                    }
-                                    cx.notify();
-                                })),
-                            )
-                            .child(
-                                self.icon_button(
-                                    "tl-freeze",
-                                    "❄",
-                                    "Freeze Frame at Playhead",
-                                    false,
-                                    true,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    let Some(vclip) = this
-                                        .state
-                                        .active_clips_at_playhead()
-                                        .into_iter()
-                                        .find(|c| c.track == TrackKind::Video)
-                                        .cloned()
-                                    else {
-                                        this.state.status_message =
-                                            "Place playhead over a video clip to freeze".into();
-                                        cx.notify();
-                                        return;
-                                    };
-                                    let Some(path) = vclip.source_path else {
-                                        return;
-                                    };
-                                    let offset = vclip.source_in_secs
-                                        + (this.state.playhead_secs - vclip.start_secs).max(0.0);
-                                    if let Some(img_path) = export_freeze_frame(&path, offset) {
-                                        this.state.insert_freeze_frame_at_playhead(img_path, 3.0);
-                                        this.sync_preview_after_seek(cx);
+                            .child({
+                                let menu_open = self.timeline_transform_menu_pos.is_some();
+                                let any_active = menu_open
+                                    || self.state.selected_clip().is_some_and(|c| {
+                                        c.flip_h || (c.track == TrackKind::Video && c.reversed)
+                                    });
+                                div()
+                                    .id("tl-transform-group")
+                                    .relative()
+                                    .w(px(30.))
+                                    .h(px(24.))
+                                    .rounded_sm()
+                                    .bg(if any_active {
+                                        Theme::bg_hover()
                                     } else {
-                                        this.state.status_message =
-                                            "Failed to capture freeze frame".into();
-                                    }
-                                    cx.notify();
-                                })),
-                            )
+                                        Theme::bg_surface()
+                                    })
+                                    .border_1()
+                                    .border_color(if any_active {
+                                        Theme::accent()
+                                    } else {
+                                        Theme::border()
+                                    })
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .gap_0p5()
+                                    .text_xs()
+                                    .text_color(if any_active {
+                                        Theme::accent()
+                                    } else {
+                                        Theme::text_primary()
+                                    })
+                                    .cursor_pointer()
+                                    .hover(|s| s.bg(Theme::bg_hover()))
+                                    .tooltip(build_tooltip(
+                                        "Transform & Time (Freeze, Reverse, Mirror, Rotate)",
+                                    ))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            if this.timeline_transform_menu_pos.is_some() {
+                                                this.timeline_transform_menu_pos = None;
+                                            } else {
+                                                this.timeline_transform_menu_pos = Some((
+                                                    f32::from(event.position.x),
+                                                    f32::from(event.position.y),
+                                                ));
+                                            }
+                                            cx.notify();
+                                        }),
+                                    )
+                                    .child("⇄")
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(Theme::text_muted())
+                                            .child("▾"),
+                                    )
+                            })
                             .child(
                                 self.icon_button(
                                     "tl-kf",
@@ -8161,81 +8267,190 @@ impl EditorView {
                     ),
             )
             .child(
+                // Sticky Tracks Header + Time Ruler row
                 div()
-                    .flex_1()
+                    .h(px(26.))
+                    .w_full()
                     .flex()
-                    .overflow_hidden()
-                    // Track headers column with Mute / Hide / Lock
+                    .bg(Theme::bg_panel())
+                    .border_b_1()
+                    .border_color(Theme::border())
                     .child(
                         div()
                             .w(px(TRACK_HEADER_W))
                             .h_full()
+                            .px_2()
                             .flex()
-                            .flex_col()
+                            .items_center()
+                            .justify_between()
+                            .text_xs()
+                            .text_color(Theme::text_muted())
+                            .border_r_1()
+                            .border_color(Theme::border())
+                            .child("Tracks")
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .children(
+                                        [
+                                            (TrackKind::Video, "🎬", "Add Video Track"),
+                                            (
+                                                TrackKind::Overlay,
+                                                "🖼",
+                                                "Add Overlay/Image Track",
+                                            ),
+                                            (TrackKind::Audio, "🎵", "Add Audio Track"),
+                                        ]
+                                        .into_iter()
+                                        .map(|(kind, icon, tip)| {
+                                            div()
+                                                .id(SharedString::from(format!(
+                                                    "add-tr-{}",
+                                                    kind.label()
+                                                )))
+                                                .w(px(20.))
+                                                .h(px(20.))
+                                                .rounded_sm()
+                                                .bg(Theme::bg_surface())
+                                                .border_1()
+                                                .border_color(Theme::border())
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .text_xs()
+                                                .text_color(Theme::text_secondary())
+                                                .cursor_pointer()
+                                                .hover(|s| {
+                                                    s.bg(Theme::bg_hover())
+                                                        .text_color(Theme::text_primary())
+                                                })
+                                                .tooltip(build_tooltip(tip))
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.state.add_track(kind);
+                                                    cx.notify();
+                                                }))
+                                                .child(icon)
+                                        }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("timeline-ruler-viewport")
+                            .flex_1()
+                            .h_full()
+                            .overflow_hidden()
+                            .bg(Theme::bg_surface())
+                            .cursor_pointer()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                                    this.playhead_dragging = true;
+                                    this.seek_from_window_x(
+                                        f32::from(event.position.x),
+                                        window,
+                                        cx,
+                                    );
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(timeline_width))
+                                    .h_full()
+                                    .relative()
+                                    .left(px(-scroll_x))
+                                    .children(ruler_marks.into_iter().map(|sec| {
+                                        let left = sec as f32 * px_per_sec;
+                                        div()
+                                            .id(SharedString::from(format!("ruler-{}", sec)))
+                                            .absolute()
+                                            .left(px(left))
+                                            .top_0()
+                                            .h_full()
+                                            .px_1()
+                                            .border_l_1()
+                                            .border_color(Theme::border())
+                                            .flex()
+                                            .items_center()
+                                            .text_xs()
+                                            .text_color(Theme::text_muted())
+                                            .child(format!("{}s", sec))
+                                    }))
+                                    .children(markers.into_iter().map(|m| {
+                                        let m_id = m.id;
+                                        let m_time = m.time_secs;
+                                        let left = m_time * px_per_sec;
+                                        div()
+                                            .id(SharedString::from(format!("marker-{}", m_id)))
+                                            .absolute()
+                                            .left(px(left - 6.0))
+                                            .top(px(2.))
+                                            .px_1()
+                                            .rounded_sm()
+                                            .bg(rgb(m.color_hex))
+                                            .text_xs()
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(Theme::bg_app())
+                                            .cursor_pointer()
+                                            .tooltip(build_tooltip(
+                                                "Click: Jump to Marker • Shift+Click: Remove",
+                                            ))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(
+                                                    move |this,
+                                                          event: &MouseDownEvent,
+                                                          _,
+                                                          cx| {
+                                                        cx.stop_propagation();
+                                                        if event.modifiers.shift {
+                                                            this.state.remove_marker(m_id);
+                                                        } else {
+                                                            this.state.seek_to(m_time);
+                                                            this.sync_preview_after_seek(cx);
+                                                        }
+                                                        cx.notify();
+                                                    },
+                                                ),
+                                            )
+                                            .child("⚑")
+                                    }))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .left(px(playhead_px))
+                                            .top_0()
+                                            .w(px(2.))
+                                            .h_full()
+                                            .bg(rgb(Theme::PLAYHEAD)),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .overflow_hidden()
+                    // Scrollable track headers column
+                    .child(
+                        div()
+                            .w(px(TRACK_HEADER_W))
+                            .h_full()
+                            .overflow_hidden()
                             .bg(Theme::bg_panel())
                             .border_r_1()
                             .border_color(Theme::border())
                             .child(
                                 div()
-                                    .h(px(26.))
-                                    .px_2()
+                                    .w_full()
+                                    .relative()
+                                    .top(px(-scroll_y))
                                     .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .text_xs()
-                                    .text_color(Theme::text_muted())
-                                    .border_b_1()
-                                    .border_color(Theme::border())
-                                    .child("Tracks")
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .gap_1()
-                                            .children(
-                                                [
-                                                    (TrackKind::Video, "🎬", "Add Video Track"),
-                                                    (
-                                                        TrackKind::Overlay,
-                                                        "🖼",
-                                                        "Add Overlay/Image Track",
-                                                    ),
-                                                    (TrackKind::Audio, "🎵", "Add Audio Track"),
-                                                ]
-                                                .into_iter()
-                                                .map(|(kind, icon, tip)| {
-                                                    div()
-                                                        .id(SharedString::from(format!(
-                                                            "add-tr-{}",
-                                                            kind.label()
-                                                        )))
-                                                        .w(px(20.))
-                                                        .h(px(20.))
-                                                        .rounded_sm()
-                                                        .bg(Theme::bg_surface())
-                                                        .border_1()
-                                                        .border_color(Theme::border())
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .text_xs()
-                                                        .text_color(Theme::text_secondary())
-                                                        .cursor_pointer()
-                                                        .hover(|s| {
-                                                            s.bg(Theme::bg_hover())
-                                                                .text_color(Theme::text_primary())
-                                                        })
-                                                        .tooltip(build_tooltip(tip))
-                                                        .on_click(cx.listener(move |this, _, _, cx| {
-                                                            this.state.add_track(kind);
-                                                            cx.notify();
-                                                        }))
-                                                        .child(icon)
-                                                }),
-                                            ),
-                                    ),
-                            )
-                            .children(tracks.iter().map(|track| {
+                                    .flex_col()
+                                    .children(tracks.iter().map(|track| {
                                 let track_id = track.id;
                                 let t = track.kind;
                                 let flags = track.flags;
@@ -8243,7 +8458,7 @@ impl EditorView {
                                 let is_main = track.is_main;
 
                                 div()
-                                    .h(px(48.))
+                                    .h(px(TRACK_ROW_H))
                                     .px_2()
                                     .flex()
                                     .items_center()
@@ -8358,8 +8573,9 @@ impl EditorView {
                                             }),
                                     )
                             })),
+                            ),
                     )
-                    // Tracks & Ruler canvas
+                    // Tracks canvas (horizontally & vertically scrolled)
                     .child(
                         div()
                             .id("timeline-tracks-canvas")
@@ -8383,80 +8599,12 @@ impl EditorView {
                             .child(
                                 div()
                                     .w(px(timeline_width))
-                                    .h_full()
+                                    .h(px(tracks_total_h.max(tracks_vp_h)))
                                     .flex()
                                     .flex_col()
                                     .relative()
                                     .left(px(-scroll_x))
-                                    // Time ruler
-                                    .child(
-                                        div()
-                                            .h(px(26.))
-                                            .w_full()
-                                            .relative()
-                                            .bg(Theme::bg_surface())
-                                            .border_b_1()
-                                            .border_color(Theme::border())
-                                            .children(ruler_marks.into_iter().map(|sec| {
-                                                let left = sec as f32 * px_per_sec;
-                                                div()
-                                                    .id(SharedString::from(format!("ruler-{}", sec)))
-                                                    .absolute()
-                                                    .left(px(left))
-                                                    .top_0()
-                                                    .h_full()
-                                                    .px_1()
-                                                    .border_l_1()
-                                                    .border_color(Theme::border())
-                                                    .flex()
-                                                    .items_center()
-                                                    .text_xs()
-                                                    .text_color(Theme::text_muted())
-                                                    .child(format!("{}s", sec))
-                                            }))
-                                            .children(markers.into_iter().map(|m| {
-                                                let m_id = m.id;
-                                                let m_time = m.time_secs;
-                                                let left = m_time * px_per_sec;
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "marker-{}",
-                                                        m_id
-                                                    )))
-                                                    .absolute()
-                                                    .left(px(left - 6.0))
-                                                    .top(px(2.))
-                                                    .px_1()
-                                                    .rounded_sm()
-                                                    .bg(rgb(m.color_hex))
-                                                    .text_xs()
-                                                    .font_weight(gpui::FontWeight::BOLD)
-                                                    .text_color(Theme::bg_app())
-                                                    .cursor_pointer()
-                                                    .tooltip(build_tooltip(
-                                                        "Click: Jump to Marker • Shift+Click: Remove",
-                                                    ))
-                                                    .on_mouse_down(
-                                                        MouseButton::Left,
-                                                        cx.listener(
-                                                            move |this,
-                                                                  event: &MouseDownEvent,
-                                                                  _,
-                                                                  cx| {
-                                                                cx.stop_propagation();
-                                                                if event.modifiers.shift {
-                                                                    this.state.remove_marker(m_id);
-                                                                } else {
-                                                                    this.state.seek_to(m_time);
-                                                                    this.sync_preview_after_seek(cx);
-                                                                }
-                                                                cx.notify();
-                                                            },
-                                                        ),
-                                                    )
-                                                    .child("⚑")
-                                            })),
-                                    )
+                                    .top(px(-scroll_y))
                                     // Track lanes
                                     .children(tracks.iter().map(|track| {
                                         let track_id = track.id;
@@ -8473,7 +8621,7 @@ impl EditorView {
                                             .collect();
 
                                         div()
-                                            .h(px(48.))
+                                            .h(px(TRACK_ROW_H))
                                             .w_full()
                                             .relative()
                                             .border_b_1()
@@ -8494,9 +8642,9 @@ impl EditorView {
                                                     )))
                                                     .absolute()
                                                     .left(px(left))
-                                                    .top(px(6.))
+                                                    .top(px(5.))
                                                     .w(px(width))
-                                                    .h(px(36.))
+                                                    .h(px(28.))
                                                     .rounded_md()
                                                     .bg(rgb(clip.track.color_hex()))
                                                     .border_2()
@@ -8671,7 +8819,72 @@ impl EditorView {
                                             .bg(rgb(Theme::PLAYHEAD)),
                                     ),
                             ),
-                    ),
+                    )
+                    .when(max_scroll_y > 0.0, |el| {
+                        el.child(
+                            div()
+                                .id("timeline-v-scrollbar-track")
+                                .w(px(8.))
+                                .h_full()
+                                .relative()
+                                .bg(Theme::bg_panel())
+                                .border_l_1()
+                                .border_color(Theme::border())
+                                .cursor_pointer()
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(move |this, event: &MouseDownEvent, window, cx| {
+                                        if max_scroll_y <= 0.0 || v_thumb_space <= 0.0 {
+                                            return;
+                                        }
+                                        let win_h = f32::from(window.viewport_size().height);
+                                        let tracks_top = win_h - this.timeline_h + 34.0 + 26.0;
+                                        let click_y =
+                                            (f32::from(event.position.y) - tracks_top).max(0.0);
+                                        let target_top = (click_y - v_thumb_h * 0.5)
+                                            .clamp(0.0, v_thumb_space);
+                                        this.timeline_scroll_y =
+                                            (target_top / v_thumb_space) * max_scroll_y;
+                                        this.v_scrollbar_dragging = true;
+                                        this.v_scrollbar_drag_start_y =
+                                            f32::from(event.position.y);
+                                        this.v_scrollbar_drag_start_scroll =
+                                            this.timeline_scroll_y;
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .id("timeline-v-scrollbar-thumb")
+                                        .absolute()
+                                        .left(px(1.))
+                                        .top(px(v_thumb_top))
+                                        .w(px(6.))
+                                        .h(px(v_thumb_h))
+                                        .rounded_full()
+                                        .bg(if self.v_scrollbar_dragging {
+                                            Theme::accent()
+                                        } else {
+                                            Theme::text_muted()
+                                        })
+                                        .hover(|s| s.bg(Theme::accent()))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(
+                                                |this, event: &MouseDownEvent, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.v_scrollbar_dragging = true;
+                                                    this.v_scrollbar_drag_start_y =
+                                                        f32::from(event.position.y);
+                                                    this.v_scrollbar_drag_start_scroll =
+                                                        this.timeline_scroll_y;
+                                                    cx.notify();
+                                                },
+                                            ),
+                                        ),
+                                ),
+                        )
+                    }),
             )
             // Bottom Horizontal Scrollbar
             .child(
@@ -8766,9 +8979,38 @@ impl Render for EditorView {
                 this.handle_key_down(event, cx);
             }))
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
+                if let Some(pdrag) = this.panel_resize_drag {
+                    let win_w = f32::from(window.viewport_size().width);
+                    let win_h = f32::from(window.viewport_size().height);
+                    let mx = f32::from(event.position.x);
+                    let my = f32::from(event.position.y);
+                    match pdrag.kind {
+                        PanelResizeKind::MediaPool => {
+                            let max_w = (win_w - this.inspector_w - 320.0)
+                                .clamp(MIN_MEDIA_POOL_W, 460.0);
+                            this.media_panel_w = (pdrag.start_size + (mx - pdrag.start_pos))
+                                .clamp(MIN_MEDIA_POOL_W, max_w);
+                        }
+                        PanelResizeKind::Inspector => {
+                            let max_w = (win_w - this.media_panel_w - 320.0)
+                                .clamp(MIN_INSPECTOR_W, 480.0);
+                            this.inspector_w = (pdrag.start_size - (mx - pdrag.start_pos))
+                                .clamp(MIN_INSPECTOR_W, max_w);
+                        }
+                        PanelResizeKind::Timeline => {
+                            let max_h = (win_h - 36.0 - 220.0).clamp(MIN_TIMELINE_H, 480.0);
+                            this.timeline_h = (pdrag.start_size - (my - pdrag.start_pos))
+                                .clamp(MIN_TIMELINE_H, max_h);
+                        }
+                    }
+                    cx.notify();
+                    return;
+                }
+
                 if let Some(field) = this.slider_drag {
-                    let slider_left = f32::from(window.viewport_size().width) - 62.0 - SLIDER_W;
-                    let r = (f32::from(event.position.x) - slider_left) / SLIDER_W;
+                    let sw = this.inspector_slider_w();
+                    let slider_left = f32::from(window.viewport_size().width) - 62.0 - sw;
+                    let r = (f32::from(event.position.x) - slider_left) / sw;
                     this.apply_slider_ratio(field, r);
                     if matches!(
                         field,
@@ -9000,6 +9242,23 @@ impl Render for EditorView {
                     this.seek_from_window_x(f32::from(event.position.x), window, cx);
                     return;
                 }
+                if this.v_scrollbar_dragging {
+                    let vp_h = (this.timeline_h - 34.0 - 26.0 - 16.0).max(40.0);
+                    let total_h = this.state.tracks.len() as f32 * TRACK_ROW_H;
+                    let max_scroll_y = (total_h - vp_h).max(0.0);
+                    let v_thumb_h = if total_h > 0.0 {
+                        ((vp_h / total_h) * vp_h).clamp(24.0, vp_h)
+                    } else {
+                        vp_h
+                    };
+                    let v_space = (vp_h - v_thumb_h).max(1.0);
+                    let dy = f32::from(event.position.y) - this.v_scrollbar_drag_start_y;
+                    let delta = (dy / v_space) * max_scroll_y;
+                    this.timeline_scroll_y =
+                        (this.v_scrollbar_drag_start_scroll + delta).clamp(0.0, max_scroll_y);
+                    cx.notify();
+                    return;
+                }
                 if !this.scrollbar_dragging {
                     return;
                 }
@@ -9064,6 +9323,14 @@ impl Render for EditorView {
                         this.scrollbar_dragging = false;
                         changed = true;
                     }
+                    if this.v_scrollbar_dragging {
+                        this.v_scrollbar_dragging = false;
+                        changed = true;
+                    }
+                    if this.panel_resize_drag.is_some() {
+                        this.panel_resize_drag = None;
+                        changed = true;
+                    }
                     if this.playhead_dragging {
                         this.playhead_dragging = false;
                         changed = true;
@@ -9083,8 +9350,89 @@ impl Render for EditorView {
                             .flex()
                             .overflow_hidden()
                             .child(self.render_media_pool(cx))
+                            .child(
+                                div()
+                                    .id("split-media-preview")
+                                    .w(px(4.))
+                                    .h_full()
+                                    .bg(if self.panel_resize_drag.is_some_and(|d| {
+                                        d.kind == PanelResizeKind::MediaPool
+                                    }) {
+                                        Theme::accent()
+                                    } else {
+                                        gpui::rgba(0x00000000)
+                                    })
+                                    .cursor_ew_resize()
+                                    .hover(|s| s.bg(Theme::accent()))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.panel_resize_drag = Some(PanelResizeDrag {
+                                                kind: PanelResizeKind::MediaPool,
+                                                start_pos: f32::from(event.position.x),
+                                                start_size: this.media_panel_w,
+                                            });
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
                             .child(self.render_preview_panel(window, cx))
+                            .child(
+                                div()
+                                    .id("split-preview-inspector")
+                                    .w(px(4.))
+                                    .h_full()
+                                    .bg(if self.panel_resize_drag.is_some_and(|d| {
+                                        d.kind == PanelResizeKind::Inspector
+                                    }) {
+                                        Theme::accent()
+                                    } else {
+                                        gpui::rgba(0x00000000)
+                                    })
+                                    .cursor_ew_resize()
+                                    .hover(|s| s.bg(Theme::accent()))
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                            cx.stop_propagation();
+                                            this.panel_resize_drag = Some(PanelResizeDrag {
+                                                kind: PanelResizeKind::Inspector,
+                                                start_pos: f32::from(event.position.x),
+                                                start_size: this.inspector_w,
+                                            });
+                                            cx.notify();
+                                        }),
+                                    ),
+                            )
                             .child(self.render_inspector(cx)),
+                    )
+                    .child(
+                        div()
+                            .id("split-workspace-timeline")
+                            .w_full()
+                            .h(px(4.))
+                            .bg(if self.panel_resize_drag.is_some_and(|d| {
+                                d.kind == PanelResizeKind::Timeline
+                            }) {
+                                Theme::accent()
+                            } else {
+                                gpui::rgba(0x00000000)
+                            })
+                            .cursor_ns_resize()
+                            .hover(|s| s.bg(Theme::accent()))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                                    cx.stop_propagation();
+                                    this.panel_resize_drag = Some(PanelResizeDrag {
+                                        kind: PanelResizeKind::Timeline,
+                                        start_pos: f32::from(event.position.y),
+                                        start_size: this.timeline_h,
+                                    });
+                                    cx.notify();
+                                }),
+                            ),
                     )
                     .child(self.render_timeline(window, cx))
             })
@@ -9106,6 +9454,9 @@ impl Render for EditorView {
             })
             .when_some(self.active_top_menu, |el, kind| {
                 el.child(self.render_menu_dropdown(kind, cx))
+            })
+            .when_some(self.timeline_transform_menu_pos, |el, pos| {
+                el.child(self.render_timeline_transform_menu(pos, cx))
             })
             .into_any_element()
     }
