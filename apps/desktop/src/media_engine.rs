@@ -1193,10 +1193,11 @@ pub fn render_unrotated_text_bgra(
     let base_h = (box_h + 16).max(32);
     let frame_bytes = (base_w * base_h * 4) as usize;
 
-    let display_text = if td.content.is_empty() {
+    let formatted = td.formatted_content();
+    let display_text = if formatted.is_empty() {
         "Text"
     } else {
-        td.content.as_str()
+        formatted.as_str()
     };
     let escaped = display_text
         .replace('\\', "\\\\")
@@ -1204,8 +1205,9 @@ pub fn render_unrotated_text_bgra(
         .replace('\'', "\\'");
     let box_part = if let Some(bg_hex) = td.bg_color_hex {
         format!(
-            ":box=1:boxcolor=0x{:06x}@0.75:boxborderw={:.0}",
+            ":box=1:boxcolor=0x{:06x}@{:.2}:boxborderw={:.0}",
             bg_hex,
+            td.bg_opacity.clamp(0.05, 1.0),
             td.bg_padding.max(2.0)
         )
     } else {
@@ -2203,15 +2205,16 @@ pub fn start_export_timeline(
                             let v_out = format!("vout{}", video_step);
                             video_step += 1;
                             let escaped = td
-                                .content
+                                .formatted_content()
                                 .replace('\\', "\\\\")
                                 .replace(':', "\\:")
                                 .replace('\'', "\\'");
                             let alpha = (clip.opacity as f32 / 100.0).clamp(0.0, 1.0);
                             let box_part = if let Some(bg_hex) = td.bg_color_hex {
                                 format!(
-                                    ":box=1:boxcolor=0x{:06x}@0.75:boxborderw={:.0}",
+                                    ":box=1:boxcolor=0x{:06x}@{:.2}:boxborderw={:.0}",
                                     bg_hex,
+                                    td.bg_opacity.clamp(0.05, 1.0),
                                     (td.bg_padding.max(2.0) * res_scale)
                                 )
                             } else {

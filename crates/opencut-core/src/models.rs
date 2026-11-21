@@ -665,12 +665,159 @@ impl TextAnimation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextCase {
+    #[default]
+    Normal,
+    Upper,
+    Lower,
+    Title,
+}
+
+impl TextCase {
+    pub fn apply(self, s: &str) -> String {
+        match self {
+            Self::Normal => s.to_string(),
+            Self::Upper => s.to_uppercase(),
+            Self::Lower => s.to_lowercase(),
+            Self::Title => s
+                .split_inclusive(char::is_whitespace)
+                .map(|w| {
+                    let mut chars = w.chars();
+                    match chars.next() {
+                        Some(first) => {
+                            let mut out = first.to_uppercase().to_string();
+                            out.push_str(&chars.as_str().to_lowercase());
+                            out
+                        }
+                        None => String::new(),
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextBubble {
+    #[default]
+    None,
+    Speech,
+    Pill,
+    Tag,
+    Banner,
+    NeonBox,
+}
+
+impl TextBubble {
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::None,
+            Self::Speech,
+            Self::Pill,
+            Self::Tag,
+            Self::Banner,
+            Self::NeonBox,
+        ]
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Speech => "Speech",
+            Self::Pill => "Pill",
+            Self::Tag => "Tag",
+            Self::Banner => "Banner",
+            Self::NeonBox => "Neon Box",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextStyleEffect {
+    #[default]
+    None,
+    NeonCyan,
+    Gold3D,
+    RetroPop,
+    CyberPink,
+    OutlineGlow,
+}
+
+impl TextStyleEffect {
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::None,
+            Self::NeonCyan,
+            Self::Gold3D,
+            Self::RetroPop,
+            Self::CyberPink,
+            Self::OutlineGlow,
+        ]
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::NeonCyan => "Neon",
+            Self::Gold3D => "Gold 3D",
+            Self::RetroPop => "Retro",
+            Self::CyberPink => "Cyber",
+            Self::OutlineGlow => "Glow",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TextLoopAnimation {
+    #[default]
+    None,
+    Pulse,
+    Float,
+    Blink,
+    Shake,
+}
+
+impl TextLoopAnimation {
+    pub const fn all() -> &'static [Self] {
+        &[
+            Self::None,
+            Self::Pulse,
+            Self::Float,
+            Self::Blink,
+            Self::Shake,
+        ]
+    }
+
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::None => "None",
+            Self::Pulse => "Pulse",
+            Self::Float => "Float",
+            Self::Blink => "Blink",
+            Self::Shake => "Shake",
+        }
+    }
+}
+
 fn default_font_family() -> String {
     "Be Vietnam Pro".into()
 }
 
 fn default_bg_padding() -> f32 {
     8.0
+}
+
+fn default_bg_opacity() -> f32 {
+    1.0
+}
+
+fn default_bg_radius() -> f32 {
+    6.0
+}
+
+fn default_line_spacing() -> f32 {
+    1.15
 }
 
 fn default_anim_duration() -> f32 {
@@ -690,11 +837,25 @@ pub struct TextClipData {
     pub font_path: Option<PathBuf>,
     #[serde(default = "default_font_weight")]
     pub font_weight: u16,
+    #[serde(default)]
+    pub italic: bool,
+    #[serde(default)]
+    pub underline: bool,
+    #[serde(default)]
+    pub text_case: TextCase,
+    #[serde(default)]
+    pub letter_spacing: f32,
+    #[serde(default = "default_line_spacing")]
+    pub line_spacing: f32,
     pub font_size: f32,
     pub color_hex: u32,
     pub bg_color_hex: Option<u32>,
     #[serde(default = "default_bg_padding")]
     pub bg_padding: f32,
+    #[serde(default = "default_bg_opacity")]
+    pub bg_opacity: f32,
+    #[serde(default = "default_bg_radius")]
+    pub bg_radius: f32,
     pub stroke_color_hex: Option<u32>,
     pub stroke_width: f32,
     #[serde(default)]
@@ -704,7 +865,17 @@ pub struct TextClipData {
     #[serde(default)]
     pub shadow_offset_y: f32,
     #[serde(default)]
+    pub glow_color_hex: Option<u32>,
+    #[serde(default)]
+    pub glow_intensity: f32,
+    #[serde(default)]
+    pub bubble: TextBubble,
+    #[serde(default)]
+    pub style_effect: TextStyleEffect,
+    #[serde(default)]
     pub animation: TextAnimation,
+    #[serde(default)]
+    pub loop_animation: TextLoopAnimation,
     #[serde(default = "default_anim_duration")]
     pub anim_duration_secs: f32,
     pub align: TextAlign,
@@ -776,6 +947,113 @@ impl TextClipData {
         }
         self.font_path = None;
     }
+
+    pub fn formatted_content(&self) -> String {
+        self.text_case.apply(&self.content)
+    }
+
+    pub fn apply_bubble(&mut self, bubble: TextBubble) {
+        self.bubble = bubble;
+        match bubble {
+            TextBubble::None => {
+                self.bg_color_hex = None;
+            }
+            TextBubble::Speech => {
+                self.bg_color_hex = Some(0xffffff);
+                self.color_hex = 0x111115;
+                self.bg_padding = 12.0;
+                self.bg_radius = 16.0;
+                self.bg_opacity = 0.95;
+            }
+            TextBubble::Pill => {
+                self.bg_color_hex = Some(0x2563eb);
+                self.color_hex = 0xffffff;
+                self.bg_padding = 12.0;
+                self.bg_radius = 24.0;
+                self.bg_opacity = 1.0;
+            }
+            TextBubble::Tag => {
+                self.bg_color_hex = Some(0xfacc15);
+                self.color_hex = 0x111115;
+                self.bg_padding = 8.0;
+                self.bg_radius = 4.0;
+                self.bg_opacity = 1.0;
+            }
+            TextBubble::Banner => {
+                self.bg_color_hex = Some(0xef4444);
+                self.color_hex = 0xffffff;
+                self.bg_padding = 12.0;
+                self.bg_radius = 2.0;
+                self.bg_opacity = 0.92;
+            }
+            TextBubble::NeonBox => {
+                self.bg_color_hex = Some(0x0f172a);
+                self.color_hex = 0x38bdf8;
+                self.glow_color_hex = Some(0x38bdf8);
+                self.glow_intensity = 0.65;
+                self.bg_padding = 12.0;
+                self.bg_radius = 10.0;
+                self.bg_opacity = 0.9;
+            }
+        }
+    }
+
+    pub fn apply_style_effect(&mut self, eff: TextStyleEffect) {
+        self.style_effect = eff;
+        match eff {
+            TextStyleEffect::None => {
+                self.glow_color_hex = None;
+                self.glow_intensity = 0.0;
+            }
+            TextStyleEffect::NeonCyan => {
+                self.color_hex = 0x38bdf8;
+                self.stroke_color_hex = Some(0x0284c7);
+                self.stroke_width = 1.5;
+                self.glow_color_hex = Some(0x38bdf8);
+                self.glow_intensity = 0.8;
+            }
+            TextStyleEffect::Gold3D => {
+                self.color_hex = 0xfacc15;
+                self.stroke_color_hex = Some(0x78350f);
+                self.stroke_width = 2.5;
+                self.shadow_color_hex = Some(0x451a03);
+                self.shadow_offset_x = 4.0;
+                self.shadow_offset_y = 4.0;
+                self.glow_color_hex = None;
+                self.glow_intensity = 0.0;
+            }
+            TextStyleEffect::RetroPop => {
+                self.color_hex = 0xf43f5e;
+                self.stroke_color_hex = Some(0xffffff);
+                self.stroke_width = 2.5;
+                self.shadow_color_hex = Some(0x1e293b);
+                self.shadow_offset_x = 5.0;
+                self.shadow_offset_y = 5.0;
+                self.glow_color_hex = None;
+                self.glow_intensity = 0.0;
+            }
+            TextStyleEffect::CyberPink => {
+                self.color_hex = 0xf472b6;
+                self.stroke_color_hex = Some(0x9d174d);
+                self.stroke_width = 2.0;
+                self.glow_color_hex = Some(0xec4899);
+                self.glow_intensity = 0.85;
+            }
+            TextStyleEffect::OutlineGlow => {
+                self.color_hex = 0xffffff;
+                self.stroke_color_hex = Some(0x3b82f6);
+                self.stroke_width = 3.0;
+                self.glow_color_hex = Some(0x60a5fa);
+                self.glow_intensity = 0.7;
+            }
+        }
+    }
+
+    pub fn copy_style_from(&mut self, other: &TextClipData) {
+        let kept_content = self.content.clone();
+        *self = other.clone();
+        self.content = kept_content;
+    }
 }
 
 impl Default for TextClipData {
@@ -785,16 +1063,28 @@ impl Default for TextClipData {
             font_family: "Be Vietnam Pro".into(),
             font_path: None,
             font_weight: 700,
+            italic: false,
+            underline: false,
+            text_case: TextCase::Normal,
+            letter_spacing: 0.0,
+            line_spacing: 1.15,
             font_size: 48.0,
             color_hex: 0xffffff,
             bg_color_hex: None,
             bg_padding: 8.0,
+            bg_opacity: 1.0,
+            bg_radius: 6.0,
             stroke_color_hex: Some(0x000000),
             stroke_width: 2.0,
             shadow_color_hex: Some(0x000000),
             shadow_offset_x: 2.0,
             shadow_offset_y: 2.0,
+            glow_color_hex: None,
+            glow_intensity: 0.0,
+            bubble: TextBubble::None,
+            style_effect: TextStyleEffect::None,
             animation: TextAnimation::None,
+            loop_animation: TextLoopAnimation::None,
             anim_duration_secs: 0.5,
             align: TextAlign::Center,
         }
