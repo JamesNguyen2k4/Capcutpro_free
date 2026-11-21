@@ -10,7 +10,6 @@ pub struct EditorCore {
     pub aspect_ratio: AspectRatio,
     pub base_height: u32,
     pub fps: u32,
-    pub main_track_magnet: bool,
     pub assets: Vec<MediaAsset>,
     pub clips: Vec<TimelineClip>,
     pub tracks: Vec<Track>,
@@ -70,7 +69,6 @@ impl EditorCore {
             aspect_ratio: AspectRatio::Ratio16x9,
             base_height: 720,
             fps: 30,
-            main_track_magnet: false,
             assets: Vec::new(),
             clips: Vec::new(),
             tracks: default_tracks(),
@@ -97,7 +95,6 @@ impl EditorCore {
             aspect_ratio: self.aspect_ratio,
             base_height: self.base_height,
             fps: self.fps,
-            main_track_magnet: self.main_track_magnet,
             assets: self.assets.clone(),
             clips: self.clips.clone(),
             tracks: self.tracks.clone(),
@@ -143,7 +140,6 @@ impl EditorCore {
             snap.base_height
         };
         self.fps = if snap.fps == 0 { 30 } else { snap.fps };
-        self.main_track_magnet = snap.main_track_magnet;
         self.assets = snap.assets;
         self.clips = snap.clips;
         self.tracks = snap.tracks;
@@ -409,28 +405,60 @@ impl EditorCore {
         }
     }
 
-    pub fn toggle_main_track_magnet(&mut self) {
-        self.push_undo();
-        self.main_track_magnet = !self.main_track_magnet;
-        if self.main_track_magnet {
-            self.compact_main_track();
-        }
-        self.status_message = if self.main_track_magnet {
-            "Main track magnet enabled".into()
-        } else {
-            "Main track magnet disabled".into()
+    pub fn is_main_track_clip(&self, clip: &TimelineClip) -> bool {
+        let Some(main_track_id) = self.tracks.iter().find(|t| t.is_main).map(|t| t.id) else {
+            return false;
         };
+        clip.track_id == main_track_id || (clip.track_id == 0 && clip.track == TrackKind::Video)
     }
 
-    pub fn compact_main_track(&mut self) {
-        let Some(main_track_id) = self.tracks.iter().find(|t| t.is_main).map(|t| t.id) else {
+    /// Sets a main-track clip start and keeps its linked clip (e.g. detached audio) in sync.
+    fn set_main_clip_start(&mut self, idx: usize, new_start: f32) {
+        let delta = new_start - self.clips[idx].start_secs;
+        self.clips[idx].start_secs = new_start;
+        if delta.abs() < 1e-4 {
+            return;
+        }
+        let Some(lid) = self.clips[idx].linked_clip_id else {
             return;
         };
+        let Some(l_idx) = self.clips.iter().position(|c| c.id == lid) else {
+            return;
+        };
+        if self.is_main_track_clip(&self.clips[l_idx]) || self.is_clip_track_locked(&self.clips[l_idx])
+        {
+            return;
+        }
+        self.clips[l_idx].start_secs = (self.clips[l_idx].start_secs + delta).max(0.0);
+    }
+
+    /// Magnetic main track: clips are always packed back-to-back from 0s (no gaps, no overlaps).
+    pub fn compact_main_track(&mut self) {
+        self.layout_main_track(None);
+    }
+
+    /// Lays out the main track. When `dragged` is `Some((id, point_secs))`, that clip is left out
+    /// of the packing and a gap of its duration is opened at the slot chosen by `point_secs`
+    /// (compared against clip midpoints of the gap-free layout, so there is no jitter).
+    /// Returns `(main_track_id, slot_start_secs, dragged_duration_secs)` for the dragged clip.
+    fn layout_main_track(
+        &mut self,
+        dragged: Option<(usize, f32)>,
+    ) -> Option<(usize, f32, f32)> {
+        let main_track_id = self.tracks.iter().find(|t| t.is_main).map(|t| t.id)?;
+        let dragged_id = dragged.map(|(id, _)| id);
+        let dragged_dur = dragged_id.and_then(|eid| {
+            self.clips
+                .iter()
+                .find(|c| c.id == eid && self.is_main_track_clip(c))
+                .map(|c| c.duration_secs)
+        });
+
         let mut indices: Vec<usize> = self
             .clips
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.track_id == main_track_id)
+            .filter(|(_, c)| self.is_main_track_clip(c) && Some(c.id) != dragged_id)
             .map(|(i, _)| i)
             .collect();
         indices.sort_by(|&a, &b| {
@@ -438,12 +466,106 @@ impl EditorCore {
                 .start_secs
                 .partial_cmp(&self.clips[b].start_secs)
                 .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| self.clips[a].id.cmp(&self.clips[b].id))
         });
 
+        let insert_idx = match (dragged, dragged_dur) {
+            (Some((_, point)), Some(_)) => {
+                let mut packed = 0.0_f32;
+                let mut count = 0usize;
+                for &idx in &indices {
+                    let dur = self.clips[idx].duration_secs;
+                    if packed + dur * 0.5 < point {
+                        count += 1;
+                    } else {
+                        break;
+                    }
+                    packed += dur;
+                }
+                count
+            }
+            _ => indices.len(),
+        };
+
+        let total = indices.len();
         let mut cursor = 0.0_f32;
-        for idx in indices {
-            self.clips[idx].start_secs = cursor;
+        let mut slot_start = 0.0_f32;
+        for (pos, idx) in indices.into_iter().enumerate() {
+            if let Some(d_dur) = dragged_dur {
+                if pos == insert_idx {
+                    slot_start = cursor;
+                    cursor += d_dur;
+                }
+            }
+            self.set_main_clip_start(idx, cursor);
             cursor += self.clips[idx].duration_secs;
+        }
+        if let Some(d_dur) = dragged_dur {
+            if insert_idx >= total {
+                slot_start = cursor;
+                cursor += d_dur;
+            }
+        }
+
+        let other_end = self
+            .clips
+            .iter()
+            .filter(|c| !self.is_main_track_clip(c))
+            .map(|c| c.end_secs())
+            .fold(0.0_f32, f32::max);
+        let max_end = cursor.max(other_end);
+        if max_end + 5.0 > self.total_duration_secs {
+            self.total_duration_secs = (max_end + 5.0).ceil();
+        }
+
+        dragged_dur.map(|d_dur| (main_track_id, slot_start, d_dur))
+    }
+
+    /// Live preview while dragging a main-track clip: the clip follows the cursor, other clips
+    /// slide to open a slot. Returns `(main_track_id, slot_start_secs, dragged_duration_secs)`.
+    /// Returns `None` when the clip is not on the main track (free placement) or is locked.
+    pub fn preview_main_track_magnet_drag(
+        &mut self,
+        clip_id: usize,
+        initial_start_secs: f32,
+        raw_start_secs: f32,
+    ) -> Option<(usize, f32, f32)> {
+        let idx = self.clips.iter().position(|c| c.id == clip_id)?;
+        if !self.is_main_track_clip(&self.clips[idx]) || self.is_clip_track_locked(&self.clips[idx])
+        {
+            return None;
+        }
+        let dur = self.clips[idx].duration_secs;
+        let clamped_start = raw_start_secs.max(0.0);
+        self.set_main_clip_start(idx, clamped_start);
+
+        let dt = raw_start_secs - initial_start_secs;
+        let point = if raw_start_secs <= 0.0 {
+            -1.0
+        } else if dt < -0.01 {
+            clamped_start
+        } else if dt > 0.01 {
+            clamped_start + dur
+        } else {
+            clamped_start + dur * 0.5
+        };
+        self.layout_main_track(Some((clip_id, point)))
+    }
+
+    /// Commits a main-track drag into its slot and repacks the track (Ripple Insert).
+    pub fn finalize_main_track_magnet_drop(&mut self, clip_id: usize, slot_start_secs: f32) {
+        if let Some(idx) = self.clips.iter().position(|c| c.id == clip_id) {
+            if self.is_main_track_clip(&self.clips[idx]) {
+                self.set_main_clip_start(idx, slot_start_secs.max(0.0));
+            }
+        }
+        self.compact_main_track();
+    }
+
+    /// Ripple-inserts a main-track clip so its left edge lands at the slot nearest `point_secs`.
+    fn insert_main_clip_at(&mut self, clip_id: usize, point_secs: f32) {
+        if let Some((_, slot, _)) = self.layout_main_track(Some((clip_id, point_secs))) {
+            self.finalize_main_track_magnet_drop(clip_id, slot);
         }
     }
 
@@ -909,6 +1031,24 @@ impl EditorCore {
     }
 
     pub fn trim_clip_left(&mut self, clip_id: usize, new_start_secs: f32) {
+        let Some(c) = self.clips.iter().find(|c| c.id == clip_id) else {
+            return;
+        };
+        let (s, si, d) = (c.start_secs, c.source_in_secs, c.duration_secs);
+        self.trim_clip_left_from(clip_id, s, si, d, new_start_secs);
+    }
+
+    /// Trims the left edge relative to the clip state captured when the drag began, so repeated
+    /// calls during one drag are idempotent. On the main track the clip keeps its left position
+    /// and following clips ripple (Ripple Edit); other tracks move freely.
+    pub fn trim_clip_left_from(
+        &mut self,
+        clip_id: usize,
+        initial_start: f32,
+        initial_source_in: f32,
+        initial_dur: f32,
+        new_start_secs: f32,
+    ) {
         let Some(idx) = self.clips.iter().position(|c| c.id == clip_id) else {
             return;
         };
@@ -916,18 +1056,20 @@ impl EditorCore {
             return;
         }
 
-        let old_start = self.clips[idx].start_secs;
-        let old_end = self.clips[idx].end_secs();
-        let old_source_in = self.clips[idx].source_in_secs;
+        let initial_end = initial_start + initial_dur;
+        let min_start = initial_start - initial_source_in.max(0.0);
+        let max_start = initial_end - 0.3;
+        let clamped_start = new_start_secs.clamp(min_start.max(0.0).min(max_start), max_start);
 
-        let min_start = (old_start - old_source_in).max(0.0);
-        let max_start = old_end - 0.3;
-        let clamped_start = new_start_secs.clamp(min_start, max_start);
-
-        let delta = clamped_start - old_start;
-        self.clips[idx].start_secs = clamped_start;
-        self.clips[idx].source_in_secs = (old_source_in + delta).max(0.0);
-        self.clips[idx].duration_secs = (old_end - clamped_start).max(0.3);
+        let delta = clamped_start - initial_start;
+        self.clips[idx].source_in_secs = (initial_source_in + delta).max(0.0);
+        self.clips[idx].duration_secs = (initial_end - clamped_start).max(0.3);
+        if self.is_main_track_clip(&self.clips[idx]) {
+            self.set_main_clip_start(idx, initial_start);
+            self.compact_main_track();
+        } else {
+            self.clips[idx].start_secs = clamped_start;
+        }
     }
 
     pub fn trim_clip_right(&mut self, clip_id: usize, new_end_secs: f32) {
@@ -943,6 +1085,9 @@ impl EditorCore {
             .max(0.3);
         let new_dur = (new_end_secs - start).clamp(0.3, max_dur);
         self.clips[idx].duration_secs = new_dur;
+        if self.is_main_track_clip(&self.clips[idx]) {
+            self.compact_main_track();
+        }
     }
 
     pub fn split_selected_or_at_playhead(&mut self) {
@@ -1013,6 +1158,7 @@ impl EditorCore {
 
         self.push_undo();
         let removed = self.clips.remove(pos);
+        let removed_was_main = self.is_main_track_clip(&removed);
         if let Some(lid) = removed.linked_clip_id {
             if let Some(l_pos) = self.clips.iter().position(|c| c.id == lid) {
                 if !self.is_clip_track_locked(&self.clips[l_pos]) {
@@ -1020,7 +1166,7 @@ impl EditorCore {
                 }
             }
         }
-        if self.main_track_magnet {
+        if removed_was_main {
             self.compact_main_track();
         }
         self.selected_clip_id = None;
@@ -1042,6 +1188,12 @@ impl EditorCore {
 
         self.push_undo();
         let removed = self.clips.remove(pos);
+        if self.is_main_track_clip(&removed) {
+            self.compact_main_track();
+            self.selected_clip_id = None;
+            self.status_message = format!("Ripple deleted {}", removed.name);
+            return;
+        }
         let shift = removed.duration_secs;
 
         for clip in &mut self.clips {
@@ -1092,9 +1244,10 @@ impl EditorCore {
                     .map(|t| t.is_main)
                     .unwrap_or(false));
         let clip_end = clip.end_secs();
+        let playhead = clip.start_secs;
         self.clips.push(clip);
-        if self.main_track_magnet && is_main_video {
-            self.compact_main_track();
+        if is_main_video {
+            self.insert_main_clip_at(new_id, playhead);
         }
         if clip_end + 5.0 > self.total_duration_secs {
             self.total_duration_secs = (clip_end + 5.0).ceil();
@@ -1749,19 +1902,85 @@ mod tests {
         core.ripple_delete_selected();
         assert_eq!(core.clips.len(), 2);
         assert!((core.clips[0].start_secs - 0.0).abs() < 0.001);
-        assert!((core.clips[1].start_secs - 4.0).abs() < 0.001);
+        // Magnetic main track: the 1s gap before clip 3 is closed as well.
+        assert!((core.clips[1].start_secs - 3.0).abs() < 0.001);
     }
 
     #[test]
     fn trim_left_updates_start_and_source_in() {
         let mut core = EditorCore::new();
-        core.clips.push(sample_clip(1, 2.0, 6.0));
-        core.trim_clip_left(1, 4.0);
+        core.clips.push(sample_clip(1, 0.0, 6.0));
+        core.trim_clip_left(1, 2.0);
 
+        // Main track is magnetic: the clip keeps its left position and the content is trimmed.
         let c = &core.clips[0];
-        assert!((c.start_secs - 4.0).abs() < 0.001);
+        assert!((c.start_secs - 0.0).abs() < 0.001);
         assert!((c.source_in_secs - 2.0).abs() < 0.001);
         assert!((c.duration_secs - 4.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn trim_left_is_idempotent_within_a_drag_and_ripples_next_clip() {
+        let mut core = EditorCore::new();
+        core.clips.push(sample_clip(1, 0.0, 6.0));
+        core.clips.push(sample_clip(2, 6.0, 3.0));
+        for _ in 0..3 {
+            core.trim_clip_left_from(1, 0.0, 0.0, 6.0, 2.0);
+        }
+        assert!((core.clips[0].source_in_secs - 2.0).abs() < 0.001);
+        assert!((core.clips[0].duration_secs - 4.0).abs() < 0.001);
+        assert!((core.clips[1].start_secs - 4.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dragging_main_clip_has_no_jitter_and_reorders() {
+        let mut core = EditorCore::new();
+        core.clips.push(sample_clip(1, 0.0, 3.0));
+        core.clips.push(sample_clip(2, 3.0, 4.0));
+        core.clips.push(sample_clip(3, 7.0, 3.0));
+        // Drag clip 1 so its trailing edge passes clip 2's midpoint (2.0) and stays before clip 3's (5.5).
+        for raw in [0.5_f32, 1.0, 1.5, 1.5, 1.5] {
+            core.preview_main_track_magnet_drag(1, 0.0, raw);
+        }
+        let slot = core.preview_main_track_magnet_drag(1, 0.0, 1.5).unwrap();
+        assert!((slot.1 - 4.0).abs() < 0.001);
+        core.finalize_main_track_magnet_drop(1, slot.1);
+        let start = |id: usize| core.clips.iter().find(|c| c.id == id).unwrap().start_secs;
+        assert!((start(2) - 0.0).abs() < 0.001);
+        assert!((start(1) - 4.0).abs() < 0.001);
+        assert!((start(3) - 7.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn dragging_long_clip_before_short_first_clip() {
+        let mut core = EditorCore::new();
+        core.clips.push(sample_clip(1, 0.0, 10.0));
+        core.clips.push(sample_clip(2, 10.0, 50.0));
+
+        // Dragging the 50s clip left past the 10s clip's midpoint (5.0s) or to 0.0s must insert at 0.0s.
+        let slot = core.preview_main_track_magnet_drag(2, 10.0, 4.0).unwrap();
+        assert!((slot.1 - 0.0).abs() < 0.001);
+        core.finalize_main_track_magnet_drop(2, slot.1);
+
+        let start = |id: usize| core.clips.iter().find(|c| c.id == id).unwrap().start_secs;
+        assert!((start(2) - 0.0).abs() < 0.001);
+        assert!((start(1) - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn linked_audio_follows_main_clip_ripple() {
+        let mut core = EditorCore::new();
+        core.clips.push(sample_clip(1, 0.0, 3.0));
+        core.clips.push(sample_clip(2, 3.0, 3.0));
+        let mut audio = sample_clip(9, 3.0, 3.0);
+        audio.track = TrackKind::Audio;
+        audio.track_id = 3;
+        core.clips.push(audio);
+        assert!(core.link_clips(2, 9));
+        core.selected_clip_id = Some(1);
+        core.delete_selected_clip();
+        let a = core.clips.iter().find(|c| c.id == 9).unwrap();
+        assert!((a.start_secs - 0.0).abs() < 0.001);
     }
 
     #[test]
@@ -1806,10 +2025,24 @@ mod tests {
         core.clips.push(sample_clip(1, 2.0, 3.0));
         core.clips.push(sample_clip(2, 8.0, 4.0));
 
-        core.toggle_main_track_magnet();
-        assert!(core.main_track_magnet);
+        core.compact_main_track();
         assert!((core.clips[0].start_secs - 0.0).abs() < 0.001);
         assert!((core.clips[1].start_secs - 3.0).abs() < 0.001);
+
+        // Drag clip 1 past clip 2's midpoint -> preview slot moves after clip 2 (4.0s)
+        let main_id = core.tracks.iter().find(|t| t.is_main).unwrap().id;
+        let slot = core.preview_main_track_magnet_drag(1, 0.0, 5.5);
+        assert_eq!(slot, Some((main_id, 4.0, 3.0)));
+        // Non-dragged clip 2 slid forward to 0.0
+        assert!((core.clips[1].start_secs - 0.0).abs() < 0.001);
+        core.finalize_main_track_magnet_drop(1, 4.0);
+        assert!((core.clips[1].start_secs - 0.0).abs() < 0.001);
+        assert!((core.clips[0].start_secs - 4.0).abs() < 0.001);
+
+        // Ripple trim on clip 2 (currently at 0..4) -> clip 1 ripples back to 2.5
+        core.trim_clip_right(2, 2.5);
+        assert!((core.clips[1].duration_secs - 2.5).abs() < 0.001);
+        assert!((core.clips[0].start_secs - 2.5).abs() < 0.001);
     }
 
     #[test]
@@ -1905,7 +2138,7 @@ mod tests {
         assert_ne!(pasted_id, 1);
         assert_eq!(core.clips.len(), 2);
         let pasted = core.clips.iter().find(|c| c.id == pasted_id).unwrap();
-        assert!((pasted.start_secs - 5.0).abs() < 0.01);
+        assert!((pasted.start_secs - 3.0).abs() < 0.01);
         assert_eq!(core.selected_clip_id, Some(pasted_id));
     }
 

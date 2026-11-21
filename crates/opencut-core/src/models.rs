@@ -1209,8 +1209,6 @@ pub struct ProjectSnapshot {
     pub base_height: u32,
     #[serde(default = "default_fps")]
     pub fps: u32,
-    #[serde(default)]
-    pub main_track_magnet: bool,
     pub assets: Vec<MediaAsset>,
     pub clips: Vec<TimelineClip>,
     #[serde(default)]

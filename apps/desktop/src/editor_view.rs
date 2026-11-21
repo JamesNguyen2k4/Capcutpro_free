@@ -1,4 +1,4 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -91,6 +91,7 @@ struct ClipDragState {
     kind: ClipDragKind,
     start_mouse_x: f32,
     initial_start_secs: f32,
+    initial_source_in_secs: f32,
     initial_duration_secs: f32,
 }
 
@@ -360,6 +361,8 @@ enum InspectorTab {
     Effects,
     Crop,
     Text,
+    TextStyle,
+    TextAnim,
 }
 
 impl InspectorTab {
@@ -372,6 +375,8 @@ impl InspectorTab {
             Self::Effects => "Effects",
             Self::Crop => "Crop",
             Self::Text => "Text",
+            Self::TextStyle => "Style",
+            Self::TextAnim => "Animation",
         }
     }
 
@@ -388,7 +393,7 @@ impl InspectorTab {
             TrackKind::Overlay => &[Self::Basic, Self::Color, Self::Effects, Self::Crop],
             TrackKind::Adjustment => &[Self::Color, Self::Effects, Self::Basic],
             TrackKind::Audio => &[Self::Audio, Self::Speed],
-            TrackKind::Text => &[Self::Text, Self::Basic],
+            TrackKind::Text => &[Self::Text, Self::TextStyle, Self::TextAnim, Self::Basic],
         }
     }
 }
@@ -440,6 +445,7 @@ pub struct EditorView {
     panel_resize_drag: Option<PanelResizeDrag>,
     playhead_dragging: bool,
     clip_drag: Option<ClipDragState>,
+    magnet_drop_slot: Option<(usize, f32, f32)>,
     preview_text_drag: Option<PreviewTextDragState>,
     slider_drag: Option<SliderField>,
     media_dim_cache: HashMap<PathBuf, (u32, u32)>,
@@ -460,6 +466,9 @@ pub struct EditorView {
     effect_category: Option<EffectCategory>,
     anim_tab: AnimSubTab,
     inspector_tab: InspectorTab,
+    text_font_menu_open: bool,
+    text_preset_menu_open: bool,
+    text_color_picker_open: bool,
     export_status: ExportStatus,
     export_modal_open: bool,
     export_options: ExportOptions,
@@ -491,7 +500,7 @@ impl EditorView {
             media_search_focused: false,
             editing_text_clip_id: None,
             marked_text_range: None,
-            preview_quality: PreviewQuality::Half,
+            preview_quality: PreviewQuality::Full,
             preview_zoom: 1.0,
             show_safe_zone: false,
             preview_fullscreen: false,
@@ -517,6 +526,7 @@ impl EditorView {
             panel_resize_drag: None,
             playhead_dragging: false,
             clip_drag: None,
+            magnet_drop_slot: None,
             preview_text_drag: None,
             slider_drag: None,
             media_dim_cache: HashMap::new(),
@@ -537,6 +547,9 @@ impl EditorView {
             effect_category: None,
             anim_tab: AnimSubTab::In,
             inspector_tab: InspectorTab::Basic,
+            text_font_menu_open: false,
+            text_preset_menu_open: false,
+            text_color_picker_open: false,
             export_status: ExportStatus::Idle,
             export_modal_open: false,
             export_options: ExportOptions::default(),
@@ -5993,6 +6006,12 @@ impl EditorView {
                     .justify_between()
                     .child(
                         div()
+                            .flex_1()
+                            .min_w(px(120.))
+                            .flex()
+                            .items_center()
+                            .justify_start()
+                            .font_family("Consolas")
                             .text_xs()
                             .font_weight(gpui::FontWeight::MEDIUM)
                             .text_color(Theme::text_secondary())
@@ -6085,8 +6104,10 @@ impl EditorView {
                     )
                     .child(
                         div()
+                            .flex_1()
                             .flex()
                             .items_center()
+                            .justify_end()
                             .gap_1p5()
                             .child({
                                 let zoomed = (self.preview_zoom - 1.0).abs() > 0.02;
@@ -6134,7 +6155,7 @@ impl EditorView {
                                     "pv-quality",
                                     self.preview_quality.label(),
                                     "Cycle Preview Quality (Full / 1/2 / 1/4)",
-                                    self.preview_quality != PreviewQuality::Half,
+                                    self.preview_quality != PreviewQuality::Full,
                                     true,
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {
@@ -7014,108 +7035,139 @@ impl EditorView {
                         let col_r = ((td.color_hex >> 16) & 0xff) as u8;
                         let col_g = ((td.color_hex >> 8) & 0xff) as u8;
                         let col_b = (td.color_hex & 0xff) as u8;
+                        let font_open = self.text_font_menu_open;
+                        let preset_open = self.text_preset_menu_open;
+                        let color_open = self.text_color_picker_open;
 
                         el.child(
-                                div()
-                                    .p_2()
-                                    .rounded_md()
-                                    .bg(Theme::bg_surface())
-                                    .text_xs()
-                                    .text_color(Theme::text_muted())
-                                    .child("Double-click text in Preview to type • Drag to move"),
-                            )
-                            // Style Presets
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
+                            div()
+                                .p_2p5()
+                                .rounded_md()
+                                .bg(Theme::bg_surface())
+                                .border_1()
+                                .border_color(Theme::border())
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(Theme::text_primary())
+                                        .child(if td.content.trim().is_empty() {
+                                            "Empty text".to_string()
+                                        } else {
+                                            td.content.clone()
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(Theme::text_muted())
+                                        .child("Double-click text in Preview to edit"),
+                                ),
+                        )
+                        // Font row (horizontal label + dropdown + "+ Font")
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(56.))
+                                                .text_xs()
+                                                .text_color(Theme::text_secondary())
+                                                .child("Font"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    div()
+                                                        .id("txt-font-dd")
+                                                        .flex_1()
+                                                        .h(px(26.))
+                                                        .px_2()
+                                                        .rounded_sm()
+                                                        .bg(Theme::bg_surface())
+                                                        .border_1()
+                                                        .border_color(if font_open {
+                                                            Theme::accent()
+                                                        } else {
+                                                            Theme::border()
+                                                        })
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .text_xs()
+                                                        .text_color(Theme::text_primary())
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.text_font_menu_open =
+                                                                !this.text_font_menu_open;
+                                                            this.text_preset_menu_open = false;
+                                                            cx.notify();
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .truncate()
+                                                                .child(td.font_family.clone()),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(Theme::text_muted())
+                                                                .child(if font_open {
+                                                                    "▴"
+                                                                } else {
+                                                                    "▾"
+                                                                }),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("btn-import-font")
+                                                        .h(px(26.))
+                                                        .px_2()
+                                                        .rounded_sm()
+                                                        .bg(Theme::bg_surface())
+                                                        .border_1()
+                                                        .border_color(Theme::border())
+                                                        .flex()
+                                                        .items_center()
+                                                        .text_xs()
+                                                        .text_color(Theme::accent())
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.prompt_import_font(cx);
+                                                        }))
+                                                        .child("+"),
+                                                ),
+                                        ),
+                                )
+                                .when(font_open, |el| {
+                                    el.child(
                                         div()
-                                            .text_xs()
-                                            .text_color(Theme::text_secondary())
-                                            .child("Style Presets"),
-                                    )
-                                    .child(
-                                        div()
+                                            .ml(px(64.))
+                                            .p_1()
+                                            .rounded_md()
+                                            .bg(Theme::bg_surface())
+                                            .border_1()
+                                            .border_color(Theme::border())
                                             .flex()
-                                            .flex_wrap()
-                                            .gap_1()
-                                            .children(TextPreset::all().iter().map(|&preset| {
-                                                div()
-                                                    .id(SharedString::from(format!(
-                                                        "tp-{}",
-                                                        preset.label()
-                                                    )))
-                                                    .px_2()
-                                                    .py_0p5()
-                                                    .rounded_sm()
-                                                    .bg(Theme::bg_surface())
-                                                    .border_1()
-                                                    .border_color(Theme::border())
-                                                    .text_xs()
-                                                    .text_color(Theme::text_primary())
-                                                    .cursor_pointer()
-                                                    .hover(|s| {
-                                                        s.border_color(Theme::accent())
-                                                            .bg(Theme::bg_hover())
-                                                    })
-                                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                                        this.state.push_undo();
-                                                        if let Some(c) =
-                                                            this.state.selected_clip_mut()
-                                                        {
-                                                            if let Some(ref mut t) = c.text {
-                                                                t.apply_preset(preset);
-                                                            }
-                                                        }
-                                                        cx.notify();
-                                                    }))
-                                                    .child(preset.label())
-                                            })),
-                                    ),
-                            )
-                            // 10 Vietnamese-ready Fonts + Import
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .text_xs()
-                                                    .text_color(Theme::text_secondary())
-                                                    .child("Font Family"),
-                                            )
-                                            .child(
-                                                div()
-                                                    .id("btn-import-font")
-                                                    .px_1p5()
-                                                    .py_0p5()
-                                                    .rounded_sm()
-                                                    .bg(Theme::bg_surface())
-                                                    .border_1()
-                                                    .border_color(Theme::border())
-                                                    .text_xs()
-                                                    .text_color(Theme::accent())
-                                                    .cursor_pointer()
-                                                    .hover(|s| s.bg(Theme::bg_hover()))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        this.prompt_import_font(cx);
-                                                    }))
-                                                    .child("+ Font"),
-                                            ),
-                                    )
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .flex_wrap()
-                                            .gap_1()
+                                            .flex_col()
+                                            .gap_0p5()
                                             .children(
                                                 [
                                                     "Be Vietnam Pro",
@@ -7137,18 +7189,23 @@ impl EditorView {
                                                             "ff-{}",
                                                             fname
                                                         )))
-                                                        .px_1p5()
-                                                        .py_0p5()
+                                                        .px_2()
+                                                        .py_1()
                                                         .rounded_sm()
                                                         .bg(if active {
+                                                            Theme::bg_hover()
+                                                        } else {
+                                                            gpui::rgba(0x00000000).into()
+                                                        })
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_between()
+                                                        .text_xs()
+                                                        .text_color(if active {
                                                             Theme::accent()
                                                         } else {
-                                                            Theme::bg_surface()
+                                                            Theme::text_primary()
                                                         })
-                                                        .border_1()
-                                                        .border_color(Theme::border())
-                                                        .text_xs()
-                                                        .text_color(Theme::text_primary())
                                                         .cursor_pointer()
                                                         .hover(|s| s.bg(Theme::bg_hover()))
                                                         .on_click(cx.listener(
@@ -7164,127 +7221,167 @@ impl EditorView {
                                                                         t.font_path = None;
                                                                     }
                                                                 }
+                                                                this.text_font_menu_open = false;
                                                                 cx.notify();
                                                             },
                                                         ))
                                                         .child(fname)
+                                                        .when(active, |row| row.child("✓"))
                                                 }),
                                             ),
-                                    ),
-                            )
-                            // Font Size & Weight sliders
-                            .child(self.inspector_slider(
-                                "Size",
-                                format!("{:.0}px", td.font_size),
-                                ((td.font_size - 12.0) / 128.0).clamp(0.0, 1.0),
-                                Theme::accent(),
-                                SliderField::FontSize,
-                                cx,
-                            ))
-                            .child(self.inspector_slider(
-                                "Weight",
-                                match td.font_weight {
-                                    0..=350 => "Light",
-                                    351..=450 => "Regular",
-                                    451..=600 => "Medium",
-                                    601..=800 => "Bold",
-                                    _ => "Black",
-                                }
-                                .into(),
-                                ((td.font_weight as f32 - 300.0) / 600.0).clamp(0.0, 1.0),
-                                Theme::accent(),
-                                SliderField::FontWeight,
-                                cx,
-                            ))
-                            // RGB Color Picker + Quick swatches
-                            .child(
-                                div()
-                                    .flex()
-                                    .flex_col()
-                                    .gap_1p5()
-                                    .child(
-                                        div()
-                                            .flex()
-                                            .items_center()
-                                            .justify_between()
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_1p5()
-                                                    .child(
-                                                        div()
-                                                            .w(px(14.))
-                                                            .h(px(14.))
-                                                            .rounded_sm()
-                                                            .bg(rgb(td.color_hex))
-                                                            .border_1()
-                                                            .border_color(Theme::border()),
-                                                    )
-                                                    .child(
-                                                        div()
-                                                            .text_xs()
-                                                            .text_color(Theme::text_secondary())
-                                                            .child(format!(
-                                                                "RGB #{:06X}",
-                                                                td.color_hex
-                                                            )),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex()
-                                                    .items_center()
-                                                    .gap_1()
-                                                    .children(
-                                                        [
-                                                            0xffffff_u32,
-                                                            0x000000,
-                                                            0xfacc15,
-                                                            0xef4444,
-                                                            0x3b82f6,
-                                                            0x22c55e,
-                                                        ]
-                                                        .into_iter()
-                                                        .map(|hex| {
-                                                            let active = td.color_hex == hex;
-                                                            div()
-                                                                .id(SharedString::from(format!(
-                                                                    "tc-{:06x}",
-                                                                    hex
-                                                                )))
-                                                                .w(px(14.))
-                                                                .h(px(14.))
-                                                                .rounded_sm()
-                                                                .bg(rgb(hex))
-                                                                .border_1()
-                                                                .border_color(if active {
-                                                                    Theme::accent()
-                                                                } else {
-                                                                    Theme::border()
-                                                                })
-                                                                .cursor_pointer()
-                                                                .on_click(cx.listener(
-                                                                    move |this, _, _, cx| {
-                                                                        this.state.push_undo();
-                                                                        if let Some(c) = this
-                                                                            .state
-                                                                            .selected_clip_mut()
-                                                                        {
-                                                                            if let Some(ref mut t) =
-                                                                                c.text
-                                                                            {
-                                                                                t.color_hex = hex;
-                                                                            }
-                                                                        }
-                                                                        cx.notify();
-                                                                    },
-                                                                ))
-                                                        }),
-                                                    ),
-                                            ),
                                     )
-                                    .child(self.inspector_slider(
+                                }),
+                        )
+                        // Font Size & Weight sliders
+                        .child(self.inspector_slider(
+                            "Size",
+                            format!("{:.0}px", td.font_size),
+                            ((td.font_size - 12.0) / 128.0).clamp(0.0, 1.0),
+                            Theme::accent(),
+                            SliderField::FontSize,
+                            cx,
+                        ))
+                        .child(self.inspector_slider(
+                            "Weight",
+                            match td.font_weight {
+                                0..=350 => "Light",
+                                351..=450 => "Regular",
+                                451..=600 => "Medium",
+                                601..=800 => "Bold",
+                                _ => "Black",
+                            }
+                            .into(),
+                            ((td.font_weight as f32 - 300.0) / 600.0).clamp(0.0, 1.0),
+                            Theme::accent(),
+                            SliderField::FontWeight,
+                            cx,
+                        ))
+                        // Color row (horizontal: label + color swatch dropdown + quick swatches)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1p5()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(56.))
+                                                .text_xs()
+                                                .text_color(Theme::text_secondary())
+                                                .child("Color"),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .id("txt-color-dd")
+                                                        .h(px(24.))
+                                                        .px_1p5()
+                                                        .rounded_sm()
+                                                        .bg(Theme::bg_surface())
+                                                        .border_1()
+                                                        .border_color(if color_open {
+                                                            Theme::accent()
+                                                        } else {
+                                                            Theme::border()
+                                                        })
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .cursor_pointer()
+                                                        .hover(|s| s.bg(Theme::bg_hover()))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            this.text_color_picker_open =
+                                                                !this.text_color_picker_open;
+                                                            cx.notify();
+                                                        }))
+                                                        .child(
+                                                            div()
+                                                                .w(px(16.))
+                                                                .h(px(12.))
+                                                                .rounded_sm()
+                                                                .bg(rgb(td.color_hex))
+                                                                .border_1()
+                                                                .border_color(Theme::border()),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .text_color(Theme::text_muted())
+                                                                .child(if color_open {
+                                                                    "▴"
+                                                                } else {
+                                                                    "▾"
+                                                                }),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1()
+                                                        .children(
+                                                            [
+                                                                0xffffff_u32,
+                                                                0x000000,
+                                                                0xfacc15,
+                                                                0xef4444,
+                                                                0x3b82f6,
+                                                                0x22c55e,
+                                                            ]
+                                                            .into_iter()
+                                                            .map(|hex| {
+                                                                let active = td.color_hex == hex;
+                                                                div()
+                                                                    .id(SharedString::from(format!(
+                                                                        "tc-{:06x}",
+                                                                        hex
+                                                                    )))
+                                                                    .w(px(14.))
+                                                                    .h(px(14.))
+                                                                    .rounded_sm()
+                                                                    .bg(rgb(hex))
+                                                                    .border_1()
+                                                                    .border_color(if active {
+                                                                        Theme::accent()
+                                                                    } else {
+                                                                        Theme::border()
+                                                                    })
+                                                                    .cursor_pointer()
+                                                                    .on_click(cx.listener(
+                                                                        move |this, _, _, cx| {
+                                                                            this.state.push_undo();
+                                                                            if let Some(c) = this
+                                                                                .state
+                                                                                .selected_clip_mut()
+                                                                            {
+                                                                                if let Some(ref mut t) =
+                                                                                    c.text
+                                                                                {
+                                                                                    t.color_hex =
+                                                                                        hex;
+                                                                                }
+                                                                            }
+                                                                            cx.notify();
+                                                                        },
+                                                                    ))
+                                                            }),
+                                                        ),
+                                                ),
+                                        ),
+                                )
+                                .when(color_open, |el| {
+                                    el.child(self.inspector_slider(
                                         "Red",
                                         format!("{}", col_r),
                                         col_r as f32 / 255.0,
@@ -7307,11 +7404,116 @@ impl EditorView {
                                         rgb(0x3b82f6),
                                         SliderField::ColorB,
                                         cx,
-                                    )),
-                            )
-                            // Effects: Stroke, Shadow, Background
-                            .child(div().h(px(1.)).w_full().bg(Theme::border()))
-                            .child(self.inspector_slider(
+                                    ))
+                                }),
+                        )
+                        // Preset style row (compact dropdown)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .w(px(56.))
+                                                .text_xs()
+                                                .text_color(Theme::text_secondary())
+                                                .child("Preset"),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("txt-preset-dd")
+                                                .flex_1()
+                                                .h(px(26.))
+                                                .px_2()
+                                                .rounded_sm()
+                                                .bg(Theme::bg_surface())
+                                                .border_1()
+                                                .border_color(if preset_open {
+                                                    Theme::accent()
+                                                } else {
+                                                    Theme::border()
+                                                })
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
+                                                .text_xs()
+                                                .text_color(Theme::text_primary())
+                                                .cursor_pointer()
+                                                .hover(|s| s.bg(Theme::bg_hover()))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.text_preset_menu_open =
+                                                        !this.text_preset_menu_open;
+                                                    this.text_font_menu_open = false;
+                                                    cx.notify();
+                                                }))
+                                                .child("Choose Preset")
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(Theme::text_muted())
+                                                        .child(if preset_open { "▴" } else { "▾" }),
+                                                ),
+                                        ),
+                                )
+                                .when(preset_open, |el| {
+                                    el.child(
+                                        div()
+                                            .ml(px(64.))
+                                            .p_1()
+                                            .rounded_md()
+                                            .bg(Theme::bg_surface())
+                                            .border_1()
+                                            .border_color(Theme::border())
+                                            .flex()
+                                            .flex_col()
+                                            .gap_0p5()
+                                            .children(TextPreset::all().iter().map(|&preset| {
+                                                div()
+                                                    .id(SharedString::from(format!(
+                                                        "tp-{}",
+                                                        preset.label()
+                                                    )))
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_sm()
+                                                    .text_xs()
+                                                    .text_color(Theme::text_primary())
+                                                    .cursor_pointer()
+                                                    .hover(|s| {
+                                                        s.bg(Theme::bg_hover())
+                                                            .text_color(Theme::accent())
+                                                    })
+                                                    .on_click(cx.listener(move |this, _, _, cx| {
+                                                        this.state.push_undo();
+                                                        if let Some(c) =
+                                                            this.state.selected_clip_mut()
+                                                        {
+                                                            if let Some(ref mut t) = c.text {
+                                                                t.apply_preset(preset);
+                                                            }
+                                                        }
+                                                        this.text_preset_menu_open = false;
+                                                        cx.notify();
+                                                    }))
+                                                    .child(preset.label())
+                                            })),
+                                    )
+                                }),
+                        )
+                    })
+                    .when(
+                        active_tab == InspectorTab::TextStyle && clip.track == TrackKind::Text,
+                        |el| {
+                            let td = clip.text.clone().unwrap_or_default();
+                            let cur_sc = td.stroke_color_hex.unwrap_or(0x000000);
+                            el.child(self.inspector_slider(
                                 "Stroke",
                                 format!("{:.1}px", td.stroke_width),
                                 (td.stroke_width / 8.0).clamp(0.0, 1.0),
@@ -7320,7 +7522,6 @@ impl EditorView {
                                 cx,
                             ))
                             .when(td.stroke_width > 0.0, |el| {
-                                let cur_sc = td.stroke_color_hex.unwrap_or(0x000000);
                                 el.child(
                                     div()
                                         .flex()
@@ -7476,9 +7677,13 @@ impl EditorView {
                                     cx,
                                 ))
                             })
-                            // Text Animations
-                            .child(div().h(px(1.)).w_full().bg(Theme::border()))
-                            .child(
+                        },
+                    )
+                    .when(
+                        active_tab == InspectorTab::TextAnim && clip.track == TrackKind::Text,
+                        |el| {
+                            let td = clip.text.clone().unwrap_or_default();
+                            el.child(
                                 div()
                                     .flex()
                                     .flex_col()
@@ -7539,7 +7744,8 @@ impl EditorView {
                                     cx,
                                 ))
                             })
-                    })
+                        },
+                    )
                     )
             } else {
                 div()
@@ -7892,7 +8098,6 @@ impl EditorView {
             .and_then(|c| c.linked_clip_id)
             .is_some();
         let snap_enabled = self.state.snap_enabled;
-        let magnet_enabled = self.state.main_track_magnet;
 
         let ruler_step: usize = if px_per_sec >= 24.0 {
             2
@@ -8140,24 +8345,6 @@ impl EditorView {
                                 )
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.state.snap_enabled = !this.state.snap_enabled;
-                                    cx.notify();
-                                })),
-                            )
-                            .child(
-                                self.icon_button(
-                                    "tl-magnet",
-                                    "🧲",
-                                    if magnet_enabled {
-                                        "Main Track Magnet: ON"
-                                    } else {
-                                        "Main Track Magnet: OFF"
-                                    },
-                                    magnet_enabled,
-                                    true,
-                                )
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    this.state.toggle_main_track_magnet();
-                                    this.sync_preview_after_seek(cx);
                                     cx.notify();
                                 })),
                             )
@@ -8620,20 +8807,55 @@ impl EditorView {
                                             .cloned()
                                             .collect();
 
+                                        let slot_preview = self
+                                            .magnet_drop_slot
+                                            .filter(|(tid, _, _)| *tid == track_id);
+                                        let dragged_clip_id =
+                                            self.clip_drag.map(|d| d.clip_id);
+
                                         div()
                                             .h(px(TRACK_ROW_H))
                                             .w_full()
                                             .relative()
                                             .border_b_1()
                                             .border_color(Theme::border())
+                                            .when_some(slot_preview, |el, (_, s_start, s_dur)| {
+                                                let sx = s_start * px_per_sec;
+                                                let sw = (s_dur * px_per_sec).max(16.0);
+                                                el.child(
+                                                    div()
+                                                        .absolute()
+                                                        .left(px(sx))
+                                                        .top(px(5.))
+                                                        .w(px(sw))
+                                                        .h(px(28.))
+                                                        .rounded_md()
+                                                        .bg(gpui::rgba(0x38bdf826))
+                                                        .border_1()
+                                                        .border_color(Theme::accent()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .absolute()
+                                                        .left(px((sx - 1.0).max(0.0)))
+                                                        .top(px(2.))
+                                                        .w(px(3.))
+                                                        .h(px(TRACK_ROW_H - 4.0))
+                                                        .rounded_full()
+                                                        .bg(Theme::accent()),
+                                                )
+                                            })
                                             .children(track_clips.into_iter().map(|clip| {
                                                 let clip_id = clip.id;
                                                 let is_sel = selected_clip_id == Some(clip_id);
+                                                let is_magnet_dragging = slot_preview.is_some()
+                                                    && dragged_clip_id == Some(clip_id);
                                                 let left = clip.start_secs * px_per_sec;
                                                 let width =
                                                     (clip.duration_secs * px_per_sec).max(24.0);
                                                 let init_start = clip.start_secs;
                                                 let init_dur = clip.duration_secs;
+                                                let init_src_in = clip.source_in_secs;
 
                                                 div()
                                                     .id(SharedString::from(format!(
@@ -8645,6 +8867,7 @@ impl EditorView {
                                                     .top(px(5.))
                                                     .w(px(width))
                                                     .h(px(28.))
+                                                    .when(is_magnet_dragging, |el| el.opacity(0.82))
                                                     .rounded_md()
                                                     .bg(rgb(clip.track.color_hex()))
                                                     .border_2()
@@ -8678,7 +8901,8 @@ impl EditorView {
                                                                         ),
                                                                         initial_start_secs:
                                                                             init_start,
-                                                                        initial_duration_secs:
+                                                                        initial_source_in_secs: init_src_in,
+                                                                                initial_duration_secs:
                                                                             init_dur,
                                                                     });
                                                                 cx.notify();
@@ -8719,6 +8943,7 @@ impl EditorView {
                                                                                     event.position.x,
                                                                                 ),
                                                                                 initial_start_secs: init_start,
+                                                                                initial_source_in_secs: init_src_in,
                                                                                 initial_duration_secs: init_dur,
                                                                             },
                                                                         );
@@ -8798,6 +9023,7 @@ impl EditorView {
                                                                                     event.position.x,
                                                                                 ),
                                                                                 initial_start_secs: init_start,
+                                                                                initial_source_in_secs: init_src_in,
                                                                                 initial_duration_secs: init_dur,
                                                                             },
                                                                         );
@@ -9217,16 +9443,29 @@ impl Render for EditorView {
                     let dt = dx / this.state.px_per_sec;
                     match drag.kind {
                         ClipDragKind::Move => {
-                            let snap_threshold = 10.0 / this.state.px_per_sec;
-                            this.state.move_clip_with_snap(
+                            // Main track is always magnetic (ripple insert); other tracks are free.
+                            this.magnet_drop_slot = this.state.preview_main_track_magnet_drag(
                                 drag.clip_id,
+                                drag.initial_start_secs,
                                 drag.initial_start_secs + dt,
-                                snap_threshold,
                             );
+                            if this.magnet_drop_slot.is_none() {
+                                let snap_threshold = 10.0 / this.state.px_per_sec;
+                                this.state.move_clip_with_snap(
+                                    drag.clip_id,
+                                    drag.initial_start_secs + dt,
+                                    snap_threshold,
+                                );
+                            }
                         }
                         ClipDragKind::TrimLeft => {
-                            this.state
-                                .trim_clip_left(drag.clip_id, drag.initial_start_secs + dt);
+                            this.state.trim_clip_left_from(
+                                drag.clip_id,
+                                drag.initial_start_secs,
+                                drag.initial_source_in_secs,
+                                drag.initial_duration_secs,
+                                drag.initial_start_secs + dt,
+                            );
                         }
                         ClipDragKind::TrimRight => {
                             let new_end =
@@ -9314,10 +9553,15 @@ impl Render for EditorView {
                         }
                         changed = true;
                     }
-                    if this.clip_drag.is_some() {
-                        this.clip_drag = None;
+                    if let Some(drag) = this.clip_drag.take() {
+                        if let Some((_, slot_start, _)) = this.magnet_drop_slot.take() {
+                            this.state
+                                .finalize_main_track_magnet_drop(drag.clip_id, slot_start);
+                        }
                         this.sync_preview_after_seek(cx);
                         changed = true;
+                    } else {
+                        this.magnet_drop_slot = None;
                     }
                     if this.scrollbar_dragging {
                         this.scrollbar_dragging = false;
